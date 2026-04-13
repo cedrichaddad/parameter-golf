@@ -63,6 +63,7 @@ pub fn cross_entropy_backward(
 ) {
     let num_tokens = targets.len();
     let inv_cap = 1.0 / softcap;
+    let mut exps = vec![0.0f32; vocab_size]; // pre-allocated, reused across tokens
 
     for t in 0..num_tokens {
         let offset = t * vocab_size;
@@ -79,7 +80,6 @@ pub fn cross_entropy_backward(
         }
 
         let mut sum_exp = 0.0f32;
-        let mut exps = vec![0.0f32; vocab_size]; // TODO: pre-allocate
         for (i, &v) in row.iter().enumerate() {
             let capped = softcap * (v * inv_cap).tanh();
             exps[i] = (capped - max_val).exp();

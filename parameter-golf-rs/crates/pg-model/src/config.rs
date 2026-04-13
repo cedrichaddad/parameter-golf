@@ -266,7 +266,7 @@ impl TrainConfig {
 
     /// Compute WSD learning rate at a given step.
     pub fn wsd_lr(&self, step: usize) -> f32 {
-        let warmdown_start = self.total_iterations - self.warmdown_iters;
+        let warmdown_start = self.total_iterations.saturating_sub(self.warmdown_iters);
         if step < self.warmup_steps {
             // Linear warmup
             self.matrix_lr * (step as f32 / self.warmup_steps as f32)
@@ -300,7 +300,7 @@ impl TrainConfig {
         if !self.swa_enabled {
             return false;
         }
-        let warmdown_start = self.total_iterations - self.warmdown_iters;
+        let warmdown_start = self.total_iterations.saturating_sub(self.warmdown_iters);
         step >= warmdown_start && step % self.swa_every == 0
     }
 

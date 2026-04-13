@@ -106,6 +106,18 @@ pub struct ForwardBuffer {
 }
 
 impl ForwardBuffer {
+    /// Resize tokens without reallocation. Panics if tokens > max capacity.
+    /// All buffers were pre-allocated to max size, so only the token count changes.
+    pub fn resize_tokens(&mut self, tokens: usize) {
+        assert!(
+            tokens * self.model_dim <= self.x.len(),
+            "resize_tokens({}) exceeds buffer capacity (max {})",
+            tokens,
+            self.x.len() / self.model_dim,
+        );
+        self.tokens = tokens;
+    }
+
     pub fn new(config: &ModelConfig, tokens: usize) -> Self {
         let d = config.model_dim;
         let h = config.num_heads;
@@ -347,7 +359,7 @@ impl GptModel {
         layer: usize,
         tokens: &[u32],
         buf: &mut ForwardBuffer,
-    ) -> Option<Vec<f32>> {
+    ) {
         let t = buf.tokens;
         let d = buf.model_dim;
         let h = buf.num_heads;
@@ -396,15 +408,7 @@ impl GptModel {
             }
         }
 
-        // 5. Capture raw_v for VRL (only from first layer)
-        let raw_v = if self.config.vrl_enabled && buf.v0.is_none() {
-            Some(buf.v[..t * kv_dim].to_vec())
-        } else {
-            None
-        };
-
-        // 6. VRL: mix v0 and current v (not used in SOTA config, but implemented)
-        // In SOTA: value_residual=False, so this is skipped
+        // 5-6. VRL disabled in SOTA config (value_residual=False)
 
         // 7. QK-norm (RMSNorm on Q and K per head)
         // Q: [tokens, num_heads * head_dim] — normalize each head's head_dim slice
@@ -516,13 +520,22 @@ impl GptModel {
             let dim_idx = i % d;
             buf.x[i] += bp.mlp_scale[dim_idx] * buf.mlp_out[i];
         }
-
-        raw_v
     }
 
     /// Full forward pass: returns logits [tokens, vocab_size].
     /// input_ids: [tokens] (u32 token IDs)
     pub fn forward(&self, input_ids: &[u32], buf: &mut ForwardBuffer) {
+        self.forward_inner(input_ids, buf, None);
+    }
+
+    /// Forward pass with optional cache capture for backward.
+    /// When `cache` is Some, saves per-layer hidden states and intermediate activations.
+    pub(crate) fn forward_inner(
+        &self,
+        input_ids: &[u32],
+        buf: &mut ForwardBuffer,
+        mut cache: Option<&mut crate::backward::ForwardCache>,
+    ) {
         let t = input_ids.len();
         let d = self.config.model_dim;
         assert_eq!(t, buf.tokens);
@@ -544,17 +557,20 @@ impl GptModel {
                 self.config.bigram_vocab_size,
                 bigram_dim,
             );
-            // Project to model_dim: [tokens, model_dim] = [tokens, bigram_dim] @ [model_dim, bigram_dim]^T
             pg_kernels::linear::linear_forward(
                 &buf.bigram_out[..t * bigram_dim],
                 &self.bigram_proj,
                 &mut buf.bigram_proj_out[..t * d],
                 t, d, bigram_dim,
             );
-            // Add scaled bigram embedding
             for i in 0..t * d {
                 buf.x[i] += self.bigram_scale * buf.bigram_proj_out[i];
             }
+        }
+
+        // Save x_post_embed (before initial RMSNorm) for bigram backward
+        if let Some(ref mut c) = cache {
+            c.x_post_embed = buf.x[..t * d].to_vec();
         }
 
         // 3. Initial RMSNorm
@@ -562,11 +578,14 @@ impl GptModel {
         pg_kernels::rms_norm::rms_norm_forward_cpu(&buf.x[..t * d], &mut normed, d, 1.0, 1e-6);
         buf.x[..t * d].copy_from_slice(&normed);
 
-        // 4. SmearGate: (1-σ(g)) * x + σ(g) * x_prev (sequence-shifted)
-        // SOTA convention: x_prev[:, 0] = 0, x_prev[:, t] = x[:, t-1]
+        // Save x_post_norm (before SmearGate) for SmearGate backward
+        if let Some(ref mut c) = cache {
+            c.x_post_norm = buf.x[..t * d].to_vec();
+        }
+
+        // 4. SmearGate
         {
             let mut x_prev = vec![0.0f32; t * d];
-            // Shift: x_prev[t] = x[t-1], x_prev[0] = 0
             for i in 1..t {
                 x_prev[i * d..(i + 1) * d].copy_from_slice(&buf.x[(i - 1) * d..i * d]);
             }
@@ -579,6 +598,11 @@ impl GptModel {
 
         // 5. Save x0 (anchor for residual mixing)
         buf.x0[..t * d].copy_from_slice(&buf.x[..t * d]);
+        if let Some(ref mut c) = cache {
+            c.x0.copy_from_slice(&buf.x0[..t * d]);
+            c.input_ids = input_ids.to_vec();
+            c.tokens = t;
+        }
         buf.v0 = None;
         buf.ve_cache = None;
         buf.skips.clear();
@@ -588,18 +612,21 @@ impl GptModel {
 
         // 6. Encoder layers
         for i in 0..n_enc {
-            let raw_v = self.block_forward(i, input_ids, buf);
-            if buf.v0.is_none() {
-                buf.v0 = raw_v;
+            if let Some(ref mut c) = cache {
+                c.layer_x.push(buf.x[..t * d].to_vec());
             }
-            // Save skip connection (clone current x)
+            self.block_forward(i, input_ids, buf);
             buf.skips.push(buf.x[..t * d].to_vec());
+        }
+
+        // Save encoder skips for cache (before decoder pops them)
+        if let Some(ref mut c) = cache {
+            c.skips = buf.skips.clone();
         }
 
         // 7. Decoder layers with skip connections
         for i in 0..n_dec {
             let bi = n_enc + i;
-            // Add skip connection (pop from stack = LIFO)
             if let Some(skip) = buf.skips.pop() {
                 let sw = self.skip_weight(i);
                 for j in 0..t * d {
@@ -607,7 +634,15 @@ impl GptModel {
                     buf.x[j] += sw[dim_idx] * skip[j];
                 }
             }
+            if let Some(ref mut c) = cache {
+                c.layer_x.push(buf.x[..t * d].to_vec());
+            }
             self.block_forward(bi, input_ids, buf);
+        }
+
+        // Save x_final for cache
+        if let Some(ref mut c) = cache {
+            c.x_final.copy_from_slice(&buf.x[..t * d]);
         }
 
         // 8. Final RMSNorm
@@ -615,7 +650,6 @@ impl GptModel {
         pg_kernels::rms_norm::rms_norm_forward_cpu(&buf.x[..t * d], &mut final_normed, d, 1.0, 1e-6);
 
         // 9. Output projection (tied embeddings: logits = x @ tok_emb^T)
-        // tok_emb is [vocab, d], so we want Y[t,v] = sum_d x[t,d] * tok_emb[v,d]
         let vocab = self.config.vocab_size;
         pg_kernels::linear::linear_forward(
             &final_normed,
@@ -623,10 +657,6 @@ impl GptModel {
             &mut buf.logits[..t * vocab],
             t, vocab, d,
         );
-
-        // 10. buf.logits stores RAW (pre-softcap) logits.
-        // Softcap is applied inside cross_entropy_forward/backward.
-        // This preserves raw logits for backward pass.
     }
 
     /// Compute loss from forward pass results.

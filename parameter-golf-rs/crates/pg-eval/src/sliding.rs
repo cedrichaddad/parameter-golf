@@ -9,6 +9,24 @@
 use pg_model::{GptModel, ForwardBuffer};
 use pg_model::config::TrainConfig;
 
+/// Compute NLL with softcap applied to logits: cap * tanh(logit / cap).
+/// This matches the training loss which applies softcap inside cross_entropy_forward.
+#[inline]
+fn nll_with_softcap(logits: &[f32], target: usize, softcap: f32) -> f32 {
+    // Apply softcap: capped = cap * tanh(logit / cap)
+    // Then standard NLL: -log(softmax(capped)[target])
+    let capped: Vec<f32> = if softcap > 0.0 {
+        logits.iter().map(|&l| softcap * (l / softcap).tanh()).collect()
+    } else {
+        logits.to_vec()
+    };
+
+    let max_logit = capped.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = capped.iter().map(|&l| (l - max_logit).exp()).sum();
+    let log_sum_exp = max_logit + sum_exp.ln();
+    log_sum_exp - capped[target]
+}
+
 /// Sliding window BPB evaluation (no TTT).
 /// Returns (mean_loss, bpb).
 pub fn eval_sliding(
@@ -42,26 +60,18 @@ pub fn eval_sliding(
         let input = &val_tokens[ws..end];
         let target = &val_tokens[ws + 1..end + 1];
 
-        // Truncate buffer if window is shorter than seq_len
-        if wlen < seq_len {
-            buf = ForwardBuffer::new(&model.config, wlen);
-        } else if buf.tokens != wlen {
-            buf = ForwardBuffer::new(&model.config, wlen);
-        }
+        // Resize buffer for this window (no reallocation)
+        buf.resize_tokens(wlen);
 
         model.forward(input, &mut buf);
 
-        // Compute per-token NLL
+        // Compute per-token NLL with softcap
         let vocab = model.config.vocab_size;
+        let softcap = model.config.logit_softcap;
         for t in 0..wlen {
             let logits = &buf.logits[t * vocab..(t + 1) * vocab];
             let tgt = target[t] as usize;
-
-            // NLL = -log(softmax(logits)[target])
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
-            let log_sum_exp = max_logit + sum_exp.ln();
-            let nll = log_sum_exp - logits[tgt];
+            let nll = nll_with_softcap(logits, tgt, softcap);
 
             // Only score the "new" tokens (stride region)
             let s = if ws == 0 { 0 } else { wlen.saturating_sub(stride) };
@@ -159,15 +169,13 @@ pub fn score_chunk(
         model.forward(input, &mut buf);
 
         let vocab = model.config.vocab_size;
+        let softcap = model.config.logit_softcap;
         let s = if ws == 0 { 0 } else { (wlen - stride).max(0) };
 
         for t in s..wlen {
             let logits = &buf.logits[t * vocab..(t + 1) * vocab];
             let tgt = target[t] as usize;
-
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
-            let nll = (max_logit + sum_exp.ln()) - logits[tgt];
+            let nll = nll_with_softcap(logits, tgt, softcap);
 
             loss_sum += nll as f64;
             token_count += 1;

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 pg-core = { path = "../pg-core" }
+pg-model = { path = "../pg-model" }
 half = { workspace = true }
 rayon = { workspace = true }
 zstd = { workspace = true }

@@ -31,7 +31,7 @@ enum TensorStorage {
     #[cfg(feature = "cuda")]
     Gpu {
         data: std::sync::Arc<cudarc::driver::CudaSlice<u8>>,
-        device: std::sync::Arc<cudarc::driver::CudaDevice>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
     },
 }
 
@@ -76,17 +76,17 @@ impl GpuTensor {
     #[cfg(feature = "cuda")]
     /// Allocate a zeroed tensor on GPU.
     pub fn zeros_gpu(
-        device: std::sync::Arc<cudarc::driver::CudaDevice>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
         shape: &[usize],
         dtype: DType,
     ) -> PgResult<Self> {
         let numel: usize = shape.iter().product();
         let nbytes = numel * dtype.size_bytes();
-        let data = device.alloc_zeros::<u8>(nbytes)?;
+        let data = stream.alloc_zeros::<u8>(nbytes).map_err(|e| PgError::InvalidOp(format!("GPU alloc failed: {:?}", e)))?;
         Ok(Self {
             data: TensorStorage::Gpu {
                 data: std::sync::Arc::new(data),
-                device,
+                stream,
             },
             shape: SmallVec::from_slice(shape),
             strides: Self::contiguous_strides(shape),
@@ -101,8 +101,8 @@ impl GpuTensor {
         match &self.data {
             TensorStorage::Cpu(data) => Ok(data[self.offset..self.offset + nbytes].to_vec()),
             #[cfg(feature = "cuda")]
-            TensorStorage::Gpu { data, device } => {
-                let all_data = device.dtoh_sync_copy(data)?;
+            TensorStorage::Gpu { data, stream } => {
+                let all_data = stream.memcpy_dtov(data.as_ref()).map_err(|e| PgError::InvalidOp(format!("GPU memcpy failed: {:?}", e)))?;
                 Ok(all_data[self.offset..self.offset + nbytes].to_vec())
             }
         }

@@ -76,6 +76,22 @@ impl TokenStream {
         Ok(result)
     }
 
+    /// Skip `n` tokens in the stream without allocating.
+    pub fn skip(&mut self, n: usize) -> PgResult<()> {
+        let mut remaining = n;
+        while remaining > 0 {
+            let avail = self.current_shard.num_tokens() - self.pos;
+            if avail == 0 {
+                self.advance_file()?;
+                continue;
+            }
+            let k = remaining.min(avail);
+            self.pos += k;
+            remaining -= k;
+        }
+        Ok(())
+    }
+
     fn advance_file(&mut self) -> PgResult<()> {
         self.file_idx = (self.file_idx + 1) % self.files.len();
         self.current_shard = DataShard::open(&self.files[self.file_idx])?;
@@ -113,12 +129,19 @@ impl DistributedTokenLoader {
         let local_tokens = global_tokens / self.world_size;
         let per_rank_span = local_tokens + 1; // +1 for target offset
 
-        // Take enough tokens for all ranks
-        let chunk = self.stream.take(per_rank_span * self.world_size)?;
+        // Skip tokens for lower ranks, then take only this rank's span.
+        // This avoids reading all ranks' data on every GPU.
+        let skip_tokens = self.rank * per_rank_span;
+        if skip_tokens > 0 {
+            self.stream.skip(skip_tokens)?;
+        }
+        let local = self.stream.take(per_rank_span)?;
 
-        // Slice for this rank
-        let start = self.rank * per_rank_span;
-        let local = &chunk[start..start + per_rank_span];
+        // Skip remaining ranks' tokens to keep stream position consistent
+        let remaining_skip = (self.world_size - self.rank - 1) * per_rank_span;
+        if remaining_skip > 0 {
+            self.stream.skip(remaining_skip)?;
+        }
 
         let x = local[..local.len() - 1].to_vec();
         let y = local[1..].to_vec();

@@ -131,6 +131,13 @@ pub fn newton_schulz5(g: &[f32], shape: &[usize], steps: usize) -> Vec<f32> {
 pub struct MuonBankState {
     pub momentum_buffer: Vec<f32>, // same shape as parameter
     pub scale: f32,                // max(1, M/N)^0.5
+    // Pre-allocated scratch for NS5 (avoid per-step allocs)
+    pub ns_x: Vec<f32>,           // [B*rows*cols]
+    pub ns_a: Vec<f32>,           // [B*rows*rows]
+    pub ns_aa: Vec<f32>,          // [B*rows*rows]
+    pub ns_b: Vec<f32>,           // [B*rows*rows]
+    pub ns_new_x: Vec<f32>,       // [B*rows*cols]
+    pub ns_update: Vec<f32>,      // [B*M*N] — nesterov update scratch
 }
 
 /// Muon optimizer (CPU single-GPU reference).
@@ -155,11 +162,20 @@ impl Muon {
         let bank_states = bank_shapes
             .iter()
             .map(|shape| {
-                let numel = shape[0] * shape[1] * shape[2];
-                let scale = (shape[1] as f32 / shape[2] as f32).max(1.0).sqrt();
+                let (batch, m, n) = (shape[0], shape[1], shape[2]);
+                let numel = batch * m * n;
+                let scale = (m as f32 / n as f32).max(1.0).sqrt();
+                let transposed = m > n;
+                let (rows, cols) = if transposed { (n, m) } else { (m, n) };
                 MuonBankState {
                     momentum_buffer: vec![0.0; numel],
                     scale,
+                    ns_x: vec![0.0; batch * rows * cols],
+                    ns_a: vec![0.0; batch * rows * rows],
+                    ns_aa: vec![0.0; batch * rows * rows],
+                    ns_b: vec![0.0; batch * rows * rows],
+                    ns_new_x: vec![0.0; batch * rows * cols],
+                    ns_update: vec![0.0; numel],
                 }
             })
             .collect();
@@ -190,15 +206,15 @@ impl Muon {
             state.momentum_buffer[i] = self.momentum * state.momentum_buffer[i] + grad[i];
         }
 
-        // 2. Nesterov: update = grad + momentum * buf
-        let update: Vec<f32> = if self.nesterov {
-            grad.iter()
-                .zip(state.momentum_buffer.iter())
-                .map(|(&g, &buf)| g + self.momentum * buf)
-                .collect()
+        // 2. Nesterov: update = grad + momentum * buf (into pre-allocated scratch)
+        if self.nesterov {
+            for i in 0..grad.len() {
+                state.ns_update[i] = grad[i] + self.momentum * state.momentum_buffer[i];
+            }
         } else {
-            state.momentum_buffer.clone()
-        };
+            state.ns_update[..grad.len()].copy_from_slice(&state.momentum_buffer[..grad.len()]);
+        }
+        let update = &state.ns_update[..grad.len()];
 
         // 3. Newton-Schulz orthogonalization
         let ortho = newton_schulz5(&update, &[shape[0], shape[1], shape[2]], self.ns_steps);

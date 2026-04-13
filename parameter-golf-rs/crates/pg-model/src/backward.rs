@@ -135,10 +135,15 @@ pub struct ForwardCache {
     /// Token IDs (for VE/bigram recomputation)
     pub input_ids: Vec<u32>,
     pub tokens: usize,
+    /// Hidden state after embedding + bigram, before initial RMSNorm (for bigram backward)
+    pub x_post_embed: Vec<f32>,
+    /// Hidden state after initial RMSNorm, before SmearGate (for SmearGate backward)
+    pub x_post_norm: Vec<f32>,
 }
 
 impl GptModel {
     /// Forward pass that also saves activation cache for backward.
+    /// Runs a single forward pass (not two), capturing per-layer states along the way.
     pub fn forward_with_cache(
         &self,
         input_ids: &[u32],
@@ -147,11 +152,7 @@ impl GptModel {
         let t = input_ids.len();
         let d = self.config.model_dim;
         let n = self.config.num_layers;
-        // Run the standard forward
-        self.forward(input_ids, buf);
 
-        // We need to reconstruct layer-boundary hidden states.
-        // Re-run forward, saving x at each layer entry.
         let mut cache = ForwardCache {
             layer_x: Vec::with_capacity(n),
             x0: vec![0.0; t * d],
@@ -159,88 +160,13 @@ impl GptModel {
             skips: Vec::new(),
             input_ids: input_ids.to_vec(),
             tokens: t,
+            x_post_embed: Vec::new(),
+            x_post_norm: Vec::new(),
         };
 
-        // Re-run forward to capture per-layer states.
-        // (On GPU, we'd checkpoint only select layers; here we save all for correctness.)
-        let mut rerun_buf = ForwardBuffer::new(&self.config, t);
-        self.forward_capture(input_ids, &mut rerun_buf, &mut cache);
+        self.forward_inner(input_ids, buf, Some(&mut cache));
 
         cache
-    }
-
-    /// Forward with per-layer state capture.
-    fn forward_capture(
-        &self,
-        input_ids: &[u32],
-        buf: &mut ForwardBuffer,
-        cache: &mut ForwardCache,
-    ) {
-        let t = input_ids.len();
-        let d = self.config.model_dim;
-        let n_enc = self.config.num_encoder_layers();
-        let n_dec = self.config.num_decoder_layers();
-
-        // 1-4. Embedding + bigram + norm + smear (same as forward)
-        for i in 0..t {
-            let tok = input_ids[i] as usize;
-            buf.x[i * d..(i + 1) * d].copy_from_slice(&self.tok_emb[tok * d..(tok + 1) * d]);
-        }
-        if self.config.bigram_vocab_size > 0 {
-            let bd = self.config.bigram_dim;
-            pg_kernels::bigram_hash::bigram_hash_forward(
-                input_ids, &self.bigram_embed, &mut buf.bigram_out[..t * bd],
-                self.config.bigram_vocab_size, bd,
-            );
-            pg_kernels::linear::linear_forward(
-                &buf.bigram_out[..t * bd], &self.bigram_proj,
-                &mut buf.bigram_proj_out[..t * d], t, d, bd,
-            );
-            for i in 0..t * d {
-                buf.x[i] += self.bigram_scale * buf.bigram_proj_out[i];
-            }
-        }
-        let mut normed = vec![0.0f32; t * d];
-        pg_kernels::rms_norm::rms_norm_forward_cpu(&buf.x[..t * d], &mut normed, d, 1.0, 1e-6);
-        buf.x[..t * d].copy_from_slice(&normed);
-        {
-            let mut x_prev = vec![0.0f32; t * d];
-            for i in 1..t {
-                x_prev[i * d..(i + 1) * d].copy_from_slice(&buf.x[(i - 1) * d..i * d]);
-            }
-            let mut smeared = vec![0.0f32; t * d];
-            pg_kernels::smear_gate::smear_gate_forward(
-                &buf.x[..t * d], &x_prev, &self.smear_gate, &mut smeared, t, d,
-            );
-            buf.x[..t * d].copy_from_slice(&smeared);
-        }
-        buf.x0[..t * d].copy_from_slice(&buf.x[..t * d]);
-        cache.x0.copy_from_slice(&buf.x0[..t * d]);
-        buf.v0 = None;
-        buf.ve_cache = None;
-
-        // Encoder
-        for i in 0..n_enc {
-            cache.layer_x.push(buf.x[..t * d].to_vec());
-            self.block_forward(i, input_ids, buf);
-            cache.skips.push(buf.x[..t * d].to_vec());
-        }
-
-        // Decoder
-        let mut skip_stack: Vec<Vec<f32>> = cache.skips.clone();
-        for i in 0..n_dec {
-            let bi = n_enc + i;
-            if let Some(skip) = skip_stack.pop() {
-                let sw = self.skip_weight(i);
-                for j in 0..t * d {
-                    buf.x[j] += sw[j % d] * skip[j];
-                }
-            }
-            cache.layer_x.push(buf.x[..t * d].to_vec());
-            self.block_forward(bi, input_ids, buf);
-        }
-
-        cache.x_final.copy_from_slice(&buf.x[..t * d]);
     }
 
     /// Backward through a single transformer block.
@@ -450,11 +376,9 @@ impl GptModel {
             grads.qo_bank[o_offset + i] += grad_o_w[i];
         }
 
-        // 8. XSA backward (simplified: skip for now if not using XSA)
+        // 8. XSA backward
+        let mut xsa_grad_v: Option<Vec<f32>> = None;
         let grad_attn_out = if bp.use_xsa {
-            // XSA: z = y - (y·v/||v||²) * v
-            // For CPU reference, approximate: pass gradient through
-            // Full XSA backward would use xsa_backward kernel
             let mut grad_y = vec![0.0f32; t * h * hd];
             let mut grad_v_xsa = vec![0.0f32; t * hkv * hd];
             pg_kernels::xsa::xsa_backward(
@@ -462,18 +386,28 @@ impl GptModel {
                 &mut grad_y, &mut grad_v_xsa,
                 t, h, hkv, hd,
             );
-            // Note: grad_v_xsa should be added to v gradient but attention backward is complex
+            xsa_grad_v = Some(grad_v_xsa);
             grad_y
         } else {
             grad_attn_result
         };
 
-        // 7. Attention backward — simplified for CPU reference.
-        // Full attention backward is complex (O(n²d) backward through softmax + QKV).
-        // For TTT (SGD), the key gradient paths are through the linear projections.
-        // We approximate by passing the gradient through as if attention were identity.
-        // TODO: Implement full causal attention backward for exact gradients.
-        let grad_q_post_gain = grad_attn_out.clone(); // approximate
+        // 7. Attention backward — exact causal attention backward with GQA.
+        let mut grad_q_post_gain = vec![0.0f32; t * h * hd];
+        let mut grad_k_attn = vec![0.0f32; t * hkv * hd];
+        let mut grad_v_attn = vec![0.0f32; t * hkv * hd];
+        pg_kernels::attention::causal_attention_backward(
+            &q_proj, &k_proj, &v_proj, &attn_out, &grad_attn_out,
+            &mut grad_q_post_gain, &mut grad_k_attn, &mut grad_v_attn,
+            t, h, hkv, hd,
+        );
+
+        // Add XSA grad_v to V gradient path
+        if let Some(ref gv_xsa) = xsa_grad_v {
+            for i in 0..t * hkv * hd {
+                grad_v_attn[i] += gv_xsa[i];
+            }
+        }
 
         // 6. q_gain backward: Q_scaled = Q * gain
         // grad_Q_pre_gain = grad_Q_scaled * gain
@@ -493,15 +427,20 @@ impl GptModel {
         }
 
         // 5. RoPE backward
+        let mut grad_k_post_rope = grad_k_attn.clone();
         if c.rope_dims > 0 {
             pg_kernels::rope::apply_partial_rope_backward(
                 &mut grad_q_post_rope, &self.rope_cos, &self.rope_sin, 1, t, h, hd, c.rope_dims,
             );
+            pg_kernels::rope::apply_partial_rope_backward(
+                &mut grad_k_post_rope, &self.rope_cos, &self.rope_sin, 1, t, hkv, hd, c.rope_dims,
+            );
         }
 
-        // 4. QK-norm backward (simplified: just pass through)
-        // Full QK-norm backward involves the RMSNorm Jacobian per head
+        // 4. QK-norm backward (simplified: pass through)
+        // Full per-head RMSNorm backward would apply the Jacobian; this is a minor approximation.
         let grad_q_proj = grad_q_post_rope;
+        let grad_k_proj = grad_k_post_rope;
 
         // 3. Q projection backward: Q = attn_norm_out @ q_w^T
         let mut grad_attn_norm = vec![0.0f32; t * d];
@@ -513,10 +452,32 @@ impl GptModel {
             grads.qo_bank[q_offset + i] += grad_q_w[i];
         }
 
-        // K and V projection backward (gradient flows through attention)
-        // With the approximate attention backward, K/V grads are not computed.
-        // In the full implementation, we'd compute grad_k, grad_v from attention backward
-        // and then backward through the K/V linear projections.
+        // K projection backward: K = attn_norm_out @ k_w^T
+        let mut grad_attn_norm_k = vec![0.0f32; t * d];
+        pg_kernels::linear::linear_backward_input(&grad_k_proj, k_w, &mut grad_attn_norm_k, t, kv_dim, d);
+        let k_offset = layer * kv_dim * d;
+        let mut grad_k_w = vec![0.0f32; kv_dim * d];
+        pg_kernels::linear::linear_backward_weight(&grad_k_proj, &attn_norm_out, &mut grad_k_w, t, kv_dim, d);
+        for i in 0..kv_dim * d {
+            grads.kv_bank[k_offset + i] += grad_k_w[i];
+        }
+        for i in 0..t * d {
+            grad_attn_norm[i] += grad_attn_norm_k[i];
+        }
+
+        // V projection backward: V = attn_norm_out @ v_w^T
+        let mut grad_attn_norm_v = vec![0.0f32; t * d];
+        pg_kernels::linear::linear_backward_input(&grad_v_attn, v_w, &mut grad_attn_norm_v, t, kv_dim, d);
+        let n_layers = c.num_layers;
+        let v_offset = (n_layers + layer) * kv_dim * d;
+        let mut grad_v_w = vec![0.0f32; kv_dim * d];
+        pg_kernels::linear::linear_backward_weight(&grad_v_attn, &attn_norm_out, &mut grad_v_w, t, kv_dim, d);
+        for i in 0..kv_dim * d {
+            grads.kv_bank[v_offset + i] += grad_v_w[i];
+        }
+        for i in 0..t * d {
+            grad_attn_norm[i] += grad_attn_norm_v[i];
+        }
 
         // 2. Attn norm backward
         let mut grad_x_in_from_norm = vec![0.0f32; t * d];
@@ -564,6 +525,11 @@ impl GptModel {
         // Backward through output layer
         let mut grad_x = backward_output_loss(self, buf, targets, grads);
 
+        // Collect skip gradients to propagate back to encoder layers.
+        // grad_encoder_skips[enc_layer] = gradient flowing back through skip to that encoder's output.
+        let n_skip = self.config.num_skip_weights();
+        let mut grad_encoder_skips: Vec<Vec<f32>> = vec![vec![0.0f32; t * d]; n_skip];
+
         // Backward through decoder layers (reverse order)
         for i in (0..n_dec).rev() {
             let bi = n_enc + i;
@@ -578,21 +544,33 @@ impl GptModel {
                 grads,
             );
 
-            // Backward through skip connection: x += skip_weight * skip
+            // Backward through skip connection: x_dec = x + skip_weight * skip_enc
+            // grad_x already contains gradient w.r.t. x_dec (post-skip)
+            // grad_skip_weight += grad_x * skip_enc
+            // grad_skip_enc = grad_x * skip_weight  (propagate to encoder!)
             if i < cache.skips.len() {
-                let skip = &cache.skips[n_enc - 1 - i]; // LIFO order
-                let _sw = self.skip_weight(i); // Will use for grad propagation through skip
+                let enc_layer = n_enc - 1 - i; // LIFO: decoder 0 ← encoder (n_enc-1)
+                let skip = &cache.skips[enc_layer];
+                let sw = self.skip_weight(i);
                 for j in 0..t * d {
                     let di = j % d;
                     grads.skip_weights[i * d + di] += grad_x[j] * skip[j];
-                    // grad through skip goes to the encoder layer output
-                    // (not propagated further in this simplified version)
+                    grad_encoder_skips[enc_layer][j] += grad_x[j] * sw[di];
                 }
             }
         }
 
         // Backward through encoder layers (reverse order)
         for i in (0..n_enc).rev() {
+            // Inject skip gradient into grad_x before encoder block backward.
+            // The skip was saved AFTER block i's forward, so the gradient from the
+            // skip goes to the OUTPUT of block i, which is the current grad_x.
+            if i < n_skip {
+                for j in 0..t * d {
+                    grad_x[j] += grad_encoder_skips[i][j];
+                }
+            }
+
             self.block_backward(
                 i,
                 &mut grad_x,
@@ -603,19 +581,125 @@ impl GptModel {
             );
         }
 
-        // Backward through SmearGate, initial RMSNorm, and embeddings
-        // (grad_x now contains gradient w.r.t. post-smeargate output)
+        // grad_x now contains gradient w.r.t. post-SmearGate output (= x0)
 
         // SmearGate backward
-        // SmearGate: output = (1-σ(g))*x + σ(g)*x_prev
-        // For embedding gradients, pass through
-        // grad_smear_gate is accumulated in the kernel
+        // SmearGate: output = (1-σ(g)) * x_post_norm + σ(g) * x_prev
+        // where x_post_norm is the hidden state after initial RMSNorm
+        {
+            let x_post_norm = &cache.x_post_norm;
+            // Reconstruct x_prev (shifted x_post_norm)
+            let mut x_prev = vec![0.0f32; t * d];
+            for i in 1..t {
+                x_prev[i * d..(i + 1) * d].copy_from_slice(&x_post_norm[(i - 1) * d..i * d]);
+            }
 
-        // Embedding backward: scatter grad_x into tok_emb
-        for i in 0..t {
-            let tok = input_ids[i] as usize;
-            for j in 0..d {
-                grads.tok_emb[tok * d + j] += grad_x[i * d + j];
+            let mut grad_x_smear = vec![0.0f32; t * d];
+            let mut grad_x_prev = vec![0.0f32; t * d];
+            pg_kernels::smear_gate::smear_gate_backward(
+                x_post_norm,
+                &x_prev,
+                &self.smear_gate,
+                &grad_x,
+                &mut grad_x_smear,
+                &mut grad_x_prev,
+                &mut grads.smear_gate,
+                t,
+                d,
+            );
+
+            // grad_x_prev flows to shifted positions: grad_x_prev[i] → grad_x_post_norm[i-1]
+            // Combine: grad_x_post_norm[i] = grad_x_smear[i] + grad_x_prev[i+1]
+            let mut grad_x_post_norm = grad_x_smear;
+            for i in 0..t - 1 {
+                for j in 0..d {
+                    grad_x_post_norm[i * d + j] += grad_x_prev[(i + 1) * d + j];
+                }
+            }
+            // grad_x_prev[0] has no predecessor to flow to (x_prev[0] = 0)
+
+            // Initial RMSNorm backward
+            let mut grad_x_post_embed = vec![0.0f32; t * d];
+            pg_kernels::rms_norm::rms_norm_backward_cpu(
+                &cache.x_post_embed,
+                &grad_x_post_norm,
+                &mut grad_x_post_embed,
+                d,
+                1.0,
+                1e-6,
+            );
+
+            // Bigram backward: x_post_embed = tok_embed_out + bigram_scale * bigram_proj_out
+            // grad_bigram_proj_out = grad_x_post_embed * bigram_scale
+            if self.config.bigram_vocab_size > 0 {
+                let bigram_dim = self.config.bigram_dim;
+
+                // Recompute bigram_proj_out and bigram_out for weight gradients
+                let mut bigram_out = vec![0.0f32; t * bigram_dim];
+                pg_kernels::bigram_hash::bigram_hash_forward(
+                    input_ids,
+                    &self.bigram_embed,
+                    &mut bigram_out,
+                    self.config.bigram_vocab_size,
+                    bigram_dim,
+                );
+                let mut bigram_proj_out = vec![0.0f32; t * d];
+                pg_kernels::linear::linear_forward(
+                    &bigram_out,
+                    &self.bigram_proj,
+                    &mut bigram_proj_out,
+                    t, d, bigram_dim,
+                );
+
+                // grad_bigram_scale = sum(grad_x_post_embed * bigram_proj_out)
+                for i in 0..t * d {
+                    grads.bigram_scale += grad_x_post_embed[i] * bigram_proj_out[i];
+                }
+
+                // grad_bigram_proj_out = grad_x_post_embed * bigram_scale
+                let mut grad_bigram_proj_out = vec![0.0f32; t * d];
+                for i in 0..t * d {
+                    grad_bigram_proj_out[i] = grad_x_post_embed[i] * self.bigram_scale;
+                }
+
+                // Backward through bigram projection: proj_out = bigram_out @ bigram_proj^T
+                // grad_bigram_proj (weight gradient) — linear_backward_weight overwrites, so use scratch
+                let mut grad_bigram_proj_w = vec![0.0f32; d * bigram_dim];
+                pg_kernels::linear::linear_backward_weight(
+                    &grad_bigram_proj_out,
+                    &bigram_out,
+                    &mut grad_bigram_proj_w,
+                    t, d, bigram_dim,
+                );
+                for i in 0..d * bigram_dim {
+                    grads.bigram_proj[i] += grad_bigram_proj_w[i];
+                }
+
+                // grad_bigram_out = grad_bigram_proj_out @ bigram_proj
+                let mut grad_bigram_out = vec![0.0f32; t * bigram_dim];
+                pg_kernels::linear::linear_backward_input(
+                    &grad_bigram_proj_out,
+                    &self.bigram_proj,
+                    &mut grad_bigram_out,
+                    t, d, bigram_dim,
+                );
+
+                // Scatter grad_bigram_out into grad_bigram_embed via hash indices
+                pg_kernels::bigram_hash::bigram_hash_backward(
+                    input_ids,
+                    &grad_bigram_out,
+                    &mut grads.bigram_embed,
+                    self.config.bigram_vocab_size,
+                    bigram_dim,
+                );
+            }
+
+            // Embedding backward: scatter grad_x_post_embed into tok_emb
+            for i in 0..t {
+                let tok = input_ids[i] as usize;
+                for j in 0..d {
+                    grads.tok_emb[tok * d + j] += grad_x_post_embed[i * d + j];
+                }
             }
         }
 
@@ -646,9 +730,14 @@ pub fn backward_output_loss(
     pg_kernels::linear::linear_backward_input(&grad_logits, &model.tok_emb, &mut grad_x, t, vocab, d);
 
     // grad_tok_emb += grad_logits^T @ final_normed_x
+    // Use scratch buffer since linear_backward_weight overwrites (not accumulates)
     let mut final_normed = vec![0.0f32; t * d];
     pg_kernels::rms_norm::rms_norm_forward_cpu(&buf.x[..t * d], &mut final_normed, d, 1.0, 1e-6);
-    pg_kernels::linear::linear_backward_weight(&grad_logits, &final_normed, &mut grads.tok_emb, t, vocab, d);
+    let mut grad_tok_emb_logits = vec![0.0f32; vocab * d];
+    pg_kernels::linear::linear_backward_weight(&grad_logits, &final_normed, &mut grad_tok_emb_logits, t, vocab, d);
+    for i in 0..vocab * d {
+        grads.tok_emb[i] += grad_tok_emb_logits[i];
+    }
 
     // Final RMSNorm backward
     let mut grad_pre_norm = vec![0.0f32; t * d];
@@ -800,12 +889,14 @@ mod tests {
             "tok_emb[{}]: analytical={:.6}, numerical={:.6}, diff={:.6}, rel={:.4}",
             idx, analytical, numerical, diff, diff / max_val
         );
-        // Very relaxed tolerance — attention backward is identity pass-through (approximate),
-        // QK-norm backward is pass-through, and XSA backward is simplified.
-        // Full attention backward will fix this; for now just verify both are nonzero and same sign.
+        // Relaxed tolerance — QK-norm backward is a pass-through approximation.
+        // This is the dominant source of gradient error. On GPU, Flash Attention 3
+        // handles the fused QK-norm + attention backward exactly.
+        // Just verify same sign and order of magnitude.
         assert!(
             (analytical * numerical > 0.0) || diff < 1e-3,
-            "gradient sign mismatch or both near-zero: analytical={}, numerical={}", analytical, numerical
+            "gradient sign mismatch: analytical={}, numerical={}",
+            analytical, numerical
         );
     }
 }

@@ -55,6 +55,11 @@ fn main() {
     let mut state_bigram_proj = AdamWState::new(model.bigram_proj.len());
     let mut state_smear_gate = AdamWState::new(model.smear_gate.len());
     let mut state_skip_weights = AdamWState::new(model.skip_weights.len());
+    let mut state_ve_embed = AdamWState::new(model.ve_embed.len());
+    let mut state_ve_proj = AdamWState::new(model.ve_proj.len());
+    let mut state_ve_scale = AdamWState::new(1);
+    let mut state_ve_layer_scales = AdamWState::new(model.ve_layer_scales.len());
+    let mut state_bigram_scale = AdamWState::new(1);
 
     // Per-block scalar states
     let mut state_attn_scale: Vec<AdamWState> = (0..n)
@@ -90,6 +95,21 @@ fn main() {
 
     // TODO: Load data shards
     // let mut data = DistributedTokenLoader::new("data/datasets/fineweb10B_sp1024/fineweb_train_*.bin", 0, 1).unwrap();
+
+    // Pre-allocate flat buffer for EMA/SWA (avoids 140MB alloc per step)
+    let mut flat_buf = vec![0.0f32; total_params];
+
+    // Persistent AdamW instances (avoid reconstructing every step)
+    let mut adamw_embed = AdamW::new(
+        train_config.embed_lr,
+        train_config.adam_beta1, train_config.adam_beta2,
+        train_config.adam_eps, train_config.adam_wd,
+    );
+    let mut adamw_scalar = AdamW::new(
+        train_config.scalar_lr,
+        train_config.adam_beta1, train_config.adam_beta2,
+        train_config.adam_eps, train_config.adam_wd,
+    );
 
     let start = Instant::now();
 
@@ -132,34 +152,47 @@ fn main() {
         muon.step_bank(3, &mut model.mlp_down_bank, &grads.mlp_down_bank, &bank_shapes[3]);
 
         // Optimizer step: AdamW for scalar/embedding params
-        let embed_lr_scaled = train_config.embed_lr * lr_scale;
-        let scalar_lr_scaled = train_config.scalar_lr * lr_scale;
+        adamw_embed.lr = train_config.embed_lr * lr_scale;
+        adamw_scalar.lr = train_config.scalar_lr * lr_scale;
         {
-            let adamw_e = AdamW::new(embed_lr_scaled, train_config.adam_beta1, train_config.adam_beta2, train_config.adam_eps, train_config.adam_wd);
-            adamw_e.step(&mut model.tok_emb, &grads.tok_emb, &mut state_tok_emb);
-            adamw_e.step(&mut model.bigram_embed, &grads.bigram_embed, &mut state_bigram_embed);
-            adamw_e.step(&mut model.bigram_proj, &grads.bigram_proj, &mut state_bigram_proj);
+            adamw_embed.step(&mut model.tok_emb, &grads.tok_emb, &mut state_tok_emb);
+            adamw_embed.step(&mut model.bigram_embed, &grads.bigram_embed, &mut state_bigram_embed);
+            adamw_embed.step(&mut model.bigram_proj, &grads.bigram_proj, &mut state_bigram_proj);
+            adamw_embed.step(&mut model.ve_embed, &grads.ve_embed, &mut state_ve_embed);
         }
         {
-            let adamw_s = AdamW::new(scalar_lr_scaled, train_config.adam_beta1, train_config.adam_beta2, train_config.adam_eps, train_config.adam_wd);
-            adamw_s.step(&mut model.smear_gate, &grads.smear_gate, &mut state_smear_gate);
-            adamw_s.step(&mut model.skip_weights, &grads.skip_weights, &mut state_skip_weights);
+            adamw_scalar.step(&mut model.smear_gate, &grads.smear_gate, &mut state_smear_gate);
+            adamw_scalar.step(&mut model.skip_weights, &grads.skip_weights, &mut state_skip_weights);
+            adamw_scalar.step(&mut model.ve_proj, &grads.ve_proj, &mut state_ve_proj);
+            {
+                let mut ve_scale_slice = [model.ve_scale];
+                let grad_ve_scale_slice = [grads.ve_scale];
+                adamw_scalar.step(&mut ve_scale_slice, &grad_ve_scale_slice, &mut state_ve_scale);
+                model.ve_scale = ve_scale_slice[0];
+            }
+            adamw_scalar.step(&mut model.ve_layer_scales, &grads.ve_layer_scales, &mut state_ve_layer_scales);
+            {
+                let mut bigram_scale_slice = [model.bigram_scale];
+                let grad_bigram_scale_slice = [grads.bigram_scale];
+                adamw_scalar.step(&mut bigram_scale_slice, &grad_bigram_scale_slice, &mut state_bigram_scale);
+                model.bigram_scale = bigram_scale_slice[0];
+            }
 
             for i in 0..n {
-                adamw_s.step(&mut model.blocks[i].attn_scale, &grads.block_attn_scale[i], &mut state_attn_scale[i]);
-                adamw_s.step(&mut model.blocks[i].mlp_scale, &grads.block_mlp_scale[i], &mut state_mlp_scale[i]);
-                adamw_s.step(&mut model.blocks[i].resid_mix, &grads.block_resid_mix[i], &mut state_resid_mix[i]);
-                adamw_s.step(&mut model.blocks[i].q_gain, &grads.block_q_gain[i], &mut state_q_gain[i]);
+                adamw_scalar.step(&mut model.blocks[i].attn_scale, &grads.block_attn_scale[i], &mut state_attn_scale[i]);
+                adamw_scalar.step(&mut model.blocks[i].mlp_scale, &grads.block_mlp_scale[i], &mut state_mlp_scale[i]);
+                adamw_scalar.step(&mut model.blocks[i].resid_mix, &grads.block_resid_mix[i], &mut state_resid_mix[i]);
+                adamw_scalar.step(&mut model.blocks[i].q_gain, &grads.block_q_gain[i], &mut state_q_gain[i]);
             }
         }
 
-        // EMA
-        let flat = flatten_params(&model);
-        ema.update(&flat);
+        // EMA (reuse pre-allocated flat buffer)
+        flatten_params_into(&model, &mut flat_buf);
+        ema.update(&flat_buf);
 
         // SWA during warmdown
         if train_config.should_swa(step) {
-            swa.accumulate(&flat);
+            swa.accumulate(&flat_buf);
         }
 
         // Late QAT (placeholder — int6 STE quantization during warmdown)
@@ -192,8 +225,14 @@ fn main() {
     let total_time = start.elapsed().as_secs_f32();
     eprintln!("Training complete in {:.1}s", total_time);
 
-    // TODO: Quantize model to int6 (16MB artifact limit)
-    // TODO: Run eval with TTT
+    // Quantize and export artifact (< 16MB)
+    let artifact_path = std::path::Path::new("artifact.pgrs");
+    match pg_quant::export::export_model(&model, artifact_path) {
+        Ok(size) => eprintln!("Artifact saved: {} bytes ({:.2} MB)", size, size as f64 / 1_048_576.0),
+        Err(e) => eprintln!("Artifact export failed: {}", e),
+    }
+
+    // TODO: Run eval with TTT using the exported artifact
 }
 
 /// Count total trainable parameters.
@@ -223,6 +262,7 @@ fn count_params(model: &GptModel) -> usize {
 }
 
 /// Flatten all model parameters into a single contiguous buffer.
+#[allow(dead_code)]
 fn flatten_params(model: &GptModel) -> Vec<f32> {
     let mut flat = Vec::with_capacity(count_params(model));
     flat.extend_from_slice(&model.tok_emb);
@@ -246,6 +286,38 @@ fn flatten_params(model: &GptModel) -> Vec<f32> {
     flat.push(model.ve_scale);
     flat.extend_from_slice(&model.ve_layer_scales);
     flat
+}
+
+/// Flatten model parameters into a pre-allocated buffer (zero alloc).
+fn flatten_params_into(model: &GptModel, flat: &mut [f32]) {
+    let mut pos = 0;
+
+    fn copy(src: &[f32], dst: &mut [f32], pos: &mut usize) {
+        dst[*pos..*pos + src.len()].copy_from_slice(src);
+        *pos += src.len();
+    }
+
+    copy(&model.tok_emb, flat, &mut pos);
+    copy(&model.bigram_embed, flat, &mut pos);
+    copy(&model.bigram_proj, flat, &mut pos);
+    flat[pos] = model.bigram_scale; pos += 1;
+    copy(&model.smear_gate, flat, &mut pos);
+    copy(&model.skip_weights, flat, &mut pos);
+    copy(&model.qo_bank, flat, &mut pos);
+    copy(&model.kv_bank, flat, &mut pos);
+    copy(&model.mlp_up_bank, flat, &mut pos);
+    copy(&model.mlp_down_bank, flat, &mut pos);
+    for bp in &model.blocks {
+        copy(&bp.attn_scale, flat, &mut pos);
+        copy(&bp.mlp_scale, flat, &mut pos);
+        copy(&bp.resid_mix, flat, &mut pos);
+        copy(&bp.q_gain, flat, &mut pos);
+    }
+    copy(&model.ve_embed, flat, &mut pos);
+    copy(&model.ve_proj, flat, &mut pos);
+    flat[pos] = model.ve_scale; pos += 1;
+    copy(&model.ve_layer_scales, flat, &mut pos);
+    debug_assert_eq!(pos, flat.len(), "flatten_params_into size mismatch");
 }
 
 /// Unflatten a contiguous parameter buffer back into the model.
