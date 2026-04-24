@@ -7,7 +7,6 @@
 ///
 /// JSON header maps tensor names to {dtype, shape, data_offsets: [start, end]}.
 /// Data offsets are relative to the end of the header.
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -28,14 +27,15 @@ pub struct TensorInfo {
 /// Loaded safetensors file.
 pub struct SafeTensorsFile {
     pub tensors: HashMap<String, TensorInfo>,
-    pub data: Vec<u8>, // raw tensor data (after header)
+    pub data: Vec<u8>,  // raw tensor data (after header)
     data_offset: usize, // byte offset where tensor data starts in the file
 }
 
 impl SafeTensorsFile {
     /// Load a safetensors file from disk.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+        let bytes =
+            fs::read(path).map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
         Self::from_bytes(&bytes)
     }
 
@@ -47,7 +47,8 @@ impl SafeTensorsFile {
 
         let header_size = (&bytes[..8])
             .read_u64::<LittleEndian>()
-            .map_err(|e| format!("failed to read header size: {}", e))? as usize;
+            .map_err(|e| format!("failed to read header size: {}", e))?
+            as usize;
 
         if bytes.len() < 8 + header_size {
             return Err(format!(
@@ -94,7 +95,11 @@ impl SafeTensorsFile {
             }
             "BF16" => {
                 if raw.len() != numel * 2 {
-                    return Err(format!("BF16 size mismatch: {} vs {}", raw.len(), numel * 2));
+                    return Err(format!(
+                        "BF16 size mismatch: {} vs {}",
+                        raw.len(),
+                        numel * 2
+                    ));
                 }
                 let floats: Vec<f32> = raw
                     .chunks_exact(2)
@@ -217,7 +222,8 @@ fn parse_json_number(chars: &[char], pos: &mut usize) -> Result<usize, String> {
         *pos += 1;
     }
     let s: String = chars[start..*pos].iter().collect();
-    s.parse::<usize>().map_err(|e| format!("invalid number '{}': {}", s, e))
+    s.parse::<usize>()
+        .map_err(|e| format!("invalid number '{}': {}", s, e))
 }
 
 fn skip_json_value(chars: &[char], pos: &mut usize) -> Result<(), String> {
@@ -233,8 +239,12 @@ fn skip_json_value(chars: &[char], pos: &mut usize) -> Result<(), String> {
             *pos += 1;
             let mut depth = 1;
             while *pos < chars.len() && depth > 0 {
-                if chars[*pos] == '{' { depth += 1; }
-                if chars[*pos] == '}' { depth -= 1; }
+                if chars[*pos] == '{' {
+                    depth += 1;
+                }
+                if chars[*pos] == '}' {
+                    depth -= 1;
+                }
                 *pos += 1;
             }
         }
@@ -242,8 +252,12 @@ fn skip_json_value(chars: &[char], pos: &mut usize) -> Result<(), String> {
             *pos += 1;
             let mut depth = 1;
             while *pos < chars.len() && depth > 0 {
-                if chars[*pos] == '[' { depth += 1; }
-                if chars[*pos] == ']' { depth -= 1; }
+                if chars[*pos] == '[' {
+                    depth += 1;
+                }
+                if chars[*pos] == ']' {
+                    depth -= 1;
+                }
                 *pos += 1;
             }
         }

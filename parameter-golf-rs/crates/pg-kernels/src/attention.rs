@@ -90,11 +90,11 @@ pub fn causal_attention_backward(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    _output: &[f32],     // forward output (reserved for fused softmax backward variant)
+    _output: &[f32], // forward output (reserved for fused softmax backward variant)
     grad_output: &[f32], // [tokens, num_heads, head_dim]
-    grad_q: &mut [f32],  // [tokens, num_heads, head_dim]
-    grad_k: &mut [f32],  // [tokens, num_kv_heads, head_dim]
-    grad_v: &mut [f32],  // [tokens, num_kv_heads, head_dim]
+    grad_q: &mut [f32], // [tokens, num_heads, head_dim]
+    grad_k: &mut [f32], // [tokens, num_kv_heads, head_dim]
+    grad_v: &mut [f32], // [tokens, num_kv_heads, head_dim]
     tokens: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -125,7 +125,9 @@ pub fn causal_attention_backward(
                     dot += q[q_off + d] * k[k_off + d];
                 }
                 scores[s] = dot * scale;
-                if scores[s] > max_s { max_s = scores[s]; }
+                if scores[s] > max_s {
+                    max_s = scores[s];
+                }
             }
             let mut weights = vec![0.0f32; t + 1];
             let mut sum_exp = 0.0f32;
@@ -196,7 +198,9 @@ mod tests {
             assert!(
                 (out[d] - v[d]).abs() < 1e-5,
                 "mismatch at {}: {} vs {}",
-                d, out[d], v[d]
+                d,
+                out[d],
+                v[d]
             );
         }
     }
@@ -234,12 +238,25 @@ mod tests {
         // Deterministic pseudo-random inputs
         let make_val = |i: usize| ((i as f32 * 0.37 + 0.13).sin() * 0.5);
         let q: Vec<f32> = (0..tokens * num_heads * head_dim).map(make_val).collect();
-        let k: Vec<f32> = (0..tokens * num_kv_heads * head_dim).map(|i| make_val(i + 100)).collect();
-        let v: Vec<f32> = (0..tokens * num_kv_heads * head_dim).map(|i| make_val(i + 200)).collect();
+        let k: Vec<f32> = (0..tokens * num_kv_heads * head_dim)
+            .map(|i| make_val(i + 100))
+            .collect();
+        let v: Vec<f32> = (0..tokens * num_kv_heads * head_dim)
+            .map(|i| make_val(i + 200))
+            .collect();
 
         // Forward
         let mut out = vec![0.0f32; tokens * num_heads * head_dim];
-        causal_attention_forward(&q, &k, &v, &mut out, tokens, num_heads, num_kv_heads, head_dim);
+        causal_attention_forward(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
 
         // Use sum of outputs as scalar loss
         let grad_output = vec![1.0f32; tokens * num_heads * head_dim];
@@ -249,9 +266,18 @@ mod tests {
         let mut grad_k = vec![0.0f32; tokens * num_kv_heads * head_dim];
         let mut grad_v = vec![0.0f32; tokens * num_kv_heads * head_dim];
         causal_attention_backward(
-            &q, &k, &v, &out, &grad_output,
-            &mut grad_q, &mut grad_k, &mut grad_v,
-            tokens, num_heads, num_kv_heads, head_dim,
+            &q,
+            &k,
+            &v,
+            &out,
+            &grad_output,
+            &mut grad_q,
+            &mut grad_k,
+            &mut grad_v,
+            tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         );
 
         // Numerical gradient for Q
@@ -263,13 +289,40 @@ mod tests {
             q_m[idx] -= eps;
             let mut out_p = vec![0.0f32; out.len()];
             let mut out_m = vec![0.0f32; out.len()];
-            causal_attention_forward(&q_p, &k, &v, &mut out_p, tokens, num_heads, num_kv_heads, head_dim);
-            causal_attention_forward(&q_m, &k, &v, &mut out_m, tokens, num_heads, num_kv_heads, head_dim);
-            let numerical: f32 = out_p.iter().zip(out_m.iter()).map(|(p, m)| (p - m) / (2.0 * eps)).sum();
+            causal_attention_forward(
+                &q_p,
+                &k,
+                &v,
+                &mut out_p,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            causal_attention_forward(
+                &q_m,
+                &k,
+                &v,
+                &mut out_m,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            let numerical: f32 = out_p
+                .iter()
+                .zip(out_m.iter())
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
             let diff = (grad_q[idx] - numerical).abs();
             let max_val = grad_q[idx].abs().max(numerical.abs()).max(1e-6);
-            assert!(diff / max_val < 0.02 || diff < 1e-4,
-                "Q grad mismatch at {}: analytical={}, numerical={}", idx, grad_q[idx], numerical);
+            assert!(
+                diff / max_val < 0.02 || diff < 1e-4,
+                "Q grad mismatch at {}: analytical={}, numerical={}",
+                idx,
+                grad_q[idx],
+                numerical
+            );
         }
 
         // Numerical gradient for K
@@ -280,13 +333,40 @@ mod tests {
             k_m[idx] -= eps;
             let mut out_p = vec![0.0f32; out.len()];
             let mut out_m = vec![0.0f32; out.len()];
-            causal_attention_forward(&q, &k_p, &v, &mut out_p, tokens, num_heads, num_kv_heads, head_dim);
-            causal_attention_forward(&q, &k_m, &v, &mut out_m, tokens, num_heads, num_kv_heads, head_dim);
-            let numerical: f32 = out_p.iter().zip(out_m.iter()).map(|(p, m)| (p - m) / (2.0 * eps)).sum();
+            causal_attention_forward(
+                &q,
+                &k_p,
+                &v,
+                &mut out_p,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            causal_attention_forward(
+                &q,
+                &k_m,
+                &v,
+                &mut out_m,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            let numerical: f32 = out_p
+                .iter()
+                .zip(out_m.iter())
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
             let diff = (grad_k[idx] - numerical).abs();
             let max_val = grad_k[idx].abs().max(numerical.abs()).max(1e-6);
-            assert!(diff / max_val < 0.02 || diff < 1e-4,
-                "K grad mismatch at {}: analytical={}, numerical={}", idx, grad_k[idx], numerical);
+            assert!(
+                diff / max_val < 0.02 || diff < 1e-4,
+                "K grad mismatch at {}: analytical={}, numerical={}",
+                idx,
+                grad_k[idx],
+                numerical
+            );
         }
 
         // Numerical gradient for V
@@ -297,13 +377,40 @@ mod tests {
             v_m[idx] -= eps;
             let mut out_p = vec![0.0f32; out.len()];
             let mut out_m = vec![0.0f32; out.len()];
-            causal_attention_forward(&q, &k, &v_p, &mut out_p, tokens, num_heads, num_kv_heads, head_dim);
-            causal_attention_forward(&q, &k, &v_m, &mut out_m, tokens, num_heads, num_kv_heads, head_dim);
-            let numerical: f32 = out_p.iter().zip(out_m.iter()).map(|(p, m)| (p - m) / (2.0 * eps)).sum();
+            causal_attention_forward(
+                &q,
+                &k,
+                &v_p,
+                &mut out_p,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            causal_attention_forward(
+                &q,
+                &k,
+                &v_m,
+                &mut out_m,
+                tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+            let numerical: f32 = out_p
+                .iter()
+                .zip(out_m.iter())
+                .map(|(p, m)| (p - m) / (2.0 * eps))
+                .sum();
             let diff = (grad_v[idx] - numerical).abs();
             let max_val = grad_v[idx].abs().max(numerical.abs()).max(1e-6);
-            assert!(diff / max_val < 0.02 || diff < 1e-4,
-                "V grad mismatch at {}: analytical={}, numerical={}", idx, grad_v[idx], numerical);
+            assert!(
+                diff / max_val < 0.02 || diff < 1e-4,
+                "V grad mismatch at {}: analytical={}, numerical={}",
+                idx,
+                grad_v[idx],
+                numerical
+            );
         }
     }
 

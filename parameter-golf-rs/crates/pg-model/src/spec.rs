@@ -16,6 +16,16 @@ pub enum RunMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum TrainBackend {
+    #[default]
+    Cpu,
+    CudaSingle,
+    CudaSingleParity,
+    CudaDistributed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum VariantFamily {
     #[default]
     BaselineSp8192,
@@ -50,6 +60,7 @@ pub enum QuantScheme {
     GptqLiteInt6,
     MixedInt5Int6,
     Aggressive,
+    TightInt7Int4,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -259,12 +270,25 @@ impl ModelSpec {
             xsa_last_n: self.xsa_last_n,
             logit_softcap: self.logit_softcap,
             qk_gain_init: self.qk_gain_init,
+            recurrence_enabled: self.recurrence.enabled,
+            recurrence_start_layer: self.recurrence.start_layer,
+            recurrence_repeat_layers: self.recurrence.repeat_layers,
+            parallel_residual: self.parallel_residual.enabled
+                && self.parallel_residual.split_attention_mlp,
             vrl_enabled: false,
             ve_enabled: self.value_embedding.enabled,
             ve_dim: self.value_embedding.dim,
             ve_layers: self.value_embedding.layers.clone(),
-            bigram_vocab_size: if self.bigram.enabled { self.bigram.vocab_size } else { 0 },
-            bigram_dim: if self.bigram.enabled { self.bigram.dim } else { 0 },
+            bigram_vocab_size: if self.bigram.enabled {
+                self.bigram.vocab_size
+            } else {
+                0
+            },
+            bigram_dim: if self.bigram.enabled {
+                self.bigram.dim
+            } else {
+                0
+            },
             ln_scale: self.ln_scale,
             tie_embeddings: self.tie_embeddings,
             tied_embed_init_std: 0.005,
@@ -277,8 +301,15 @@ impl ModelSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TrainSpec {
+    pub backend: TrainBackend,
     pub batch_tokens: usize,
     pub seq_len: usize,
+    pub train_data_pattern: Option<String>,
+    pub validation_data_pattern: Option<String>,
+    pub rank: usize,
+    pub world_size: usize,
+    pub artifact_path: String,
+    pub fast_bank_updates: bool,
     pub warmup_steps: usize,
     pub total_iterations: usize,
     pub warmdown_iters: usize,
@@ -300,8 +331,15 @@ pub struct TrainSpec {
 impl Default for TrainSpec {
     fn default() -> Self {
         Self {
+            backend: TrainBackend::Cpu,
             batch_tokens: 524_288,
             seq_len: 2048,
+            train_data_pattern: None,
+            validation_data_pattern: None,
+            rank: 0,
+            world_size: 1,
+            artifact_path: "artifact.pgrs".to_string(),
+            fast_bank_updates: false,
             warmup_steps: 20,
             total_iterations: 9_000,
             warmdown_iters: 3_500,
@@ -391,6 +429,8 @@ pub struct EvalSpec {
     pub legal_score_first: bool,
     pub qttt: bool,
     pub chunk_tokens: usize,
+    pub tokenizer_vocab_path: Option<String>,
+    pub max_tokens: Option<usize>,
 }
 
 impl Default for EvalSpec {
@@ -400,6 +440,8 @@ impl Default for EvalSpec {
             legal_score_first: true,
             qttt: false,
             chunk_tokens: 32_768,
+            tokenizer_vocab_path: None,
+            max_tokens: None,
         }
     }
 }
@@ -413,6 +455,7 @@ pub struct RunSpec {
     pub quant: QuantSpec,
     pub eval: EvalSpec,
     pub mode: RunMode,
+    pub allow_unsupported_variants: bool,
 }
 
 impl Default for RunSpec {
@@ -430,6 +473,7 @@ impl RunSpec {
             quant: QuantSpec::default(),
             eval: EvalSpec::default(),
             mode: RunMode::Smoke,
+            allow_unsupported_variants: false,
         }
     }
 
@@ -439,8 +483,8 @@ impl RunSpec {
     }
 
     pub fn save(&self, path: &Path) -> PgResult<()> {
-        let body =
-            toml::to_string_pretty(self).map_err(|e| PgError::DataFormat(format!("spec TOML encode failed: {e}")))?;
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| PgError::DataFormat(format!("spec TOML encode failed: {e}")))?;
         std::fs::write(path, body)?;
         Ok(())
     }

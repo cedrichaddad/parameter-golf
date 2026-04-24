@@ -20,7 +20,6 @@
 /// | **Fusion A**: `xsa_residual_norm_fused` | XSA projection + residual add + RMSNorm |
 /// | **Fusion B**: `bigram_embed_fused`      | Token embedding + bigram lookup + bigram projection + add |
 /// | **Fusion C**: `rmsnorm_qk_rope_qgain`   | RMSNorm(Q,K) + partial RoPE + per-head q_gain |
-
 use crate::bigram_hash::bigram_hash;
 
 /// Fusion A: XSA-projection epilogue + residual add + RMSNorm.
@@ -45,13 +44,13 @@ use crate::bigram_hash::bigram_hash;
 /// post-output-projection kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn xsa_residual_norm_fused(
-    attn_proj_out: &[f32],   // [tokens, dim] — attention output projected
-    v_self_full: &[f32],     // [tokens, dim] — V vectors expanded to head-dim space
-    residual: &[f32],        // [tokens, dim]
-    rms_weight: &[f32],      // [dim]
+    attn_proj_out: &[f32], // [tokens, dim] — attention output projected
+    v_self_full: &[f32],   // [tokens, dim] — V vectors expanded to head-dim space
+    residual: &[f32],      // [tokens, dim]
+    rms_weight: &[f32],    // [dim]
     ln_scale: f32,
-    h_out: &mut [f32],       // [tokens, dim] — residual stream after add
-    normed_out: &mut [f32],  // [tokens, dim] — normalized for next sublayer
+    h_out: &mut [f32],      // [tokens, dim] — residual stream after add
+    normed_out: &mut [f32], // [tokens, dim] — normalized for next sublayer
     tokens: usize,
     dim: usize,
     eps: f32,
@@ -151,11 +150,11 @@ pub fn xsa_residual_norm_unfused(
 #[allow(clippy::too_many_arguments)]
 pub fn bigram_embed_fused(
     token_ids: &[u32],
-    embed_table: &[f32],     // [vocab, dim]
-    bigram_table: &[f32],    // [num_buckets, bigram_dim]
-    bigram_proj: &[f32],     // [dim, bigram_dim]  (row-major: [d * bigram_dim + bd])
+    embed_table: &[f32],  // [vocab, dim]
+    bigram_table: &[f32], // [num_buckets, bigram_dim]
+    bigram_proj: &[f32],  // [dim, bigram_dim]  (row-major: [d * bigram_dim + bd])
     bigram_scale: f32,
-    output: &mut [f32],      // [tokens, dim]
+    output: &mut [f32], // [tokens, dim]
     dim: usize,
     bigram_dim: usize,
     num_buckets: usize,
@@ -241,11 +240,11 @@ pub fn bigram_embed_unfused(
 /// the inner loops are fully unrolled at compile time.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_qk_rope_qgain_fused(
-    q: &mut [f32],         // [tokens, num_heads, head_dim]
-    k: &mut [f32],         // [tokens, num_kv_heads, head_dim]
-    cos_table: &[f32],     // [seq_len, rope_dims/2]
-    sin_table: &[f32],     // [seq_len, rope_dims/2]
-    q_gain: &[f32],        // [num_heads]
+    q: &mut [f32],     // [tokens, num_heads, head_dim]
+    k: &mut [f32],     // [tokens, num_kv_heads, head_dim]
+    cos_table: &[f32], // [seq_len, rope_dims/2]
+    sin_table: &[f32], // [seq_len, rope_dims/2]
+    q_gain: &[f32],    // [num_heads]
     tokens: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -336,8 +335,19 @@ pub fn rmsnorm_qk_rope_qgain_unfused(
         crate::rms_norm::rms_norm_forward_cpu(&buf, k, head_dim, 1.0, eps);
     }
     // 2. Standalone partial RoPE on Q and K using apply_partial_rope.
-    crate::rope::apply_partial_rope(q, cos_table, sin_table, 1, tokens, num_heads, head_dim, rope_dims);
-    crate::rope::apply_partial_rope(k, cos_table, sin_table, 1, tokens, num_kv_heads, head_dim, rope_dims);
+    crate::rope::apply_partial_rope(
+        q, cos_table, sin_table, 1, tokens, num_heads, head_dim, rope_dims,
+    );
+    crate::rope::apply_partial_rope(
+        k,
+        cos_table,
+        sin_table,
+        1,
+        tokens,
+        num_kv_heads,
+        head_dim,
+        rope_dims,
+    );
     // 3. Standalone q_gain scaling.
     for t in 0..tokens {
         for h in 0..num_heads {
@@ -388,7 +398,10 @@ mod tests {
         let attn = deterministic(1, tokens * dim, 1.0);
         let v = deterministic(2, tokens * dim, 1.0);
         let residual = deterministic(3, tokens * dim, 0.5);
-        let rms_w = deterministic(4, dim, 0.2).iter().map(|x| x + 1.0).collect::<Vec<_>>();
+        let rms_w = deterministic(4, dim, 0.2)
+            .iter()
+            .map(|x| x + 1.0)
+            .collect::<Vec<_>>();
         let ln_scale = 0.7;
 
         let mut h_a = vec![0.0f32; tokens * dim];
@@ -396,8 +409,12 @@ mod tests {
         let mut h_b = vec![0.0f32; tokens * dim];
         let mut n_b = vec![0.0f32; tokens * dim];
 
-        xsa_residual_norm_fused(&attn, &v, &residual, &rms_w, ln_scale, &mut h_a, &mut n_a, tokens, dim, 1e-6);
-        xsa_residual_norm_unfused(&attn, &v, &residual, &rms_w, ln_scale, &mut h_b, &mut n_b, tokens, dim, 1e-6);
+        xsa_residual_norm_fused(
+            &attn, &v, &residual, &rms_w, ln_scale, &mut h_a, &mut n_a, tokens, dim, 1e-6,
+        );
+        xsa_residual_norm_unfused(
+            &attn, &v, &residual, &rms_w, ln_scale, &mut h_b, &mut n_b, tokens, dim, 1e-6,
+        );
 
         approx_eq_slice(&h_a, &h_b, 1e-5, "h_out");
         approx_eq_slice(&n_a, &n_b, 1e-5, "normed_out");
@@ -411,7 +428,9 @@ mod tests {
         let bigram_dim = 6;
         let num_buckets = 32;
 
-        let token_ids: Vec<u32> = (0..tokens as u32).map(|i| (i * 3 + 1) % vocab as u32).collect();
+        let token_ids: Vec<u32> = (0..tokens as u32)
+            .map(|i| (i * 3 + 1) % vocab as u32)
+            .collect();
         let embed = deterministic(11, vocab * dim, 0.3);
         let bigram_table = deterministic(12, num_buckets * bigram_dim, 0.4);
         let bigram_proj = deterministic(13, dim * bigram_dim, 0.2);
@@ -420,8 +439,28 @@ mod tests {
         let mut a = vec![0.0f32; tokens * dim];
         let mut b = vec![0.0f32; tokens * dim];
 
-        bigram_embed_fused(&token_ids, &embed, &bigram_table, &bigram_proj, bigram_scale, &mut a, dim, bigram_dim, num_buckets);
-        bigram_embed_unfused(&token_ids, &embed, &bigram_table, &bigram_proj, bigram_scale, &mut b, dim, bigram_dim, num_buckets);
+        bigram_embed_fused(
+            &token_ids,
+            &embed,
+            &bigram_table,
+            &bigram_proj,
+            bigram_scale,
+            &mut a,
+            dim,
+            bigram_dim,
+            num_buckets,
+        );
+        bigram_embed_unfused(
+            &token_ids,
+            &embed,
+            &bigram_table,
+            &bigram_proj,
+            bigram_scale,
+            &mut b,
+            dim,
+            bigram_dim,
+            num_buckets,
+        );
 
         approx_eq_slice(&a, &b, 1e-5, "bigram_embed_output");
     }
@@ -447,12 +486,30 @@ mod tests {
         let mut k_b = k.clone();
 
         rmsnorm_qk_rope_qgain_fused(
-            &mut q_a, &mut k_a, &cos_table, &sin_table, &q_gain,
-            tokens, num_heads, num_kv_heads, head_dim, rope_dims, eps,
+            &mut q_a,
+            &mut k_a,
+            &cos_table,
+            &sin_table,
+            &q_gain,
+            tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dims,
+            eps,
         );
         rmsnorm_qk_rope_qgain_unfused(
-            &mut q_b, &mut k_b, &cos_table, &sin_table, &q_gain,
-            tokens, num_heads, num_kv_heads, head_dim, rope_dims, eps,
+            &mut q_b,
+            &mut k_b,
+            &cos_table,
+            &sin_table,
+            &q_gain,
+            tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dims,
+            eps,
         );
 
         approx_eq_slice(&q_a, &q_b, 1e-5, "q post-fusion");

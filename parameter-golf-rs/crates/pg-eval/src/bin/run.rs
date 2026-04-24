@@ -1,16 +1,24 @@
 use std::path::PathBuf;
 
-use pg_model::{ExecutionPlan, RunSpec, VariantFamily};
+use pg_model::{ExecutionPlan, GptModel, RunSpec, VariantFamily};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut artifact: Option<PathBuf> = None;
     let mut spec = None;
     let mut builtin = VariantFamily::BaselineSp8192;
+    let mut max_tokens: Option<usize> = None;
+    let mut validation_data_pattern: Option<String> = None;
+    let mut stride: Option<usize> = None;
+    let mut tokenizer_vocab_path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--artifact" => artifact = args.next().map(PathBuf::from),
             "--spec" => spec = args.next(),
+            "--val-data" => validation_data_pattern = args.next(),
+            "--max-tokens" => max_tokens = args.next().and_then(|v| v.parse::<usize>().ok()),
+            "--stride" => stride = args.next().and_then(|v| v.parse::<usize>().ok()),
+            "--tokenizer-vocab" => tokenizer_vocab_path = args.next(),
             "--builtin" => {
                 if let Some(name) = args.next() {
                     builtin = match name.as_str() {
@@ -26,10 +34,19 @@ fn main() {
         }
     }
 
-    let run_spec = spec
+    let mut run_spec = spec
         .map(PathBuf::from)
         .map(|p| RunSpec::load(&p).expect("failed to load spec"))
         .unwrap_or_else(|| RunSpec::for_family(builtin));
+    if let Some(pattern) = validation_data_pattern {
+        run_spec.train.validation_data_pattern = Some(pattern);
+    }
+    if let Some(value) = stride {
+        run_spec.eval.stride = value;
+    }
+    if let Some(path) = tokenizer_vocab_path {
+        run_spec.eval.tokenizer_vocab_path = Some(path);
+    }
     let plan = ExecutionPlan::from_run_spec(&run_spec).expect("failed to build execution plan");
 
     let artifact_bytes = artifact
@@ -46,5 +63,61 @@ fn main() {
         println!("artifact_budget_ok={}", plan.artifact_budget_ok(bytes));
     } else {
         println!("artifact_bytes=unknown");
+    }
+
+    if let Some(pattern) = run_spec.train.validation_data_pattern.as_deref() {
+        let mut model = GptModel::new(run_spec.model.to_model_config());
+        model.fill_deterministic();
+        if let Some(path) = artifact.as_ref() {
+            pg_quant::export::load_artifact(path, &mut model).expect("failed to load artifact");
+        }
+        let tokens = pg_data::token_stream::load_validation_tokens_limited(
+            pattern,
+            max_tokens.map(|limit| limit.max(2)),
+        )
+            .expect("failed to load validation tokens")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect::<Vec<_>>();
+        let bpb_luts = if let Some(path) = run_spec.eval.tokenizer_vocab_path.as_deref() {
+            pg_data::bpb::BpbLuts::from_vocab_file(std::path::Path::new(path))
+                .expect("failed to load tokenizer vocab")
+        } else {
+            pg_data::bpb::BpbLuts::placeholder(run_spec.model.vocab_size)
+        };
+        let target_bytes = bpb_luts.pair_byte_counts_u32(&tokens);
+        let seq_len = run_spec
+            .model
+            .eval_seq_len
+            .min(tokens.len().saturating_sub(1))
+            .max(1);
+        let (loss, bpb) = if run_spec.eval.qttt {
+            let mut cfg = pg_eval::qttt::QttTConfig::paper_default(seq_len);
+            cfg.stride = run_spec.eval.stride;
+            cfg.seq_len = seq_len;
+            cfg.chunk_tokens = run_spec.eval.chunk_tokens;
+            pg_eval::qttt::eval_qttt(&mut model, &tokens, &target_bytes, &cfg)
+        } else {
+            pg_eval::sliding::eval_sliding(
+                &model,
+                &tokens,
+                &target_bytes,
+                run_spec.eval.stride,
+                seq_len,
+            )
+        };
+        println!("eval_tokens={}", tokens.len());
+        println!("eval_loss={loss:.6}");
+        println!(
+            "eval_bpb_kind={}",
+            if run_spec.eval.tokenizer_vocab_path.is_some() {
+                "tokenizer_vocab"
+            } else {
+                "placeholder"
+            }
+        );
+        println!("eval_bpb={bpb:.6}");
+    } else {
+        println!("eval_status=plan_only_no_validation_data");
     }
 }

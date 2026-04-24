@@ -114,7 +114,9 @@ mod tests {
             assert!(
                 (dx[i] - numerical_grad).abs() < 1e-3,
                 "gradient mismatch at {}: analytical={}, numerical={}",
-                i, dx[i], numerical_grad
+                i,
+                dx[i],
+                numerical_grad
             );
         }
     }

@@ -9,7 +9,6 @@
 ///   - tests round-tripping `pg_compat::loader::load_safetensors`
 ///   - the per-step equivalence harness, which loads the same dump from both
 ///     PyTorch and Rust to validate forward/backward parity.
-
 use std::collections::BTreeMap;
 
 use half::bf16;

@@ -112,10 +112,13 @@ mod tests {
 
     #[test]
     fn test_open_train_shard() {
-        let shard_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin");
+        let shard_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin");
         if !shard_path.exists() {
-            eprintln!("Skipping test: shard file not found at {}", shard_path.display());
+            eprintln!(
+                "Skipping test: shard file not found at {}",
+                shard_path.display()
+            );
             return;
         }
         let shard = DataShard::open(&shard_path).expect("failed to open shard");

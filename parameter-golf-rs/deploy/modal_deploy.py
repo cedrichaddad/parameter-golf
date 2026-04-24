@@ -133,7 +133,136 @@ def parity_forward():
         raise RuntimeError(f"Parity-forward failed with code {result.returncode}")
 
 
+@app.function(
+    image=image,
+    gpu="H100:1",
+    timeout=300,
+    startup_timeout=900,
+)
+def parity_kernels():
+    """Run kernel-level parity checks (parity-kernels)."""
+    import subprocess
+    import os
+
+    os.environ["RUST_LOG"] = "info"
+    result = subprocess.run(
+        ["pg-parity-kernels"],
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    print(result.stdout)
+    if result.stderr:
+        print(f"stderr: {result.stderr}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Parity-kernels failed with code {result.returncode}")
+
+
+@app.function(
+    image=image,
+    gpu="H100:1",
+    timeout=300,
+    startup_timeout=900,
+)
+def parity_step():
+    """Run the one-step backward parity harness on the baseline spec."""
+    import subprocess
+    import os
+
+    os.environ["RUST_LOG"] = "info"
+    result = subprocess.run(
+        [
+            "pg-parity-step",
+            "--spec",
+            "/specs/baseline_sp8192.toml",
+            "--backend",
+            "cuda-single",
+        ],
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    print(result.stdout)
+    if result.stderr:
+        print(f"stderr: {result.stderr}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Parity-step failed with code {result.returncode}")
+
+
 # --- Training & Evaluation ---
+
+
+@app.function(
+    image=image,
+    gpu="H100:1",
+    timeout=700,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+    },
+)
+def train_single():
+    """Run the training CLI on one H100. Defaults to cuda-single proxy mode."""
+    import subprocess
+    import os
+    import time
+
+    os.environ["RUST_LOG"] = "info"
+    train_glob = os.environ.get("PG_TRAIN_GLOB")
+    val_glob = os.environ.get("PG_VAL_GLOB")
+    tokenizer_vocab = os.environ.get("PG_TOKENIZER_VOCAB")
+    artifact_path = os.environ.get("PG_ARTIFACT_PATH", "/output/artifact_single.pgrs")
+    builtin = os.environ.get("PG_VARIANT", "baseline_sp8192")
+    mode = os.environ.get("PG_MODE", "proxy")
+    backend = os.environ.get("PG_BACKEND", "cuda-single")
+    world_size = os.environ.get("PG_WORLD_SIZE", "1")
+    rank = os.environ.get("PG_RANK", "0")
+
+    start = time.time()
+
+    cmd = [
+        "pg-train",
+        "run",
+        "--builtin",
+        builtin,
+        "--mode",
+        mode,
+        "--backend",
+        backend,
+        "--artifact",
+        artifact_path,
+        "--world-size",
+        world_size,
+        "--rank",
+        rank,
+    ]
+    if train_glob:
+        cmd.extend(["--train-data", train_glob])
+    if val_glob:
+        cmd.extend(["--val-data", val_glob])
+    if tokenizer_vocab:
+        cmd.extend(["--tokenizer-vocab", tokenizer_vocab])
+
+    result = subprocess.run(
+        cmd,
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        timeout=650,
+    )
+
+    elapsed = time.time() - start
+    print(f"Training completed in {elapsed:.1f}s")
+    print(f"stdout: {result.stdout[-4000:]}")
+    print(f"stderr: {result.stderr[-4000:]}")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Training failed with code {result.returncode}")
+
+    output_volume.commit()
 
 
 @app.function(
@@ -153,13 +282,43 @@ def train():
     import time
 
     os.environ["RUST_LOG"] = "info"
-    os.environ["DATA_DIR"] = "/data/datasets/fineweb10B_sp1024"
-    os.environ["OUTPUT_DIR"] = "/output"
+    train_glob = os.environ.get("PG_TRAIN_GLOB")
+    val_glob = os.environ.get("PG_VAL_GLOB")
+    tokenizer_vocab = os.environ.get("PG_TOKENIZER_VOCAB")
+    artifact_path = os.environ.get("PG_ARTIFACT_PATH", "/output/artifact.pgrs")
+    builtin = os.environ.get("PG_VARIANT", "baseline_sp8192")
+    mode = os.environ.get("PG_MODE", "record")
+    backend = os.environ.get("PG_BACKEND", "cuda-distributed")
+    world_size = os.environ.get("PG_WORLD_SIZE", "8")
+    rank = os.environ.get("PG_RANK", "0")
 
     start = time.time()
 
+    cmd = [
+        "pg-train",
+        "run",
+        "--builtin",
+        builtin,
+        "--mode",
+        mode,
+        "--backend",
+        backend,
+        "--artifact",
+        artifact_path,
+        "--world-size",
+        world_size,
+        "--rank",
+        rank,
+    ]
+    if train_glob:
+        cmd.extend(["--train-data", train_glob])
+    if val_glob:
+        cmd.extend(["--val-data", val_glob])
+    if tokenizer_vocab:
+        cmd.extend(["--tokenizer-vocab", tokenizer_vocab])
+
     result = subprocess.run(
-        ["pg-train"],
+        cmd,
         env=os.environ,
         capture_output=True,
         text=True,
@@ -194,16 +353,25 @@ def evaluate():
     import os
 
     os.environ["RUST_LOG"] = "info"
-    os.environ["ARTIFACT_PATH"] = "/output/artifact.pgrs"
-    os.environ["DATA_DIR"] = "/data/datasets/fineweb10B_sp1024"
+    artifact_path = os.environ.get("PG_ARTIFACT_PATH", "/output/artifact.pgrs")
+    val_glob = os.environ.get("PG_VAL_GLOB")
+    tokenizer_vocab = os.environ.get("PG_TOKENIZER_VOCAB")
+    builtin = os.environ.get("PG_VARIANT", "baseline_sp8192")
 
-    result = subprocess.run(
-        ["pg-train", "--eval-only"],
-        env=os.environ,
-        capture_output=True,
-        text=True,
-        timeout=250,
-    )
+    cmd = [
+        "pg-eval",
+        "run",
+        "--builtin",
+        builtin,
+        "--artifact",
+        artifact_path,
+    ]
+    if val_glob:
+        cmd.extend(["--val-data", val_glob])
+    if tokenizer_vocab:
+        cmd.extend(["--tokenizer-vocab", tokenizer_vocab])
+
+    result = subprocess.run(cmd, env=os.environ, capture_output=True, text=True, timeout=250)
 
     print(f"stdout: {result.stdout[-2000:]}")
     print(f"stderr: {result.stderr[-2000:]}")

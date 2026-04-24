@@ -15,7 +15,6 @@
 /// All schemes here are *uniform per-row* in this scaffold. Block-quantized
 /// variants are listed in the config space but quantize as `PerRow` for now —
 /// they will land when the packing kernels are implemented.
-
 use rayon::prelude::*;
 
 /// Bit width for one weight group.
@@ -108,20 +107,24 @@ pub struct GroupConfig {
 
 impl GroupConfig {
     pub fn new(bits: Bits, block: Block) -> Self {
-        Self { bits, block, clip: ClipStrategy::default() }
+        Self {
+            bits,
+            block,
+            clip: ClipStrategy::default(),
+        }
     }
 }
 
 /// Full quantization scheme — one entry per weight group in the model.
 #[derive(Debug, Clone)]
 pub struct Scheme {
-    pub attn_q:    GroupConfig,
-    pub attn_k:    GroupConfig,
-    pub attn_v:    GroupConfig,
-    pub attn_o:    GroupConfig,
-    pub mlp_up:    GroupConfig,
-    pub mlp_down:  GroupConfig,
-    pub embed:     GroupConfig,
+    pub attn_q: GroupConfig,
+    pub attn_k: GroupConfig,
+    pub attn_v: GroupConfig,
+    pub attn_o: GroupConfig,
+    pub mlp_up: GroupConfig,
+    pub mlp_down: GroupConfig,
+    pub embed: GroupConfig,
 }
 
 impl Scheme {
@@ -161,8 +164,12 @@ impl Scheme {
         let int6 = GroupConfig::new(Bits::B6, Block::PerRow);
         let int8 = GroupConfig::new(Bits::B8, Block::PerRow);
         Self {
-            attn_q: int5.clone(), attn_k: int5.clone(), attn_v: int5.clone(), attn_o: int5,
-            mlp_up: int6.clone(), mlp_down: int6,
+            attn_q: int5.clone(),
+            attn_k: int5.clone(),
+            attn_v: int5.clone(),
+            attn_o: int5,
+            mlp_up: int6.clone(),
+            mlp_down: int6,
             embed: int8,
         }
     }
@@ -173,8 +180,12 @@ impl Scheme {
         let int5 = GroupConfig::new(Bits::B5, Block::PerRow);
         let int6 = GroupConfig::new(Bits::B6, Block::PerRow);
         Self {
-            attn_q: int4.clone(), attn_k: int4.clone(), attn_v: int4.clone(), attn_o: int4,
-            mlp_up: int5.clone(), mlp_down: int5,
+            attn_q: int4.clone(),
+            attn_k: int4.clone(),
+            attn_v: int4.clone(),
+            attn_o: int4,
+            mlp_up: int5.clone(),
+            mlp_down: int5,
             embed: int6,
         }
     }
@@ -189,14 +200,14 @@ impl Scheme {
         embed_elems: usize,
         zstd_ratio: f32,
     ) -> usize {
-        let raw_bits = (attn_qkvo_elems / 4) * (
-            self.attn_q.bits.nbits()
+        let raw_bits = (attn_qkvo_elems / 4)
+            * (self.attn_q.bits.nbits()
                 + self.attn_k.bits.nbits()
                 + self.attn_v.bits.nbits()
-                + self.attn_o.bits.nbits()
-        ) + mlp_up_elems * self.mlp_up.bits.nbits()
-          + mlp_down_elems * self.mlp_down.bits.nbits()
-          + embed_elems * self.embed.bits.nbits();
+                + self.attn_o.bits.nbits())
+            + mlp_up_elems * self.mlp_up.bits.nbits()
+            + mlp_down_elems * self.mlp_down.bits.nbits()
+            + embed_elems * self.embed.bits.nbits();
         let raw_bytes = (raw_bits + 7) / 8;
         (raw_bytes as f32 * zstd_ratio) as usize
     }
@@ -206,11 +217,11 @@ impl Scheme {
 pub struct PackedWeight {
     pub bits: Bits,
     pub block: Block,
-    pub data: Vec<i8>,         // signed integers in [bits.qmin(), bits.qmax()]
-    pub scales: Vec<f32>,      // one per scale group
+    pub data: Vec<i8>,    // signed integers in [bits.qmin(), bits.qmax()]
+    pub scales: Vec<f32>, // one per scale group
     pub rows: usize,
     pub cols: usize,
-    pub mse: f64,              // sum-squared reconstruction error
+    pub mse: f64, // sum-squared reconstruction error
 }
 
 impl PackedWeight {
@@ -355,9 +366,12 @@ mod tests {
         }
 
         let recon = q.dequantize();
-        let mse: f64 = w.iter().zip(recon.iter())
+        let mse: f64 = w
+            .iter()
+            .zip(recon.iter())
             .map(|(&a, &b)| ((a - b) as f64).powi(2))
-            .sum::<f64>() / (rows * cols) as f64;
+            .sum::<f64>()
+            / (rows * cols) as f64;
         assert!(mse < 0.01, "int6 mse too high: {}", mse);
     }
 

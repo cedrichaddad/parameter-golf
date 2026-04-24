@@ -10,11 +10,7 @@
 
 /// Precompute cos/sin tables for RoPE.
 /// Returns (cos_table, sin_table), each of shape [seq_len, rope_dims/2].
-pub fn precompute_rope_tables(
-    seq_len: usize,
-    rope_dims: usize,
-    base: f32,
-) -> (Vec<f32>, Vec<f32>) {
+pub fn precompute_rope_tables(seq_len: usize, rope_dims: usize, base: f32) -> (Vec<f32>, Vec<f32>) {
     let half = rope_dims / 2;
     let mut cos_table = vec![0.0f32; seq_len * half];
     let mut sin_table = vec![0.0f32; seq_len * half];
@@ -130,10 +126,11 @@ mod tests {
     fn test_rope_roundtrip() {
         // Apply RoPE then inverse should recover original
         let (cos, sin) = precompute_rope_tables(4, 16, 10000.0);
-        let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-                           9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
-                           // passthrough dims (17-64 equivalent)
-                           100.0, 200.0, 300.0, 400.0];
+        let original = vec![
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0, // passthrough dims (17-64 equivalent)
+            100.0, 200.0, 300.0, 400.0,
+        ];
         let head_dim = 20; // 16 rope + 4 passthrough
         let rope_dims = 16;
 
@@ -153,7 +150,9 @@ mod tests {
             assert!(
                 (x[i] - original[i]).abs() < 1e-4,
                 "mismatch at {}: got {}, expected {}",
-                i, x[i], original[i]
+                i,
+                x[i],
+                original[i]
             );
         }
     }

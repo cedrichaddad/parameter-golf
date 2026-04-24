@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pg_core::error::{PgError, PgResult};
 
@@ -152,30 +152,41 @@ impl DistributedTokenLoader {
 
 /// Load all validation tokens from shard files matching a pattern.
 pub fn load_validation_tokens(pattern: &str) -> PgResult<Vec<u16>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(
-        Path::new(pattern)
-            .parent()
-            .ok_or_else(|| PgError::DataFormat("invalid pattern path".into()))?,
-    )?
-    .filter_map(Result::ok)
-    .map(|e| e.path())
-    .filter(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("fineweb_val_") && n.ends_with(".bin"))
-            .unwrap_or(false)
-    })
-    .collect();
+    load_validation_tokens_limited(pattern, None)
+}
+
+/// Load validation tokens up to an optional prefix limit.
+///
+/// This preserves legal score-first ordering for proxy/smoke evaluation while
+/// avoiding full-shard materialization when only a small eval prefix is needed.
+pub fn load_validation_tokens_limited(pattern: &str, max_tokens: Option<usize>) -> PgResult<Vec<u16>> {
+    let mut files: Vec<PathBuf> = glob::glob(pattern)
+        .map_err(|e| PgError::DataFormat(format!("invalid glob pattern: {}", e)))?
+        .filter_map(Result::ok)
+        .collect();
     files.sort();
 
     if files.is_empty() {
-        return Err(PgError::DataFormat("no validation files found".into()));
+        return Err(PgError::DataFormat(format!(
+            "no validation files found for pattern: {}",
+            pattern
+        )));
     }
 
     let mut all_tokens = Vec::new();
+    if let Some(limit) = max_tokens {
+        all_tokens.reserve(limit);
+    }
     for file in &files {
         let shard = DataShard::open(file)?;
-        all_tokens.extend_from_slice(shard.all_tokens());
+        let remaining = max_tokens
+            .map(|limit| limit.saturating_sub(all_tokens.len()))
+            .unwrap_or_else(|| shard.num_tokens());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(shard.num_tokens());
+        all_tokens.extend_from_slice(shard.tokens(0, take));
     }
 
     Ok(all_tokens)

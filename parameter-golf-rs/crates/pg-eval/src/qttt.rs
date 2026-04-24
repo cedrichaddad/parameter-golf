@@ -1,3 +1,4 @@
+use pg_model::backward::GradBuffers;
 /// qTTT — Query-only Test-Time Training (TDD §0, arXiv:2512.13898).
 ///
 /// Standard TTT fine-tunes the whole model on each scored chunk; qTTT
@@ -33,9 +34,7 @@
 /// - The score-first legal semantics are preserved: a chunk is scored
 ///   first with the *current* (i.e., post-training-from-previous-chunk)
 ///   weights, then trained on. No forward leak.
-
-use pg_model::{GptModel, ForwardBuffer};
-use pg_model::backward::GradBuffers;
+use pg_model::{ForwardBuffer, GptModel};
 
 use crate::sliding::{build_ttt_chunks, score_chunk};
 
@@ -312,7 +311,15 @@ pub fn train_chunk_qttt(
                 }
             }
 
-            sgd_step_qttt(model, grads, state, lr, cfg.momentum, q_half, cfg.adapt_q_gain);
+            sgd_step_qttt(
+                model,
+                grads,
+                state,
+                lr,
+                cfg.momentum,
+                q_half,
+                cfg.adapt_q_gain,
+            );
         }
     }
 
@@ -376,7 +383,15 @@ pub fn eval_qttt(
             } else {
                 1.0
             };
-            train_chunk_qttt(model, &mut state, chunk_slice, cfg, lr_scale, &mut buf, &mut grads);
+            train_chunk_qttt(
+                model,
+                &mut state,
+                chunk_slice,
+                cfg,
+                lr_scale,
+                &mut buf,
+                &mut grads,
+            );
         }
     }
 
@@ -414,6 +429,10 @@ mod tests {
             xsa_last_n: 0,
             logit_softcap: 30.0,
             qk_gain_init: 1.0,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,
@@ -475,31 +494,63 @@ mod tests {
         let mut grads = GradBuffers::new(&model.config);
 
         // Fill every grad with a nonzero sentinel.
-        for v in grads.qo_bank.iter_mut() { *v = 1.0; }
-        for v in grads.kv_bank.iter_mut() { *v = 1.0; }
-        for v in grads.mlp_up_bank.iter_mut() { *v = 1.0; }
-        for v in grads.mlp_down_bank.iter_mut() { *v = 1.0; }
-        for v in grads.tok_emb.iter_mut() { *v = 1.0; }
-        for v in grads.bigram_embed.iter_mut() { *v = 1.0; }
-        for v in grads.bigram_proj.iter_mut() { *v = 1.0; }
+        for v in grads.qo_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.kv_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.mlp_up_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.mlp_down_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.tok_emb.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.bigram_embed.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.bigram_proj.iter_mut() {
+            *v = 1.0;
+        }
         grads.bigram_scale = 1.0;
-        for v in grads.smear_gate.iter_mut() { *v = 1.0; }
-        for v in grads.skip_weights.iter_mut() { *v = 1.0; }
-        for v in grads.ve_embed.iter_mut() { *v = 1.0; }
-        for v in grads.ve_proj.iter_mut() { *v = 1.0; }
+        for v in grads.smear_gate.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.skip_weights.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.ve_embed.iter_mut() {
+            *v = 1.0;
+        }
+        for v in grads.ve_proj.iter_mut() {
+            *v = 1.0;
+        }
         grads.ve_scale = 1.0;
-        for v in grads.ve_layer_scales.iter_mut() { *v = 1.0; }
+        for v in grads.ve_layer_scales.iter_mut() {
+            *v = 1.0;
+        }
         for g in grads.block_attn_scale.iter_mut() {
-            for v in g { *v = 1.0; }
+            for v in g {
+                *v = 1.0;
+            }
         }
         for g in grads.block_mlp_scale.iter_mut() {
-            for v in g { *v = 1.0; }
+            for v in g {
+                *v = 1.0;
+            }
         }
         for g in grads.block_resid_mix.iter_mut() {
-            for v in g { *v = 1.0; }
+            for v in g {
+                *v = 1.0;
+            }
         }
         for g in grads.block_q_gain.iter_mut() {
-            for v in g { *v = 1.0; }
+            for v in g {
+                *v = 1.0;
+            }
         }
 
         let n = cfg.num_layers;
@@ -534,7 +585,9 @@ mod tests {
         let model = GptModel::new(cfg.clone());
         let mut grads = GradBuffers::new(&model.config);
         for g in grads.block_q_gain.iter_mut() {
-            for v in g { *v = 1.0; }
+            for v in g {
+                *v = 1.0;
+            }
         }
         let q_half = cfg.num_layers * cfg.model_dim * cfg.model_dim;
         mask_grads_qttt(&mut grads, q_half, false);
@@ -553,20 +606,26 @@ mod tests {
 
         let before_kv = model.kv_bank.clone();
         let before_mlp = model.mlp_up_bank.clone();
-        let before_q_half: Vec<f32> = model
-            .qo_bank[..cfg.num_layers * cfg.model_dim * cfg.model_dim]
-            .to_vec();
-        let before_o_half: Vec<f32> = model
-            .qo_bank[cfg.num_layers * cfg.model_dim * cfg.model_dim..]
-            .to_vec();
+        let before_q_half: Vec<f32> =
+            model.qo_bank[..cfg.num_layers * cfg.model_dim * cfg.model_dim].to_vec();
+        let before_o_half: Vec<f32> =
+            model.qo_bank[cfg.num_layers * cfg.model_dim * cfg.model_dim..].to_vec();
 
         // Construct non-trivial grads
         let mut grads = GradBuffers::new(&model.config);
-        for v in grads.qo_bank.iter_mut() { *v = 0.5; }
-        for v in grads.kv_bank.iter_mut() { *v = 0.5; }
-        for v in grads.mlp_up_bank.iter_mut() { *v = 0.5; }
+        for v in grads.qo_bank.iter_mut() {
+            *v = 0.5;
+        }
+        for v in grads.kv_bank.iter_mut() {
+            *v = 0.5;
+        }
+        for v in grads.mlp_up_bank.iter_mut() {
+            *v = 0.5;
+        }
         for g in grads.block_q_gain.iter_mut() {
-            for v in g { *v = 0.5; }
+            for v in g {
+                *v = 0.5;
+            }
         }
 
         let q_half = cfg.num_layers * cfg.model_dim * cfg.model_dim;
@@ -611,8 +670,12 @@ mod tests {
         let q_half = cfg.num_layers * cfg.model_dim * cfg.model_dim;
 
         // Put 1.0 into first 4 entries of q half → norm = 2.0
-        for v in grads.qo_bank[..q_half].iter_mut() { *v = 0.0; }
-        for v in grads.qo_bank[q_half..].iter_mut() { *v = 999.0; }
+        for v in grads.qo_bank[..q_half].iter_mut() {
+            *v = 0.0;
+        }
+        for v in grads.qo_bank[q_half..].iter_mut() {
+            *v = 999.0;
+        }
         grads.qo_bank[0] = 1.0;
         grads.qo_bank[1] = 1.0;
         grads.qo_bank[2] = 1.0;

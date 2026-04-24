@@ -53,9 +53,7 @@ fn main() {
         let host_data: Vec<bf16> = (0..n_elems)
             .map(|i| bf16::from_f32((i % 1000) as f32 * 0.001))
             .collect();
-        let dev = stream
-            .memcpy_stod(&host_data)
-            .expect("H2D copy failed");
+        let dev = stream.memcpy_stod(&host_data).expect("H2D copy failed");
         let roundtrip = stream.memcpy_dtov(&dev).expect("D2H copy failed");
         let dt = t0.elapsed();
 

@@ -45,3 +45,8 @@ path = "src/bin/parity_forward.rs"
 [[bin]]
 name = "parity-step"
 path = "src/bin/parity_step.rs"
+
+[[bin]]
+name = "parity-kernels"
+path = "src/bin/parity_kernels.rs"
+required-features = ["cuda"]

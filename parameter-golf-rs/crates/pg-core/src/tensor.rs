@@ -91,12 +91,23 @@ impl GpuTensor {
                 shape
             )));
         }
-        
-        let mut dev_data = stream.alloc_zeros::<u8>(expected_bytes)
+
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+        let mut dev_data = stream
+            .alloc_zeros::<u8>(expected_bytes)
             .map_err(|e| PgError::InvalidOp(format!("GPU alloc failed: {:?}", e)))?;
-        
-        stream.memcpy_htod(host_data, &mut dev_data)
-            .map_err(|e| PgError::InvalidOp(format!("GPU memcpy failed: {:?}", e)))?;
+
+        stream
+            .memcpy_htod(host_data, &mut dev_data)
+            .map_err(|e| {
+                PgError::InvalidOp(format!(
+                    "GPU memcpy failed for from_host_data_gpu shape {:?} dtype {:?} bytes {}: {:?}",
+                    shape, dtype, expected_bytes, e
+                ))
+            })?;
 
         Ok(Self {
             data: TensorStorage::Gpu {
@@ -117,7 +128,13 @@ impl GpuTensor {
     ) -> PgResult<Self> {
         let numel: usize = shape.iter().product();
         let nbytes = numel * dtype.size_bytes();
-        let data = stream.alloc_zeros::<u8>(nbytes).map_err(|e| PgError::InvalidOp(format!("GPU alloc failed: {:?}", e)))?;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+        let data = stream
+            .alloc_zeros::<u8>(nbytes)
+            .map_err(|e| PgError::InvalidOp(format!("GPU alloc failed: {:?}", e)))?;
         Ok(Self {
             data: TensorStorage::Gpu {
                 data: std::sync::Arc::new(data),
@@ -137,8 +154,65 @@ impl GpuTensor {
             TensorStorage::Cpu(data) => Ok(data[self.offset..self.offset + nbytes].to_vec()),
             #[cfg(feature = "cuda")]
             TensorStorage::Gpu { data, stream } => {
-                let all_data = stream.memcpy_dtov(data.as_ref()).map_err(|e| PgError::InvalidOp(format!("GPU memcpy failed: {:?}", e)))?;
+                stream
+                    .context()
+                    .bind_to_thread()
+                    .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+                let all_data = stream
+                    .memcpy_dtov(data.as_ref())
+                    .map_err(|e| PgError::InvalidOp(format!("GPU memcpy failed: {:?}", e)))?;
                 Ok(all_data[self.offset..self.offset + nbytes].to_vec())
+            }
+        }
+    }
+
+    /// Overwrite the full contents of a base tensor from host bytes.
+    ///
+    /// This intentionally rejects sliced views for now. The CUDA training
+    /// runtime uses it to refresh persistent device-resident weights between
+    /// steps without rebuilding the entire `GpuModel`.
+    pub fn copy_from_host_bytes(&mut self, host_data: &[u8]) -> PgResult<()> {
+        let expected_bytes = self.nbytes();
+        if host_data.len() != expected_bytes {
+            return Err(PgError::InvalidOp(format!(
+                "host data length {} != expected {} for shape {:?} dtype {}",
+                host_data.len(),
+                expected_bytes,
+                self.shape,
+                self.dtype
+            )));
+        }
+        if self.offset != 0 {
+            return Err(PgError::InvalidOp(
+                "copy_from_host_bytes only supports base tensors with offset=0".into(),
+            ));
+        }
+        match &mut self.data {
+            TensorStorage::Cpu(data) => {
+                let buf = std::sync::Arc::make_mut(data);
+                buf[..expected_bytes].copy_from_slice(host_data);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            TensorStorage::Gpu { data, stream } => {
+                stream
+                    .context()
+                    .bind_to_thread()
+                    .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+                let dev = std::sync::Arc::get_mut(data).ok_or_else(|| {
+                    PgError::InvalidOp(
+                        "cannot copy into shared GPU storage; tensor has outstanding aliases"
+                            .into(),
+                    )
+                })?;
+                stream
+                    .memcpy_htod(host_data, dev)
+                    .map_err(|e| {
+                        PgError::InvalidOp(format!(
+                            "GPU memcpy failed for copy_from_host_bytes shape {:?} dtype {:?} bytes {}: {:?}",
+                            self.shape, self.dtype, expected_bytes, e
+                        ))
+                    })
             }
         }
     }
@@ -357,5 +431,12 @@ mod tests {
         // Get O weight for layer 5 (stored at index 11 + 5 = 16)
         let o_weight = bank.slice_first(16).unwrap();
         assert_eq!(o_weight.shape(), &[512, 512]);
+    }
+
+    #[test]
+    fn test_copy_from_host_bytes_cpu() {
+        let mut t = GpuTensor::zeros_cpu(&[4], DType::I8);
+        t.copy_from_host_bytes(&[4, 3, 2, 1]).unwrap();
+        assert_eq!(t.to_host_bytes().unwrap(), vec![4, 3, 2, 1]);
     }
 }

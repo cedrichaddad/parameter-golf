@@ -1,3 +1,4 @@
+use pg_model::config::TrainConfig;
 /// Sliding window evaluation + legal score-first TTT.
 ///
 /// CRITICAL: Scoring windows are INSIDE the TTT chunk loop.
@@ -5,26 +6,27 @@
 ///   Phase 1: SCORE this chunk with stride-64 sliding windows (no gradients)
 ///   Phase 2: TRAIN on already-scored chunk (SGD, 3 epochs)
 /// Last chunk: scored but never trained on.
-
-use pg_model::{GptModel, ForwardBuffer};
-use pg_model::config::TrainConfig;
+use pg_model::{ForwardBuffer, GptModel};
 
 /// Compute NLL with softcap applied to logits: cap * tanh(logit / cap).
 /// This matches the training loss which applies softcap inside cross_entropy_forward.
 #[inline]
 fn nll_with_softcap(logits: &[f32], target: usize, softcap: f32) -> f32 {
-    // Apply softcap: capped = cap * tanh(logit / cap)
-    // Then standard NLL: -log(softmax(capped)[target])
-    let capped: Vec<f32> = if softcap > 0.0 {
-        logits.iter().map(|&l| softcap * (l / softcap).tanh()).collect()
-    } else {
-        logits.to_vec()
+    let cap = |l: f32| {
+        if softcap > 0.0 {
+            softcap * (l / softcap).tanh()
+        } else {
+            l
+        }
     };
-
-    let max_logit = capped.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = capped.iter().map(|&l| (l - max_logit).exp()).sum();
+    let target_logit = cap(logits[target]);
+    let max_logit = logits
+        .iter()
+        .map(|&l| cap(l))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits.iter().map(|&l| (cap(l) - max_logit).exp()).sum();
     let log_sum_exp = max_logit + sum_exp.ln();
-    log_sum_exp - capped[target]
+    log_sum_exp - target_logit
 }
 
 /// Sliding window BPB evaluation (no TTT).
@@ -32,7 +34,7 @@ fn nll_with_softcap(logits: &[f32], target: usize, softcap: f32) -> f32 {
 pub fn eval_sliding(
     model: &GptModel,
     val_tokens: &[u32],
-    base_bytes: &[f32],  // per-token byte counts for BPB
+    base_bytes: &[f32], // per-token byte counts for BPB
     stride: usize,
     seq_len: usize,
 ) -> (f64, f64) {
@@ -74,12 +76,17 @@ pub fn eval_sliding(
             let nll = nll_with_softcap(logits, tgt, softcap);
 
             // Only score the "new" tokens (stride region)
-            let s = if ws == 0 { 0 } else { wlen.saturating_sub(stride) };
+            let s = if ws == 0 {
+                0
+            } else {
+                wlen.saturating_sub(stride)
+            };
             if t >= s {
                 loss_sum += nll as f64;
                 token_count += 1;
-                if t < base_bytes.len() {
-                    byte_count += base_bytes[ws + t] as f64;
+                let tok_idx = ws + t;
+                if tok_idx < base_bytes.len() {
+                    byte_count += base_bytes[tok_idx] as f64;
                 } else {
                     byte_count += 1.0; // fallback
                 }
@@ -87,7 +94,11 @@ pub fn eval_sliding(
         }
     }
 
-    let val_loss = if token_count > 0 { loss_sum / token_count as f64 } else { 0.0 };
+    let val_loss = if token_count > 0 {
+        loss_sum / token_count as f64
+    } else {
+        0.0
+    };
     let bits_per_token = val_loss / 2.0f64.ln();
     let tokens_per_byte = if byte_count > 0.0 {
         token_count as f64 / byte_count
@@ -215,7 +226,8 @@ pub fn eval_ttt_scoring_only(
 
     for (ci, chunk) in chunks.iter().enumerate() {
         // Phase 1: Score
-        let (loss, tokens, bytes) = score_chunk(model, val_tokens, base_bytes, chunk, stride, seq_len);
+        let (loss, tokens, bytes) =
+            score_chunk(model, val_tokens, base_bytes, chunk, stride, seq_len);
         total_loss += loss;
         total_tokens_scored += tokens;
         total_bytes += bytes;
@@ -278,6 +290,10 @@ mod tests {
             xsa_last_n: 0,
             logit_softcap: 30.0,
             qk_gain_init: 1.0,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,

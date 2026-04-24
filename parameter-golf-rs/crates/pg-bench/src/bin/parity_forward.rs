@@ -1,12 +1,18 @@
-use pg_model::{ExecutionPlan, ForwardBuffer, GptModel, RunSpec, VariantFamily};
+use pg_model::{ExecutionPlan, ForwardBuffer, GptModel, RunSpec, TrainBackend, VariantFamily};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut spec = None;
     let mut builtin = VariantFamily::BaselineSp8192;
+    let mut backend = TrainBackend::Cpu;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--spec" => spec = args.next(),
+            "--backend" => {
+                if let Some(raw) = args.next() {
+                    backend = parse_backend(&raw).unwrap_or(backend);
+                }
+            }
             "--builtin" => {
                 if let Some(name) = args.next() {
                     builtin = match name.as_str() {
@@ -41,6 +47,7 @@ fn main() {
         .expect("cpu reference failed");
 
     println!("variant_fingerprint={}", plan.variant_fingerprint);
+    println!("backend={backend:?}");
     println!("tokens={tokens}");
     println!("vocab_size={}", config.vocab_size);
 
@@ -50,7 +57,14 @@ fn main() {
             Ok((max_abs, mean_abs)) => {
                 println!("gpu_forward_max_abs_diff={max_abs:.6}");
                 println!("gpu_forward_mean_abs_diff={mean_abs:.6}");
-                println!("status={}", if max_abs < 1e-3 { "parity_ok" } else { "parity_failed" });
+                println!(
+                    "status={}",
+                    if max_abs < 1e-3 {
+                        "parity_ok"
+                    } else {
+                        "parity_failed"
+                    }
+                );
             }
             Err(err) => {
                 println!("status=gpu_path_not_ready");
@@ -61,9 +75,22 @@ fn main() {
 
     #[cfg(not(feature = "cuda"))]
     {
-        let max_abs = cpu_buf.logits.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let max_abs = cpu_buf
+            .logits
+            .iter()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()));
         println!("cpu_forward_max_abs_logit={max_abs:.6}");
         println!("status=cpu_reference_only");
+    }
+}
+
+fn parse_backend(raw: &str) -> Option<TrainBackend> {
+    match raw {
+        "cpu" => Some(TrainBackend::Cpu),
+        "cuda-single" => Some(TrainBackend::CudaSingle),
+        "cuda-single-parity" => Some(TrainBackend::CudaSingleParity),
+        "cuda-distributed" => Some(TrainBackend::CudaDistributed),
+        _ => None,
     }
 }
 
@@ -83,8 +110,9 @@ fn run_cuda_parity(
     let gpu_model = GpuModel::from_cpu_reference(model, plan, ctx, stream.clone())
         .map_err(|e| format!("gpu model init: {e}"))?;
     let ids_bytes: &[u8] = bytemuck::cast_slice(input_ids);
-    let input = GpuTensor::from_host_data_gpu(stream.clone(), ids_bytes, &[input_ids.len()], DType::U32)
-        .map_err(|e| format!("input upload: {e}"))?;
+    let input =
+        GpuTensor::from_host_data_gpu(stream.clone(), ids_bytes, &[input_ids.len()], DType::U32)
+            .map_err(|e| format!("input upload: {e}"))?;
     let mut gpu_buf = GpuActivations::new_for_plan(plan, input_ids.len(), stream.clone())
         .map_err(|e| format!("activation alloc: {e}"))?;
 

@@ -23,7 +23,6 @@
 /// The point is that adding a new architecture is one type alias, not a
 /// new code path. The training and eval entry points are generic over
 /// `A: ArchTrait`.
-
 use std::marker::PhantomData;
 
 use crate::config::ModelConfig;

@@ -131,13 +131,13 @@ pub struct MuonBankState {
     pub momentum_buffer: Vec<f32>, // same shape as parameter
     pub scale: f32,                // max(1, M/N)^0.5
     // Pre-allocated scratch for NS5 (avoid per-step allocs)
-    pub ns_x: Vec<f32>,           // [B*rows*cols]
-    pub ns_a: Vec<f32>,           // [B*rows*rows]
-    pub ns_aa: Vec<f32>,          // [B*rows*rows]
-    pub ns_b: Vec<f32>,           // [B*rows*rows]
-    pub ns_new_x: Vec<f32>,       // [B*rows*cols]
-    pub ns_update: Vec<f32>,      // [B*M*N] — nesterov update scratch
-    pub ns_result: Vec<f32>,      // [B*M*N] — result scratch
+    pub ns_x: Vec<f32>,      // [B*rows*cols]
+    pub ns_a: Vec<f32>,      // [B*rows*rows]
+    pub ns_aa: Vec<f32>,     // [B*rows*rows]
+    pub ns_b: Vec<f32>,      // [B*rows*rows]
+    pub ns_new_x: Vec<f32>,  // [B*rows*cols]
+    pub ns_update: Vec<f32>, // [B*M*N] — nesterov update scratch
+    pub ns_result: Vec<f32>, // [B*M*N] — result scratch
 }
 
 /// Muon optimizer (CPU single-GPU reference).
@@ -215,13 +215,11 @@ impl Muon {
         } else {
             state.ns_update[..grad.len()].copy_from_slice(&state.momentum_buffer[..grad.len()]);
         }
-        let update = &state.ns_update[..grad.len()];
-
         // 3. Newton-Schulz orthogonalization
         let param_len = param.len();
         newton_schulz5(
-            &state.ns_update[..param_len], 
-            &[shape[0], shape[1], shape[2]], 
+            &state.ns_update[..param_len],
+            &[shape[0], shape[1], shape[2]],
             self.ns_steps,
             &mut state.ns_x,
             &mut state.ns_a,
@@ -266,7 +264,17 @@ mod tests {
         let mut aa = vec![0.0; 16];
         let mut new_x = vec![0.0; 16];
         let mut result = vec![0.0; 16];
-        newton_schulz5(&g, &[4, 4], 10, &mut x, &mut a_buf, &mut b_buf, &mut aa, &mut new_x, &mut result);
+        newton_schulz5(
+            &g,
+            &[4, 4],
+            10,
+            &mut x,
+            &mut a_buf,
+            &mut b_buf,
+            &mut aa,
+            &mut new_x,
+            &mut result,
+        );
 
         // Check that X^T X is approximately identity
         // NS5 pushes singular values toward uniformity
@@ -280,7 +288,10 @@ mod tests {
                 assert!(
                     (dot - expected).abs() < 0.5,
                     "XtX[{},{}]={}, expected {}",
-                    i, j, dot, expected
+                    i,
+                    j,
+                    dot,
+                    expected
                 );
             }
         }
@@ -321,7 +332,17 @@ mod tests {
         let mut aa = vec![0.0; 32];
         let mut new_x = vec![0.0; 32];
         let mut result = vec![0.0; 32];
-        newton_schulz5(&g, &[2, 4, 4], 10, &mut x, &mut a_buf, &mut b_buf, &mut aa, &mut new_x, &mut result);
+        newton_schulz5(
+            &g,
+            &[2, 4, 4],
+            10,
+            &mut x,
+            &mut a_buf,
+            &mut b_buf,
+            &mut aa,
+            &mut new_x,
+            &mut result,
+        );
         assert_eq!(result.len(), 32);
 
         // Diagonal elements should be close to ±1
@@ -331,7 +352,9 @@ mod tests {
                 assert!(
                     diag.abs() > 0.5,
                     "batch {} diag {} = {} (should be near ±1)",
-                    b, i, diag
+                    b,
+                    i,
+                    diag
                 );
             }
         }
@@ -349,7 +372,10 @@ mod tests {
         muon.step_bank(0, &mut param, &grad, &shape);
 
         // Parameters should change
-        let changed = param.iter().zip(param_before.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        let changed = param
+            .iter()
+            .zip(param_before.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(changed, "params should have changed after step");
     }
 }

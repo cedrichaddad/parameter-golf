@@ -105,9 +105,15 @@ mod tests {
         let mut grad_x_prev = vec![0.0; tokens * dim];
         let mut grad_gate = vec![0.0; dim];
         smear_gate_backward(
-            &x, &x_prev, &gate, &grad_out,
-            &mut grad_x, &mut grad_x_prev, &mut grad_gate,
-            tokens, dim,
+            &x,
+            &x_prev,
+            &gate,
+            &grad_out,
+            &mut grad_x,
+            &mut grad_x_prev,
+            &mut grad_gate,
+            tokens,
+            dim,
         );
 
         // Numerical check for gate gradient
@@ -123,14 +129,24 @@ mod tests {
             smear_gate_forward(&x, &x_prev, &gate_p, &mut out_p, tokens, dim);
             smear_gate_forward(&x, &x_prev, &gate_m, &mut out_m, tokens, dim);
 
-            let loss_p: f32 = grad_out.iter().zip(out_p.iter()).map(|(&a, &b)| a * b).sum();
-            let loss_m: f32 = grad_out.iter().zip(out_m.iter()).map(|(&a, &b)| a * b).sum();
+            let loss_p: f32 = grad_out
+                .iter()
+                .zip(out_p.iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            let loss_m: f32 = grad_out
+                .iter()
+                .zip(out_m.iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
             let numerical = (loss_p - loss_m) / (2.0 * eps);
 
             assert!(
                 (grad_gate[d] - numerical).abs() < 1e-3,
                 "gate grad mismatch at {}: analytical={}, numerical={}",
-                d, grad_gate[d], numerical
+                d,
+                grad_gate[d],
+                numerical
             );
         }
     }

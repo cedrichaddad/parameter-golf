@@ -41,7 +41,11 @@ pub fn xsa_forward(
                 let y_slice = &y[y_offset..y_offset + head_dim];
 
                 // y^T v
-                let dot: f32 = y_slice.iter().zip(v_slice.iter()).map(|(&a, &b)| a * b).sum();
+                let dot: f32 = y_slice
+                    .iter()
+                    .zip(v_slice.iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
                 let coeff = dot / v_norm_sq;
 
                 // z = y - coeff * v
@@ -83,32 +87,31 @@ pub fn xsa_backward(
                 let y_slice = &y[y_offset..y_offset + head_dim];
                 let go_slice = &grad_output[y_offset..y_offset + head_dim];
 
-                let y_dot_v: f32 = y_slice.iter().zip(v_slice.iter()).map(|(&a, &b)| a * b).sum();
+                let y_dot_v: f32 = y_slice
+                    .iter()
+                    .zip(v_slice.iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
                 let coeff = y_dot_v / v_norm_sq;
 
                 // grad_y = grad_out - (grad_out^T v / ||v||²) * v
-                let go_dot_v: f32 = go_slice.iter().zip(v_slice.iter()).map(|(&a, &b)| a * b).sum();
+                let go_dot_v: f32 = go_slice
+                    .iter()
+                    .zip(v_slice.iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
                 let go_coeff = go_dot_v / v_norm_sq;
 
                 for d in 0..head_dim {
                     grad_y[y_offset + d] = go_slice[d] - go_coeff * v_slice[d];
                 }
 
-                // grad_v contributions (accumulated across group heads)
-                // d/dv of (y - (y^T v / ||v||²) * v)
-                // = -(go^T y / ||v||² + coeff * go^T) * something... complex
-                // Simplified: grad_v += -coeff * go - (go^T v / ||v||²) * (y - 2*coeff*v) / ||v||²
-                // For correctness, use the full derivative:
-                // dL/dv_k = sum_g [ -go · (y·e_k/||v||² + coeff·e_k) + go · v · (2·y·v·e_k / ||v||⁴) ]
-                // This simplifies per-element to:
+                // grad_v = -coeff*go - (go·v / ||v||²)*y
+                //          + (2*(y·v)*(go·v) / ||v||⁴)*v
                 for d in 0..head_dim {
-                    let dcoeff_dv_d = (y_slice[d] * v_norm_sq - y_dot_v * 2.0 * v_slice[d])
-                        / (v_norm_sq * v_norm_sq);
-                    grad_v[v_offset + d] +=
-                        -go_slice[d] * coeff - (go_dot_v * v_slice[d] * 0.0); // simplified
-                    // Full derivative: -go · (dcoeff/dv · v + coeff · e_d)
-                    grad_v[v_offset + d] = grad_v[v_offset + d]
-                        - go_dot_v * dcoeff_dv_d; // projection term
+                    grad_v[v_offset + d] += -coeff * go_slice[d]
+                        - (go_dot_v / v_norm_sq) * y_slice[d]
+                        + (2.0 * y_dot_v * go_dot_v / (v_norm_sq * v_norm_sq)) * v_slice[d];
                 }
             }
         }
@@ -159,5 +162,73 @@ mod tests {
         // head 1: y=[0.5, 0.5], v=[1,0] → remove v-component → [0, 0.5]
         assert!(out[2].abs() < 1e-6);
         assert!((out[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_xsa_backward_numerical() {
+        let tokens = 2;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 3;
+        let y_len = tokens * num_heads * head_dim;
+        let v_len = tokens * num_kv_heads * head_dim;
+        let y: Vec<f32> = (0..y_len)
+            .map(|i| 0.07 * ((i * 5 + 3) % 17) as f32 - 0.5)
+            .collect();
+        let v: Vec<f32> = (0..v_len)
+            .map(|i| 0.05 * ((i * 7 + 2) % 19) as f32 - 0.4)
+            .collect();
+        let grad_out: Vec<f32> = (0..y_len)
+            .map(|i| 0.03 * ((i * 11 + 1) % 13) as f32 - 0.2)
+            .collect();
+
+        let mut grad_y = vec![0.0; y_len];
+        let mut grad_v = vec![0.0; v_len];
+        xsa_backward(
+            &y,
+            &v,
+            &grad_out,
+            &mut grad_y,
+            &mut grad_v,
+            tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+
+        let loss = |yy: &[f32], vv: &[f32]| -> f32 {
+            let mut out = vec![0.0; y_len];
+            xsa_forward(yy, vv, &mut out, tokens, num_heads, num_kv_heads, head_dim);
+            out.iter().zip(grad_out.iter()).map(|(&a, &b)| a * b).sum()
+        };
+        let eps = 1e-3;
+        for &idx in &[0usize, 5, y_len - 1] {
+            let mut yp = y.clone();
+            let mut ym = y.clone();
+            yp[idx] += eps;
+            ym[idx] -= eps;
+            let numerical = (loss(&yp, &v) - loss(&ym, &v)) / (2.0 * eps);
+            let diff = (grad_y[idx] - numerical).abs();
+            assert!(
+                diff < 2e-3,
+                "grad_y[{idx}] analytical={} numerical={} diff={diff}",
+                grad_y[idx],
+                numerical
+            );
+        }
+        for &idx in &[0usize, 4, v_len - 1] {
+            let mut vp = v.clone();
+            let mut vm = v.clone();
+            vp[idx] += eps;
+            vm[idx] -= eps;
+            let numerical = (loss(&y, &vp) - loss(&y, &vm)) / (2.0 * eps);
+            let diff = (grad_v[idx] - numerical).abs();
+            assert!(
+                diff < 2e-3,
+                "grad_v[{idx}] analytical={} numerical={} diff={diff}",
+                grad_v[idx],
+                numerical
+            );
+        }
     }
 }

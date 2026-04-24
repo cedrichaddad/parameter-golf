@@ -7,8 +7,8 @@
 
 /// Per-parameter AdamW state.
 pub struct AdamWState {
-    pub m: Vec<f32>,  // first moment
-    pub v: Vec<f32>,  // second moment
+    pub m: Vec<f32>, // first moment
+    pub v: Vec<f32>, // second moment
     pub step: usize,
 }
 
@@ -33,7 +33,13 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32) -> Self {
-        Self { lr, beta1, beta2, eps, weight_decay }
+        Self {
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+        }
     }
 
     /// Step for a single parameter group.
@@ -80,7 +86,11 @@ mod tests {
             adam.step(&mut param, &grad, &mut state);
         }
 
-        assert!(param[0].abs() < 0.01, "should converge to 0, got {}", param[0]);
+        assert!(
+            param[0].abs() < 0.01,
+            "should converge to 0, got {}",
+            param[0]
+        );
     }
 
     #[test]

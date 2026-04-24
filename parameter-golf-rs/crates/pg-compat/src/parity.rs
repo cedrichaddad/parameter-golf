@@ -31,12 +31,11 @@
 /// - `loss_atol = 1e-3`
 /// - `grad_max_rel_diff = 0.02` (2% relative error in max-norm sense)
 /// - `grad_atol_floor   = 1e-6` (don't divide by tiny denominators)
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::safetensors::SafeTensorsFile;
-use crate::writer::{f32_tensor, write_safetensors, OutTensor};
+use crate::writer::{OutTensor, f32_tensor, write_safetensors};
 
 /// A single named gradient (or activation) from one stack.
 pub struct NamedTensor<'a> {
@@ -50,11 +49,7 @@ pub struct NamedTensor<'a> {
 /// `loss` is the scalar loss.
 /// `grads` are the named gradient tensors. Use the same naming convention as
 /// the PyTorch dump (e.g. `grad.qo_bank`, `grad.tok_emb`, ...).
-pub fn dump_rust_step(
-    path: &Path,
-    loss: f32,
-    grads: &[NamedTensor],
-) -> std::io::Result<()> {
+pub fn dump_rust_step(path: &Path, loss: f32, grads: &[NamedTensor]) -> std::io::Result<()> {
     let loss_buf = [loss];
 
     // Build the safetensors entries
@@ -113,8 +108,7 @@ pub fn compare_dumps(
     torch_path: &Path,
     tol: &ParityTolerances,
 ) -> Result<ParityReport, String> {
-    let rust =
-        SafeTensorsFile::load(rust_path).map_err(|e| format!("loading rust dump: {}", e))?;
+    let rust = SafeTensorsFile::load(rust_path).map_err(|e| format!("loading rust dump: {}", e))?;
     let torch =
         SafeTensorsFile::load(torch_path).map_err(|e| format!("loading torch dump: {}", e))?;
 
@@ -152,7 +146,11 @@ pub fn compare_dumps(
                         max_abs_diff: f32::INFINITY,
                         max_rel_diff: f32::INFINITY,
                         passed: false,
-                        note: Some(format!("shape mismatch: rust={} torch={}", rg.len(), tg.len())),
+                        note: Some(format!(
+                            "shape mismatch: rust={} torch={}",
+                            rg.len(),
+                            tg.len()
+                        )),
                     });
                     all_passed = false;
                     continue;
@@ -205,7 +203,10 @@ pub fn format_report(report: &ParityReport) -> String {
         "ParityReport: passed={} loss_diff={:.3e}\n",
         report.passed, report.loss_diff
     ));
-    out.push_str(&format!("{:<48} {:>14} {:>14} {:>6}\n", "tensor", "max_abs", "max_rel", "ok"));
+    out.push_str(&format!(
+        "{:<48} {:>14} {:>14} {:>6}\n",
+        "tensor", "max_abs", "max_rel", "ok"
+    ));
     for d in &report.grad_diffs {
         let note = d.note.as_deref().unwrap_or("");
         out.push_str(&format!(
@@ -236,8 +237,16 @@ mod tests {
         let g_b: Vec<f32> = vec![1.0, 2.0, 3.0];
 
         let grads = vec![
-            NamedTensor { name: "grad.qo_bank", shape: vec![2, 2], data: &g_a },
-            NamedTensor { name: "grad.tok_emb", shape: vec![3], data: &g_b },
+            NamedTensor {
+                name: "grad.qo_bank",
+                shape: vec![2, 2],
+                data: &g_a,
+            },
+            NamedTensor {
+                name: "grad.tok_emb",
+                shape: vec![3],
+                data: &g_b,
+            },
         ];
 
         let path_a = tmp_path("ident_a");
@@ -260,15 +269,26 @@ mod tests {
     fn test_compare_detects_mismatch() {
         let g_ref: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let g_bad: Vec<f32> = vec![1.0, 2.0, 3.0, 4.5]; // 12.5% relative error in max
-        let grads_ref = vec![NamedTensor { name: "grad.x", shape: vec![4], data: &g_ref }];
-        let grads_bad = vec![NamedTensor { name: "grad.x", shape: vec![4], data: &g_bad }];
+        let grads_ref = vec![NamedTensor {
+            name: "grad.x",
+            shape: vec![4],
+            data: &g_ref,
+        }];
+        let grads_bad = vec![NamedTensor {
+            name: "grad.x",
+            shape: vec![4],
+            data: &g_bad,
+        }];
 
         let p_ref = tmp_path("ref");
         let p_bad = tmp_path("bad");
         dump_rust_step(&p_ref, 1.0, &grads_ref).unwrap();
         dump_rust_step(&p_bad, 1.0, &grads_bad).unwrap();
 
-        let tol = ParityTolerances { grad_max_rel: 0.02, ..Default::default() };
+        let tol = ParityTolerances {
+            grad_max_rel: 0.02,
+            ..Default::default()
+        };
         let report = compare_dumps(&p_bad, &p_ref, &tol).unwrap();
         assert!(!report.passed);
         assert!(report.grad_diffs[0].max_rel_diff > 0.1);

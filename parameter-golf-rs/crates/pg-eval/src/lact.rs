@@ -1,3 +1,4 @@
+use pg_model::backward::GradBuffers;
 /// LaCT — Large Chunk Test-Time Training (TDD §0, arXiv:2505.23884).
 ///
 /// Standard per-window TTT runs at <5% H100 utilisation because every
@@ -24,11 +25,9 @@
 /// composed give "document-sized gradient accumulation on Q only",
 /// which is the configuration recommended by the professor-sync memo
 /// and the one we'll run in the ablations.
+use pg_model::{ForwardBuffer, GptModel};
 
-use pg_model::{GptModel, ForwardBuffer};
-use pg_model::backward::GradBuffers;
-
-use crate::qttt::{mask_grads_qttt, sgd_step_qttt, QttTParams, QttTConfig};
+use crate::qttt::{QttTConfig, QttTParams, mask_grads_qttt, sgd_step_qttt};
 use crate::sliding::{build_ttt_chunks, score_chunk};
 
 /// Hyper-parameters for the LaCT loop.
@@ -123,13 +122,25 @@ pub fn accumulate_grads(dst: &mut GradBuffers, src: &GradBuffers) {
     accumulate(&mut dst.ve_proj, &src.ve_proj);
     dst.ve_scale += src.ve_scale;
     accumulate(&mut dst.ve_layer_scales, &src.ve_layer_scales);
-    for (a, b) in dst.block_attn_scale.iter_mut().zip(src.block_attn_scale.iter()) {
+    for (a, b) in dst
+        .block_attn_scale
+        .iter_mut()
+        .zip(src.block_attn_scale.iter())
+    {
         accumulate(a, b);
     }
-    for (a, b) in dst.block_mlp_scale.iter_mut().zip(src.block_mlp_scale.iter()) {
+    for (a, b) in dst
+        .block_mlp_scale
+        .iter_mut()
+        .zip(src.block_mlp_scale.iter())
+    {
         accumulate(a, b);
     }
-    for (a, b) in dst.block_resid_mix.iter_mut().zip(src.block_resid_mix.iter()) {
+    for (a, b) in dst
+        .block_resid_mix
+        .iter_mut()
+        .zip(src.block_resid_mix.iter())
+    {
         accumulate(a, b);
     }
     for (a, b) in dst.block_q_gain.iter_mut().zip(src.block_q_gain.iter()) {
@@ -154,10 +165,18 @@ pub fn scale_grads(grads: &mut GradBuffers, k: f32) {
     scale(&mut grads.ve_proj, k);
     grads.ve_scale *= k;
     scale(&mut grads.ve_layer_scales, k);
-    for g in grads.block_attn_scale.iter_mut() { scale(g, k); }
-    for g in grads.block_mlp_scale.iter_mut() { scale(g, k); }
-    for g in grads.block_resid_mix.iter_mut() { scale(g, k); }
-    for g in grads.block_q_gain.iter_mut() { scale(g, k); }
+    for g in grads.block_attn_scale.iter_mut() {
+        scale(g, k);
+    }
+    for g in grads.block_mlp_scale.iter_mut() {
+        scale(g, k);
+    }
+    for g in grads.block_resid_mix.iter_mut() {
+        scale(g, k);
+    }
+    for g in grads.block_q_gain.iter_mut() {
+        scale(g, k);
+    }
 }
 
 /// Full-model momentum state (used when `q_only = false`).
@@ -182,10 +201,18 @@ impl LaCtMomentum {
     }
 
     pub fn reset(&mut self) {
-        for v in &mut self.qo { *v = 0.0; }
-        for v in &mut self.kv { *v = 0.0; }
-        for v in &mut self.mlp_up { *v = 0.0; }
-        for v in &mut self.mlp_down { *v = 0.0; }
+        for v in &mut self.qo {
+            *v = 0.0;
+        }
+        for v in &mut self.kv {
+            *v = 0.0;
+        }
+        for v in &mut self.mlp_up {
+            *v = 0.0;
+        }
+        for v in &mut self.mlp_down {
+            *v = 0.0;
+        }
     }
 }
 
@@ -206,41 +233,73 @@ pub fn sgd_step_full(
     };
     apply(&mut model.qo_bank, &grads.qo_bank, &mut state.qo);
     apply(&mut model.kv_bank, &grads.kv_bank, &mut state.kv);
-    apply(&mut model.mlp_up_bank, &grads.mlp_up_bank, &mut state.mlp_up);
-    apply(&mut model.mlp_down_bank, &grads.mlp_down_bank, &mut state.mlp_down);
+    apply(
+        &mut model.mlp_up_bank,
+        &grads.mlp_up_bank,
+        &mut state.mlp_up,
+    );
+    apply(
+        &mut model.mlp_down_bank,
+        &grads.mlp_down_bank,
+        &mut state.mlp_down,
+    );
 }
 
 /// L2 norm over the banks (used for full-model grad clipping).
 pub fn full_grad_norm(grads: &GradBuffers) -> f32 {
     let mut sq = 0.0f64;
-    for v in &grads.qo_bank { sq += (*v as f64) * (*v as f64); }
-    for v in &grads.kv_bank { sq += (*v as f64) * (*v as f64); }
-    for v in &grads.mlp_up_bank { sq += (*v as f64) * (*v as f64); }
-    for v in &grads.mlp_down_bank { sq += (*v as f64) * (*v as f64); }
+    for v in &grads.qo_bank {
+        sq += (*v as f64) * (*v as f64);
+    }
+    for v in &grads.kv_bank {
+        sq += (*v as f64) * (*v as f64);
+    }
+    for v in &grads.mlp_up_bank {
+        sq += (*v as f64) * (*v as f64);
+    }
+    for v in &grads.mlp_down_bank {
+        sq += (*v as f64) * (*v as f64);
+    }
     (sq as f32).sqrt()
 }
 
 fn clip_bank_grads(grads: &mut GradBuffers, max_norm: f32) {
-    if max_norm <= 0.0 { return; }
+    if max_norm <= 0.0 {
+        return;
+    }
     let n = full_grad_norm(grads);
     if n > max_norm {
         let s = max_norm / n;
-        for v in grads.qo_bank.iter_mut() { *v *= s; }
-        for v in grads.kv_bank.iter_mut() { *v *= s; }
-        for v in grads.mlp_up_bank.iter_mut() { *v *= s; }
-        for v in grads.mlp_down_bank.iter_mut() { *v *= s; }
+        for v in grads.qo_bank.iter_mut() {
+            *v *= s;
+        }
+        for v in grads.kv_bank.iter_mut() {
+            *v *= s;
+        }
+        for v in grads.mlp_up_bank.iter_mut() {
+            *v *= s;
+        }
+        for v in grads.mlp_down_bank.iter_mut() {
+            *v *= s;
+        }
     }
 }
 
 fn clip_q_grads(grads: &mut GradBuffers, max_norm: f32, q_half: usize, adapt_q_gain: bool) {
-    if max_norm <= 0.0 { return; }
+    if max_norm <= 0.0 {
+        return;
+    }
     let n = crate::qttt::q_grad_norm(grads, q_half, adapt_q_gain);
     if n > max_norm {
         let s = max_norm / n;
-        for v in &mut grads.qo_bank[..q_half] { *v *= s; }
+        for v in &mut grads.qo_bank[..q_half] {
+            *v *= s;
+        }
         if adapt_q_gain {
             for g in grads.block_q_gain.iter_mut() {
-                for v in g { *v *= s; }
+                for v in g {
+                    *v *= s;
+                }
             }
         }
     }
@@ -370,8 +429,7 @@ pub fn eval_lact(
         // Train (not on the last chunk).
         let is_last = ci == num_chunks - 1;
         if !is_last && cfg.epochs > 0 {
-            let chunk_slice =
-                &val_tokens[chunk.chunk_start..chunk.chunk_end.min(val_tokens.len())];
+            let chunk_slice = &val_tokens[chunk.chunk_start..chunk.chunk_end.min(val_tokens.len())];
             let lr_scale = if cfg.cosine_decay {
                 cosine_lr_scale(ci, num_chunks)
             } else {
@@ -425,6 +483,10 @@ mod tests {
             xsa_last_n: 0,
             logit_softcap: 30.0,
             qk_gain_init: 1.0,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,
@@ -444,8 +506,12 @@ mod tests {
         let cfg = tiny_config();
         let mut a = GradBuffers::new(&cfg);
         let mut b = GradBuffers::new(&cfg);
-        for v in a.qo_bank.iter_mut() { *v = 1.0; }
-        for v in b.qo_bank.iter_mut() { *v = 2.0; }
+        for v in a.qo_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in b.qo_bank.iter_mut() {
+            *v = 2.0;
+        }
         a.ve_scale = 3.0;
         b.ve_scale = 4.0;
 
@@ -458,7 +524,9 @@ mod tests {
     fn test_scale_grads_halves_everything() {
         let cfg = tiny_config();
         let mut g = GradBuffers::new(&cfg);
-        for v in g.qo_bank.iter_mut() { *v = 4.0; }
+        for v in g.qo_bank.iter_mut() {
+            *v = 4.0;
+        }
         g.ve_scale = 10.0;
         scale_grads(&mut g, 0.5);
         assert!(g.qo_bank.iter().all(|&v| (v - 2.0).abs() < 1e-6));
@@ -485,10 +553,18 @@ mod tests {
         let before_mlp_dn = model.mlp_down_bank.clone();
 
         let mut g = GradBuffers::new(&cfg);
-        for v in g.qo_bank.iter_mut() { *v = 1.0; }
-        for v in g.kv_bank.iter_mut() { *v = 1.0; }
-        for v in g.mlp_up_bank.iter_mut() { *v = 1.0; }
-        for v in g.mlp_down_bank.iter_mut() { *v = 1.0; }
+        for v in g.qo_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in g.kv_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in g.mlp_up_bank.iter_mut() {
+            *v = 1.0;
+        }
+        for v in g.mlp_down_bank.iter_mut() {
+            *v = 1.0;
+        }
 
         let mut st = LaCtMomentum::new(&model);
         sgd_step_full(&mut model, &g, &mut st, 0.1, 0.0);

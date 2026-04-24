@@ -10,18 +10,17 @@
 ///   - kv_bank [22, 256, 512]: K projections [0..11], V projections [11..22]
 ///   - mlp_up_bank [11, 1536, 512]: MLP gate/up projections
 ///   - mlp_down_bank [11, 512, 1536]: MLP down projections
-
 use crate::config::ModelConfig;
 use crate::plan::ExecutionPlan;
 use pg_core::PgResult;
 
 /// Per-block learnable parameters (non-banked).
 pub struct BlockParams {
-    pub attn_scale: Vec<f32>,    // [model_dim]
-    pub mlp_scale: Vec<f32>,     // [model_dim]
-    pub resid_mix: Vec<f32>,     // [2, model_dim] — resid_mix[0] and resid_mix[1]
-    pub q_gain: Vec<f32>,        // [num_heads]
-    pub ln_scale_factor: f32,    // 1/sqrt(layer_idx + 1) if ln_scale
+    pub attn_scale: Vec<f32>, // [model_dim]
+    pub mlp_scale: Vec<f32>,  // [model_dim]
+    pub resid_mix: Vec<f32>,  // [2, model_dim] — resid_mix[0] and resid_mix[1]
+    pub q_gain: Vec<f32>,     // [num_heads]
+    pub ln_scale_factor: f32, // 1/sqrt(layer_idx + 1) if ln_scale
     pub use_xsa: bool,
 }
 
@@ -60,8 +59,8 @@ pub struct GptModel {
     pub ve_layer_scales: Vec<f32>, // one per VE layer
 
     // Precomputed RoPE tables
-    pub rope_cos: Vec<f32>,      // [seq_len, rope_dims/2]
-    pub rope_sin: Vec<f32>,      // [seq_len, rope_dims/2]
+    pub rope_cos: Vec<f32>, // [seq_len, rope_dims/2]
+    pub rope_sin: Vec<f32>, // [seq_len, rope_dims/2]
 }
 
 /// Intermediate activations for a single forward pass.
@@ -77,31 +76,31 @@ pub struct ForwardBuffer {
     pub mlp_dim: usize,
 
     // Scratch buffers
-    pub x: Vec<f32>,             // [tokens, model_dim] — main hidden state
-    pub x0: Vec<f32>,            // [tokens, model_dim] — residual stream anchor
-    pub x_in: Vec<f32>,          // [tokens, model_dim]
-    pub attn_norm_out: Vec<f32>, // [tokens, model_dim]
-    pub mlp_norm_out: Vec<f32>,  // [tokens, model_dim]
-    pub q: Vec<f32>,             // [tokens, num_heads, head_dim]
-    pub k: Vec<f32>,             // [tokens, num_kv_heads, head_dim]
-    pub v: Vec<f32>,             // [tokens, num_kv_heads, head_dim]
-    pub attn_out: Vec<f32>,      // [tokens, num_heads, head_dim]
-    pub xsa_out: Vec<f32>,       // [tokens, num_heads, head_dim]
-    pub proj_out: Vec<f32>,      // [tokens, model_dim]
-    pub mlp_up: Vec<f32>,        // [tokens, mlp_dim]
-    pub mlp_act: Vec<f32>,       // [tokens, mlp_dim] (after activation)
-    pub mlp_out: Vec<f32>,       // [tokens, model_dim]
-    pub bigram_out: Vec<f32>,    // [tokens, bigram_dim]
+    pub x: Vec<f32>,               // [tokens, model_dim] — main hidden state
+    pub x0: Vec<f32>,              // [tokens, model_dim] — residual stream anchor
+    pub x_in: Vec<f32>,            // [tokens, model_dim]
+    pub attn_norm_out: Vec<f32>,   // [tokens, model_dim]
+    pub mlp_norm_out: Vec<f32>,    // [tokens, model_dim]
+    pub q: Vec<f32>,               // [tokens, num_heads, head_dim]
+    pub k: Vec<f32>,               // [tokens, num_kv_heads, head_dim]
+    pub v: Vec<f32>,               // [tokens, num_kv_heads, head_dim]
+    pub attn_out: Vec<f32>,        // [tokens, num_heads, head_dim]
+    pub xsa_out: Vec<f32>,         // [tokens, num_heads, head_dim]
+    pub proj_out: Vec<f32>,        // [tokens, model_dim]
+    pub mlp_up: Vec<f32>,          // [tokens, mlp_dim]
+    pub mlp_act: Vec<f32>,         // [tokens, mlp_dim] (after activation)
+    pub mlp_out: Vec<f32>,         // [tokens, model_dim]
+    pub bigram_out: Vec<f32>,      // [tokens, bigram_dim]
     pub bigram_proj_out: Vec<f32>, // [tokens, model_dim]
-    pub ve_out: Vec<f32>,        // [tokens, kv_dim]
-    pub ve_embed_out: Vec<f32>,  // [tokens, ve_dim]
-    pub logits: Vec<f32>,        // [tokens, vocab_size]
+    pub ve_out: Vec<f32>,          // [tokens, kv_dim]
+    pub ve_embed_out: Vec<f32>,    // [tokens, ve_dim]
+    pub logits: Vec<f32>,          // [tokens, vocab_size]
 
     // Skip connections stack (encoder outputs)
     pub skips: Vec<Vec<f32>>,
 
     // v0 cache for VRL
-    pub v0: Option<Vec<f32>>,    // [tokens, num_kv_heads, head_dim]
+    pub v0: Option<Vec<f32>>, // [tokens, num_kv_heads, head_dim]
 
     // VE cache (shared computation)
     pub ve_cache: Option<Vec<f32>>, // [tokens, kv_dim]
@@ -165,6 +164,14 @@ impl ForwardBuffer {
 }
 
 impl GptModel {
+    pub(crate) fn parallel_residual_enabled(&self) -> bool {
+        self.config.parallel_residual
+    }
+
+    pub(crate) fn is_recurrent_layer(&self, layer: usize) -> bool {
+        self.config.is_recurrent_layer(layer)
+    }
+
     pub fn new(config: ModelConfig) -> Self {
         let n = config.num_layers;
         let d = config.model_dim;
@@ -360,12 +367,7 @@ impl GptModel {
     }
 
     /// Compute value embedding for a layer, using cache.
-    fn compute_ve(
-        &self,
-        layer: usize,
-        tokens: &[u32],
-        buf: &mut ForwardBuffer,
-    ) {
+    fn compute_ve(&self, layer: usize, tokens: &[u32], buf: &mut ForwardBuffer) {
         if !self.config.ve_enabled {
             return;
         }
@@ -392,7 +394,9 @@ impl GptModel {
                 &buf.ve_embed_out[..t * ve_dim],
                 &self.ve_proj,
                 &mut projected,
-                t, kv_dim, ve_dim,
+                t,
+                kv_dim,
+                ve_dim,
             );
             // Scale by ve_scale
             for v in projected.iter_mut() {
@@ -409,13 +413,8 @@ impl GptModel {
         }
     }
 
-    /// Run a single transformer block forward.
-    pub(crate) fn block_forward(
-        &self,
-        layer: usize,
-        tokens: &[u32],
-        buf: &mut ForwardBuffer,
-    ) {
+    /// Run one application of a transformer block forward.
+    pub(crate) fn block_forward_once(&self, layer: usize, tokens: &[u32], buf: &mut ForwardBuffer) {
         let t = buf.tokens;
         let d = buf.model_dim;
         let h = buf.num_heads;
@@ -428,8 +427,7 @@ impl GptModel {
         // 1. Residual mixing: x_in = resid_mix[0] * x + resid_mix[1] * x0
         for i in 0..t * d {
             let dim_idx = i % d;
-            buf.x_in[i] = bp.resid_mix[dim_idx] * buf.x[i]
-                + bp.resid_mix[d + dim_idx] * buf.x0[i];
+            buf.x_in[i] = bp.resid_mix[dim_idx] * buf.x[i] + bp.resid_mix[d + dim_idx] * buf.x0[i];
         }
 
         // 2. Attention norm: RMSNorm(x_in) * ln_scale_factor
@@ -447,13 +445,28 @@ impl GptModel {
         let v_w = self.v_weight(layer);
 
         pg_kernels::linear::linear_forward(
-            &buf.attn_norm_out[..t * d], q_w, &mut buf.q[..t * d], t, d, d,
+            &buf.attn_norm_out[..t * d],
+            q_w,
+            &mut buf.q[..t * d],
+            t,
+            d,
+            d,
         );
         pg_kernels::linear::linear_forward(
-            &buf.attn_norm_out[..t * d], k_w, &mut buf.k[..t * kv_dim], t, kv_dim, d,
+            &buf.attn_norm_out[..t * d],
+            k_w,
+            &mut buf.k[..t * kv_dim],
+            t,
+            kv_dim,
+            d,
         );
         pg_kernels::linear::linear_forward(
-            &buf.attn_norm_out[..t * d], v_w, &mut buf.v[..t * kv_dim], t, kv_dim, d,
+            &buf.attn_norm_out[..t * d],
+            v_w,
+            &mut buf.v[..t * kv_dim],
+            t,
+            kv_dim,
+            d,
         );
 
         // 4. Add value embedding if applicable
@@ -466,52 +479,20 @@ impl GptModel {
 
         // 5-6. VRL disabled in SOTA config (value_residual=False)
 
-        // 7. QK-norm (RMSNorm on Q and K per head)
-        // Q: [tokens, num_heads * head_dim] — normalize each head's head_dim slice
-        for i in 0..t * h {
-            let offset = i * hd;
-            let slice = &buf.q[offset..offset + hd];
-            let rms = (slice.iter().map(|&x| x * x).sum::<f32>() / hd as f32 + 1e-6).sqrt();
-            let inv_rms = 1.0 / rms;
-            for j in 0..hd {
-                buf.q[offset + j] *= inv_rms;
-            }
-        }
-        for i in 0..t * hkv {
-            let offset = i * hd;
-            let slice = &buf.k[offset..offset + hd];
-            let rms = (slice.iter().map(|&x| x * x).sum::<f32>() / hd as f32 + 1e-6).sqrt();
-            let inv_rms = 1.0 / rms;
-            for j in 0..hd {
-                buf.k[offset + j] *= inv_rms;
-            }
-        }
-
-        // 8. Partial RoPE on Q and K
-        let rope_dims = self.config.rope_dims;
-        if rope_dims > 0 {
-            pg_kernels::rope::apply_partial_rope(
-                &mut buf.q[..t * h * hd],
-                &self.rope_cos, &self.rope_sin,
-                1, t, h, hd, rope_dims,
-            );
-            pg_kernels::rope::apply_partial_rope(
-                &mut buf.k[..t * hkv * hd],
-                &self.rope_cos, &self.rope_sin,
-                1, t, hkv, hd, rope_dims,
-            );
-        }
-
-        // 9. Apply q_gain: Q *= q_gain[head] per head
-        for tok in 0..t {
-            for head in 0..h {
-                let offset = (tok * h + head) * hd;
-                let gain = bp.q_gain[head];
-                for j in 0..hd {
-                    buf.q[offset + j] *= gain;
-                }
-            }
-        }
+        // 7-9. Fusion C: Q/K norm + partial RoPE + q_gain.
+        pg_kernels::fusion::rmsnorm_qk_rope_qgain_fused(
+            &mut buf.q[..t * h * hd],
+            &mut buf.k[..t * hkv * hd],
+            &self.rope_cos,
+            &self.rope_sin,
+            &bp.q_gain,
+            t,
+            h,
+            hkv,
+            hd,
+            self.config.rope_dims,
+            1e-6,
+        );
 
         // 10. Causal attention
         pg_kernels::attention::causal_attention_forward(
@@ -519,7 +500,10 @@ impl GptModel {
             &buf.k[..t * hkv * hd],
             &buf.v[..t * hkv * hd],
             &mut buf.attn_out[..t * h * hd],
-            t, h, hkv, hd,
+            t,
+            h,
+            hkv,
+            hd,
         );
 
         // 11. XSA (last N layers)
@@ -528,7 +512,10 @@ impl GptModel {
                 &buf.attn_out[..t * h * hd],
                 &buf.v[..t * hkv * hd],
                 &mut buf.xsa_out[..t * h * hd],
-                t, h, hkv, hd,
+                t,
+                h,
+                hkv,
+                hd,
             );
             &buf.xsa_out[..t * h * hd]
         } else {
@@ -538,19 +525,23 @@ impl GptModel {
         // 12. Reshape [tokens, num_heads, head_dim] → [tokens, model_dim] and output projection
         // attn_result is already [t * d] since d = h * hd
         let o_w = self.o_weight(layer);
-        pg_kernels::linear::linear_forward(
-            attn_result, o_w, &mut buf.proj_out[..t * d], t, d, d,
-        );
+        pg_kernels::linear::linear_forward(attn_result, o_w, &mut buf.proj_out[..t * d], t, d, d);
 
-        // 13. Residual: x_out = x_in + attn_scale * proj_out
+        // 13. Residual after attention.
         for i in 0..t * d {
             let dim_idx = i % d;
             buf.x[i] = buf.x_in[i] + bp.attn_scale[dim_idx] * buf.proj_out[i];
         }
 
+        let mlp_input = if self.parallel_residual_enabled() {
+            &buf.x_in[..t * d]
+        } else {
+            &buf.x[..t * d]
+        };
+
         // 14. MLP norm
         pg_kernels::rms_norm::rms_norm_forward_cpu(
-            &buf.x[..t * d],
+            mlp_input,
             &mut buf.mlp_norm_out[..t * d],
             d,
             bp.ln_scale_factor,
@@ -562,19 +553,43 @@ impl GptModel {
         let down_w = self.mlp_down_weight(layer);
 
         pg_kernels::linear::linear_forward(
-            &buf.mlp_norm_out[..t * d], up_w, &mut buf.mlp_up[..t * mlp_dim], t, mlp_dim, d,
+            &buf.mlp_norm_out[..t * d],
+            up_w,
+            &mut buf.mlp_up[..t * mlp_dim],
+            t,
+            mlp_dim,
+            d,
         );
         pg_kernels::activations::leaky_relu_sq_forward(
-            &buf.mlp_up[..t * mlp_dim], &mut buf.mlp_act[..t * mlp_dim],
+            &buf.mlp_up[..t * mlp_dim],
+            &mut buf.mlp_act[..t * mlp_dim],
         );
         pg_kernels::linear::linear_forward(
-            &buf.mlp_act[..t * mlp_dim], down_w, &mut buf.mlp_out[..t * d], t, d, mlp_dim,
+            &buf.mlp_act[..t * mlp_dim],
+            down_w,
+            &mut buf.mlp_out[..t * d],
+            t,
+            d,
+            mlp_dim,
         );
 
         // 16. Residual: x = x + mlp_scale * mlp_out
         for i in 0..t * d {
             let dim_idx = i % d;
-            buf.x[i] += bp.mlp_scale[dim_idx] * buf.mlp_out[i];
+            let base = if self.parallel_residual_enabled() {
+                buf.x_in[i] + bp.attn_scale[dim_idx] * buf.proj_out[i]
+            } else {
+                buf.x[i]
+            };
+            buf.x[i] = base + bp.mlp_scale[dim_idx] * buf.mlp_out[i];
+        }
+    }
+
+    /// Run a logical transformer block forward, including recurrence when enabled.
+    pub(crate) fn block_forward(&self, layer: usize, tokens: &[u32], buf: &mut ForwardBuffer) {
+        self.block_forward_once(layer, tokens, buf);
+        if self.is_recurrent_layer(layer) {
+            self.block_forward_once(layer, tokens, buf);
         }
     }
 
@@ -603,25 +618,19 @@ impl GptModel {
             buf.x[i * d..(i + 1) * d].copy_from_slice(src);
         }
 
-        // 2. Add bigram hash embedding
+        // 2. Fusion B: token embedding + bigram gather + projection + add.
         if self.config.bigram_vocab_size > 0 {
-            let bigram_dim = self.config.bigram_dim;
-            pg_kernels::bigram_hash::bigram_hash_forward(
+            pg_kernels::fusion::bigram_embed_fused(
                 input_ids,
+                &self.tok_emb,
                 &self.bigram_embed,
-                &mut buf.bigram_out[..t * bigram_dim],
-                self.config.bigram_vocab_size,
-                bigram_dim,
-            );
-            pg_kernels::linear::linear_forward(
-                &buf.bigram_out[..t * bigram_dim],
                 &self.bigram_proj,
-                &mut buf.bigram_proj_out[..t * d],
-                t, d, bigram_dim,
+                self.bigram_scale,
+                &mut buf.x[..t * d],
+                d,
+                self.config.bigram_dim,
+                self.config.bigram_vocab_size,
             );
-            for i in 0..t * d {
-                buf.x[i] += self.bigram_scale * buf.bigram_proj_out[i];
-            }
         }
 
         // Save x_post_embed (before initial RMSNorm) for bigram backward
@@ -647,7 +656,12 @@ impl GptModel {
             }
             let mut smeared = vec![0.0f32; t * d];
             pg_kernels::smear_gate::smear_gate_forward(
-                &buf.x[..t * d], &x_prev, &self.smear_gate, &mut smeared, t, d,
+                &buf.x[..t * d],
+                &x_prev,
+                &self.smear_gate,
+                &mut smeared,
+                t,
+                d,
             );
             buf.x[..t * d].copy_from_slice(&smeared);
         }
@@ -703,7 +717,13 @@ impl GptModel {
 
         // 8. Final RMSNorm
         let mut final_normed = vec![0.0f32; t * d];
-        pg_kernels::rms_norm::rms_norm_forward_cpu(&buf.x[..t * d], &mut final_normed, d, 1.0, 1e-6);
+        pg_kernels::rms_norm::rms_norm_forward_cpu(
+            &buf.x[..t * d],
+            &mut final_normed,
+            d,
+            1.0,
+            1e-6,
+        );
 
         // 9. Output projection (tied embeddings: logits = x @ tok_emb^T)
         let vocab = self.config.vocab_size;
@@ -711,7 +731,9 @@ impl GptModel {
             &final_normed,
             &self.tok_emb,
             &mut buf.logits[..t * vocab],
-            t, vocab, d,
+            t,
+            vocab,
+            d,
         );
     }
 
@@ -753,6 +775,10 @@ mod tests {
             xsa_last_n: 1,
             logit_softcap: 30.0,
             qk_gain_init: 1.0,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,
@@ -785,7 +811,9 @@ mod tests {
         // Logits are raw (pre-softcap), should be finite but not necessarily bounded
         // Softcap is applied inside cross_entropy
         assert!(
-            buf.logits[0..tokens.len() * vocab].iter().all(|v| v.is_finite()),
+            buf.logits[0..tokens.len() * vocab]
+                .iter()
+                .all(|v| v.is_finite()),
             "all logits should be finite"
         );
     }
@@ -833,6 +861,6 @@ mod tests {
         let config = tiny_config();
         let model = GptModel::new(config);
         assert!(!model.blocks[0].use_xsa); // layer 0: not XSA
-        assert!(model.blocks[1].use_xsa);  // layer 1: XSA (last 1)
+        assert!(model.blocks[1].use_xsa); // layer 1: XSA (last 1)
     }
 }

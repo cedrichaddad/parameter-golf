@@ -172,7 +172,10 @@ mod tests {
             assert!(
                 (grad[i] - numerical).abs() < tol,
                 "grad mismatch at {}: analytical={}, numerical={}, diff={}",
-                i, grad[i], numerical, (grad[i] - numerical).abs()
+                i,
+                grad[i],
+                numerical,
+                (grad[i] - numerical).abs()
             );
         }
     }

@@ -35,7 +35,7 @@
 //! currently pay the full bit-width for pruned entries; the **real**
 //! win is the MSE reduction, not raw-byte reduction.
 
-use crate::scheme::{quantize_with, GroupConfig, PackedWeight};
+use crate::scheme::{GroupConfig, PackedWeight, quantize_with};
 use rayon::prelude::*;
 
 /// Pruning strategy.
@@ -105,7 +105,12 @@ impl PruneMask {
 
 /// Compute a mask for `weights` according to `strategy`, and zero out
 /// the corresponding entries in `weights` in-place. Returns the mask.
-pub fn prune_rows(weights: &mut [f32], rows: usize, cols: usize, strategy: PruneStrategy) -> PruneMask {
+pub fn prune_rows(
+    weights: &mut [f32],
+    rows: usize,
+    cols: usize,
+    strategy: PruneStrategy,
+) -> PruneMask {
     assert_eq!(weights.len(), rows * cols);
     let mut mask = PruneMask::new(rows, cols);
 
@@ -205,7 +210,9 @@ fn prune_2_to_4(weights: &mut [f32], mask: &mut PruneMask, rows: usize, cols: us
                 (row[s + 2].abs(), 2),
                 (row[s + 3].abs(), 3),
             ];
-            vals.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            vals.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
             let keep0 = vals[0].1;
             let keep1 = vals[1].1;
             for i in 0..4 {
@@ -497,7 +504,10 @@ mod tests {
         assert!(mse_a.is_finite() && mse_b.is_finite());
         // The hypothesis: A is never worse than B.
         assert!(mse_a <= mse_b + 1e-9, "A={} > B={}", mse_a, mse_b);
-        eprintln!("AB test: mse_prune_then_quant={:.6e} mse_quant_then_prune={:.6e}", mse_a, mse_b);
+        eprintln!(
+            "AB test: mse_prune_then_quant={:.6e} mse_quant_then_prune={:.6e}",
+            mse_a, mse_b
+        );
     }
 
     #[test]
@@ -534,7 +544,12 @@ mod tests {
         let (mse_a, mse_b) = ordering_ab_test(&w, rows, cols, &prune_cfg, &q_cfg);
         // Both paths should retain the outlier structure perfectly;
         // the test verifies the hypothesis "A <= B" holds.
-        assert!(mse_a <= mse_b + 1e-9, "A={} should be <= B={}", mse_a, mse_b);
+        assert!(
+            mse_a <= mse_b + 1e-9,
+            "A={} should be <= B={}",
+            mse_a,
+            mse_b
+        );
         eprintln!(
             "Outlier AB test: mse_prune_then_quant={:.6e} mse_quant_then_prune={:.6e}",
             mse_a, mse_b

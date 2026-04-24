@@ -15,8 +15,14 @@ RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install NCCL dev and cuDNN dev (matching CUDA 12.6)
-RUN apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn9-cuda-12 libcudnn9-dev-cuda-12 || apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn8-dev
+# Install NCCL/cuDNN matching the CUDA 12.8 base image. Falling through to the
+# generic packages is preferable to silently upgrading NCCL to a CUDA 13.x build.
+RUN apt-get install -y --allow-change-held-packages \
+    libnccl2=2.25.1-1+cuda12.8 \
+    libnccl-dev=2.25.1-1+cuda12.8 \
+    libcudnn9-cuda-12 \
+    libcudnn9-dev-cuda-12 || \
+    apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn8-dev
 
 WORKDIR /build
 
@@ -25,12 +31,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # Build all binaries with CUDA feature
-RUN cargo build --release --features cuda -p pg-train -p pg-bench
+RUN cargo build --release --features cuda -p pg-train -p pg-bench -p pg-eval
 
 # === Runtime stage ===
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
-RUN apt-get update && apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn9-cuda-12 || apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn8 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+    libnccl2=2.25.1-1+cuda12.8 \
+    libnccl-dev=2.25.1-1+cuda12.8 \
+    libcudnn9-cuda-12 || \
+    apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn8 && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/pg-train /usr/local/bin/pg-train
 COPY --from=builder /build/target/release/smoke /usr/local/bin/pg-smoke
@@ -38,6 +49,9 @@ COPY --from=builder /build/target/release/gemm-bench /usr/local/bin/pg-gemm-benc
 COPY --from=builder /build/target/release/nccl-bench /usr/local/bin/pg-nccl-bench
 COPY --from=builder /build/target/release/preliminary /usr/local/bin/pg-preliminary
 COPY --from=builder /build/target/release/parity-forward /usr/local/bin/pg-parity-forward
+COPY --from=builder /build/target/release/parity-step /usr/local/bin/pg-parity-step
+COPY --from=builder /build/target/release/parity-kernels /usr/local/bin/pg-parity-kernels
+COPY --from=builder /build/target/release/run /usr/local/bin/pg-eval
 COPY specs /specs
 # Data directory mount point
 # VOLUME /data removed since Modal handles volumes via @app.function(volumes={...})

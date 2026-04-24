@@ -28,7 +28,6 @@
 /// `BigramStats` reference, and returns the SLOT NLL for the target
 /// token. The sliding-window and qTTT scorers call it instead of the
 /// raw cross-entropy when a `SlotConfig` is supplied.
-
 use pg_kernels::complementary::BigramStats;
 
 /// Blending strategy for SLOT.
@@ -120,7 +119,10 @@ pub fn bigram_row_prob(stats: &BigramStats, prev: u32, out: &mut [f32]) {
 pub fn blend_alpha(stats: &BigramStats, prev: u32, mode: BlendMode) -> f32 {
     match mode {
         BlendMode::Fixed(a) => a.clamp(0.0, 1.0),
-        BlendMode::EntropyAdaptive { alpha_min, alpha_max } => {
+        BlendMode::EntropyAdaptive {
+            alpha_min,
+            alpha_max,
+        } => {
             let e = stats.row_entropy(prev);
             let ln_v = (stats.vocab_size as f32).ln().max(1e-6);
             let t = (e / ln_v).clamp(0.0, 1.0);
@@ -265,7 +267,12 @@ mod tests {
                 alpha_max: 1.0,
             },
         );
-        assert!(a0 < a3, "peaked row should have smaller alpha: a0={}, a3={}", a0, a3);
+        assert!(
+            a0 < a3,
+            "peaked row should have smaller alpha: a0={}, a3={}",
+            a0,
+            a3
+        );
         assert!(a0 >= 0.5);
         assert!(a3 <= 1.0);
     }
@@ -328,7 +335,12 @@ mod tests {
         };
         let nll_neural = slot_nll(&logits, 0, 1, &s, &cfg_neural, &mut sn, &mut sb);
         let nll_mixed = slot_nll(&logits, 0, 1, &s, &cfg_mixed, &mut sn, &mut sb);
-        assert!(nll_mixed < nll_neural, "SLOT should reduce NLL when bigram is correct and neural is uniform: mixed={}, neural={}", nll_mixed, nll_neural);
+        assert!(
+            nll_mixed < nll_neural,
+            "SLOT should reduce NLL when bigram is correct and neural is uniform: mixed={}, neural={}",
+            nll_mixed,
+            nll_neural
+        );
     }
 
     #[test]

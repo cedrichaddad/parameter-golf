@@ -57,11 +57,7 @@ fn main() {
     println!("\nNCCL benchmark complete.");
 }
 
-fn bench_all_reduce(
-    comms: &[Comm],
-    streams: &[Arc<cudarc::driver::CudaStream>],
-    n_devices: usize,
-) {
+fn bench_all_reduce(comms: &[Comm], streams: &[Arc<cudarc::driver::CudaStream>], n_devices: usize) {
     println!("--- AllReduce (bf16, Sum) ---\n");
     println!(
         "{:>10}  {:>10}  {:>10}  {:>10}",
@@ -170,11 +166,7 @@ fn bench_reduce_scatter(
             cudarc::nccl::group_start().expect("group_start");
             for i in 0..n_devices {
                 comms[i]
-                    .reduce_scatter::<_, _, bf16>(
-                        &send_bufs[i],
-                        &mut recv_bufs[i],
-                        &ReduceOp::Sum,
-                    )
+                    .reduce_scatter::<_, _, bf16>(&send_bufs[i], &mut recv_bufs[i], &ReduceOp::Sum)
                     .expect("reduce_scatter");
             }
             cudarc::nccl::group_end().expect("group_end");
@@ -196,11 +188,7 @@ fn bench_reduce_scatter(
             cudarc::nccl::group_start().expect("group_start");
             for i in 0..n_devices {
                 comms[i]
-                    .reduce_scatter::<_, _, bf16>(
-                        &send_bufs[i],
-                        &mut recv_bufs[i],
-                        &ReduceOp::Sum,
-                    )
+                    .reduce_scatter::<_, _, bf16>(&send_bufs[i], &mut recv_bufs[i], &ReduceOp::Sum)
                     .expect("reduce_scatter");
             }
             cudarc::nccl::group_end().expect("group_end");
@@ -227,11 +215,7 @@ fn bench_reduce_scatter(
     println!();
 }
 
-fn bench_all_gather(
-    comms: &[Comm],
-    streams: &[Arc<cudarc::driver::CudaStream>],
-    n_devices: usize,
-) {
+fn bench_all_gather(comms: &[Comm], streams: &[Arc<cudarc::driver::CudaStream>], n_devices: usize) {
     println!("--- AllGather (bf16) ---\n");
     println!(
         "{:>10}  {:>10}  {:>10}  {:>10}",

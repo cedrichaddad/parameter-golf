@@ -104,7 +104,9 @@ mod tests {
         let m = 3;
         let n = 2;
         let k = 4;
-        let x = vec![0.1, -0.3, 0.5, 0.2, -0.1, 0.4, -0.2, 0.3, 0.6, -0.5, 0.1, 0.7];
+        let x = vec![
+            0.1, -0.3, 0.5, 0.2, -0.1, 0.4, -0.2, 0.3, 0.6, -0.5, 0.1, 0.7,
+        ];
         let w = vec![0.3, -0.1, 0.4, 0.2, -0.2, 0.5, -0.3, 0.1];
         let dy = vec![1.0, 0.5, -0.3, 0.8, 0.2, -0.1];
 
@@ -135,7 +137,9 @@ mod tests {
             assert!(
                 (dx[idx] - numerical).abs() < 1e-3,
                 "dx mismatch at {}: analytical={}, numerical={}",
-                idx, dx[idx], numerical
+                idx,
+                dx[idx],
+                numerical
             );
         }
     }

@@ -22,6 +22,10 @@ pub struct ModelConfig {
     pub xsa_last_n: usize, // XSA on last N layers
     pub logit_softcap: f32,
     pub qk_gain_init: f32,
+    pub recurrence_enabled: bool,
+    pub recurrence_start_layer: usize,
+    pub recurrence_repeat_layers: usize,
+    pub parallel_residual: bool,
 
     // Value Residual Learning
     pub vrl_enabled: bool,
@@ -71,6 +75,10 @@ impl ModelConfig {
             xsa_last_n: 4,
             logit_softcap: 30.0,
             qk_gain_init: 1.5,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
 
             vrl_enabled: false, // value_residual flag (separate from VE)
             ve_enabled: true,
@@ -93,6 +101,12 @@ impl ModelConfig {
     /// KV dimension (for GQA: num_kv_heads * head_dim).
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
+    }
+
+    pub fn is_recurrent_layer(&self, layer: usize) -> bool {
+        self.recurrence_enabled
+            && layer >= self.recurrence_start_layer
+            && layer < self.recurrence_start_layer + self.recurrence_repeat_layers
     }
 
     /// Number of encoder layers (first half, for U-Net).
@@ -291,7 +305,8 @@ impl TrainConfig {
             self.muon_momentum
         } else {
             let t = step as f32 / self.muon_momentum_warmup_steps as f32;
-            self.muon_momentum_warmup_start + t * (self.muon_momentum - self.muon_momentum_warmup_start)
+            self.muon_momentum_warmup_start
+                + t * (self.muon_momentum - self.muon_momentum_warmup_start)
         }
     }
 

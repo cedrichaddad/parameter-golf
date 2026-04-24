@@ -43,21 +43,24 @@ fn main() {
     println!("{}", "-".repeat(76));
 
     for &(label, m, n, k) in SHAPES {
-        let a = stream
-            .alloc_zeros::<bf16>(m * k)
-            .expect("alloc A failed");
-        let b = stream
-            .alloc_zeros::<bf16>(k * n)
-            .expect("alloc B failed");
-        let mut c = stream
-            .alloc_zeros::<bf16>(m * n)
-            .expect("alloc C failed");
+        let a = stream.alloc_zeros::<bf16>(m * k).expect("alloc A failed");
+        let b = stream.alloc_zeros::<bf16>(k * n).expect("alloc B failed");
+        let mut c = stream.alloc_zeros::<bf16>(m * n).expect("alloc C failed");
 
         // Warmup
         for _ in 0..WARMUP_ITERS {
             unsafe {
                 engine
-                    .matmul_f32(cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0, m, n, k, 1.0, 0.0)
+                    .matmul_f32(
+                        cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        0.0,
+                    )
                     .expect("warmup gemm failed");
             }
         }
@@ -74,7 +77,16 @@ fn main() {
         for _ in 0..BENCH_ITERS {
             unsafe {
                 engine
-                    .matmul_f32(cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0, m, n, k, 1.0, 0.0)
+                    .matmul_f32(
+                        cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        0.0,
+                    )
                     .expect("bench gemm failed");
             }
         }
@@ -125,7 +137,17 @@ fn main() {
         for _ in 0..WARMUP_ITERS {
             unsafe {
                 engine
-                    .batched_matmul_f32(cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0, batch, m, n, k, 1.0, 0.0)
+                    .batched_matmul_f32(
+                        cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0,
+                        batch,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        0.0,
+                    )
                     .expect("warmup batched gemm failed");
             }
         }
@@ -141,7 +163,17 @@ fn main() {
         for _ in 0..BENCH_ITERS {
             unsafe {
                 engine
-                    .batched_matmul_f32(cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0, cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0, batch, m, n, k, 1.0, 0.0)
+                    .batched_matmul_f32(
+                        cudarc::driver::DevicePtr::device_ptr(&a, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&b, engine.stream()).0,
+                        cudarc::driver::DevicePtr::device_ptr(&c, engine.stream()).0,
+                        batch,
+                        m,
+                        n,
+                        k,
+                        1.0,
+                        0.0,
+                    )
                     .expect("bench batched gemm failed");
             }
         }

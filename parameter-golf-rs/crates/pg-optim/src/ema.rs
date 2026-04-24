@@ -91,7 +91,7 @@ mod tests {
     fn test_ema_decay() {
         let mut ema = Ema::new(0.9, 2);
         ema.update(&[10.0, 20.0]); // init
-        ema.update(&[0.0, 0.0]);   // second update
+        ema.update(&[0.0, 0.0]); // second update
 
         // shadow = 0.9 * [10, 20] + 0.1 * [0, 0] = [9, 18]
         assert!((ema.shadow[0] - 9.0).abs() < 1e-5);

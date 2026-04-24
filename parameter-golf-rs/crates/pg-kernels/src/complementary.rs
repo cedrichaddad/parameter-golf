@@ -18,7 +18,6 @@
 /// The dense representation is fine for vocab=1024
 /// (1024×1024×4B ≈ 4 MB), which is well below the budget. For larger
 /// vocab we would switch to a HashMap<(u32,u32), u32>.
-
 use std::io::Read;
 
 /// Add-one smoothed bigram counts. `counts[prev*V + curr]` is the number
@@ -78,8 +77,7 @@ impl BigramStats {
         let curr = curr as usize;
         let row_sum = self.row_sums[prev];
         let c = self.counts[prev * self.vocab_size + curr] as u64;
-        (c as f64 + 1.0).min(f64::MAX) as f32
-            / ((row_sum + v) as f64).max(1.0) as f32
+        (c as f64 + 1.0).min(f64::MAX) as f32 / ((row_sum + v) as f64).max(1.0) as f32
     }
 
     /// Raw count of `curr` following `prev`, no smoothing.
@@ -141,7 +139,10 @@ impl BigramStats {
             *c = u32::from_le_bytes(b);
         }
         if !bytes.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidData, "trailing bytes in BigramStats blob"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "trailing bytes in BigramStats blob",
+            ));
         }
         Ok(Self {
             vocab_size: v,
@@ -169,7 +170,10 @@ impl Default for WeightShape {
     fn default() -> Self {
         // From the PR #1083 / X-WING branch defaults — tokens below p=0.2
         // are left alone so the bigram can't "poison" the interesting tail.
-        WeightShape::Floored { floor: 0.2, min_w: 0.25 }
+        WeightShape::Floored {
+            floor: 0.2,
+            min_w: 0.25,
+        }
     }
 }
 
@@ -227,18 +231,18 @@ pub fn weighted_mean_loss(losses: &[f32], weights: &[f32]) -> f32 {
         num += (*l as f64) * (*w as f64);
         den += *w as f64;
     }
-    if den <= 1e-12 { 0.0 } else { (num / den) as f32 }
+    if den <= 1e-12 {
+        0.0
+    } else {
+        (num / den) as f32
+    }
 }
 
 /// Scale each row of `grad_logits` by the corresponding per-token weight.
 /// Call this *after* `cross_entropy_backward` to match the weighted-mean
 /// semantics used by `weighted_mean_loss` (but with the gradient version
 /// of 1/sum_w, which is already baked into the caller's `grad_loss`).
-pub fn scale_grad_logits_by_weight(
-    grad_logits: &mut [f32],
-    weights: &[f32],
-    vocab_size: usize,
-) {
+pub fn scale_grad_logits_by_weight(grad_logits: &mut [f32], weights: &[f32], vocab_size: usize) {
     assert_eq!(grad_logits.len(), weights.len() * vocab_size);
     for (t, &w) in weights.iter().enumerate() {
         let off = t * vocab_size;
@@ -309,17 +313,38 @@ mod tests {
         assert!((w - 0.75).abs() < 1e-6);
 
         // Floored: p=0.1, floor=0.2 -> 1.0 (below floor, unchanged)
-        let w = apply_shape(0.1, 0.9, WeightShape::Floored { floor: 0.2, min_w: 0.25 });
+        let w = apply_shape(
+            0.1,
+            0.9,
+            WeightShape::Floored {
+                floor: 0.2,
+                min_w: 0.25,
+            },
+        );
         assert!((w - 1.0).abs() < 1e-6);
 
         // Floored: p=0.6, floor=0.2, alpha=1.0
         //   norm = (0.6-0.2)/0.8 = 0.5
         //   w = 1 - 1*0.5 = 0.5
-        let w = apply_shape(0.6, 1.0, WeightShape::Floored { floor: 0.2, min_w: 0.25 });
+        let w = apply_shape(
+            0.6,
+            1.0,
+            WeightShape::Floored {
+                floor: 0.2,
+                min_w: 0.25,
+            },
+        );
         assert!((w - 0.5).abs() < 1e-6);
 
         // Floored: p=1.0, alpha=10.0 -> clamped at min_w
-        let w = apply_shape(1.0, 10.0, WeightShape::Floored { floor: 0.2, min_w: 0.25 });
+        let w = apply_shape(
+            1.0,
+            10.0,
+            WeightShape::Floored {
+                floor: 0.2,
+                min_w: 0.25,
+            },
+        );
         assert!((w - 0.25).abs() < 1e-6);
     }
 
@@ -329,9 +354,17 @@ mod tests {
         let prev = vec![0u32, 0, 3];
         let curr = vec![1u32, 2, 0];
         let mut w = vec![0.0f32; 3];
-        complementary_weights(&prev, &curr, &s, 0.9,
-                              WeightShape::Floored { floor: 0.2, min_w: 0.1 },
-                              &mut w);
+        complementary_weights(
+            &prev,
+            &curr,
+            &s,
+            0.9,
+            WeightShape::Floored {
+                floor: 0.2,
+                min_w: 0.1,
+            },
+            &mut w,
+        );
         // (0,1): very high prob -> heavily down-weighted
         // (0,2): very low prob  -> unchanged (below floor)
         // (3,0): unseen row     -> p=0.25, barely above floor

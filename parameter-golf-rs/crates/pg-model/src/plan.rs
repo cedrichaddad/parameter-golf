@@ -5,7 +5,9 @@ use pg_core::error::{PgError, PgResult};
 
 use crate::config::ModelConfig;
 use crate::gpu::{bank_shapes, checkpoint_layers, estimate_memory};
-use crate::spec::{CompressionMode, ModelSpec, QuantScheme, RopeMode, RunMode, RunSpec, SkipTopology};
+use crate::spec::{
+    CompressionMode, ModelSpec, QuantScheme, RopeMode, RunMode, RunSpec, SkipTopology,
+};
 
 #[derive(Debug, Clone)]
 pub struct LayerFeatureMask {
@@ -62,7 +64,7 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     pub fn from_run_spec(run_spec: &RunSpec) -> PgResult<Self> {
-        validate_model_spec(&run_spec.model)?;
+        validate_run_spec(run_spec)?;
         let config = run_spec.model.to_model_config();
         let bank_shapes = bank_shapes(&config);
         let bank_layout = BankLayout {
@@ -84,7 +86,9 @@ impl ExecutionPlan {
                 && run_spec.model.value_embedding.layers.contains(&layer);
             let recurrent = run_spec.model.recurrence.enabled
                 && layer >= run_spec.model.recurrence.start_layer
-                && layer < run_spec.model.recurrence.start_layer + run_spec.model.recurrence.repeat_layers;
+                && layer
+                    < run_spec.model.recurrence.start_layer
+                        + run_spec.model.recurrence.repeat_layers;
             layer_schedule.push(LayerFeatureMask {
                 xsa: layer >= xsa_start,
                 value_embedding,
@@ -147,10 +151,24 @@ impl ExecutionPlan {
             ("num_kv_heads", spec.num_kv_heads, config.num_kv_heads),
             ("train_seq_len", spec.train_seq_len, config.train_seq_len),
             ("eval_seq_len", spec.eval_seq_len, config.eval_seq_len),
-            ("bigram_vocab_size", spec.bigram.vocab_size, config.bigram_vocab_size),
+            (
+                "bigram_vocab_size",
+                spec.bigram.vocab_size,
+                config.bigram_vocab_size,
+            ),
             ("bigram_dim", spec.bigram.dim, config.bigram_dim),
             ("ve_dim", spec.value_embedding.dim, config.ve_dim),
             ("xsa_last_n", spec.xsa_last_n, config.xsa_last_n),
+            (
+                "recurrence_start_layer",
+                spec.recurrence.start_layer,
+                config.recurrence_start_layer,
+            ),
+            (
+                "recurrence_repeat_layers",
+                spec.recurrence.repeat_layers,
+                config.recurrence_repeat_layers,
+            ),
             ("rope_dims", spec.rope.dims, config.rope_dims),
         ];
 
@@ -172,6 +190,21 @@ impl ExecutionPlan {
             return Err(PgError::InvalidOp(format!(
                 "execution plan mismatch for ve_enabled: expected {}, got {}",
                 spec.value_embedding.enabled, config.ve_enabled,
+            )));
+        }
+        if spec.recurrence.enabled != config.recurrence_enabled {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for recurrence_enabled: expected {}, got {}",
+                spec.recurrence.enabled, config.recurrence_enabled,
+            )));
+        }
+        if (spec.parallel_residual.enabled && spec.parallel_residual.split_attention_mlp)
+            != config.parallel_residual
+        {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for parallel_residual: expected {}, got {}",
+                spec.parallel_residual.enabled && spec.parallel_residual.split_attention_mlp,
+                config.parallel_residual,
             )));
         }
         if spec.ln_scale != config.ln_scale {
@@ -215,7 +248,8 @@ impl ExecutionPlan {
     }
 }
 
-fn validate_model_spec(spec: &ModelSpec) -> PgResult<()> {
+fn validate_run_spec(run_spec: &RunSpec) -> PgResult<()> {
+    let spec = &run_spec.model;
     if spec.num_heads == 0 || spec.num_kv_heads == 0 {
         return Err(PgError::InvalidOp("head counts must be non-zero".into()));
     }
@@ -232,10 +266,14 @@ fn validate_model_spec(spec: &ModelSpec) -> PgResult<()> {
         )));
     }
     if spec.bigram.enabled && (spec.bigram.vocab_size == 0 || spec.bigram.dim == 0) {
-        return Err(PgError::InvalidOp("bigram enabled but vocab/dim is zero".into()));
+        return Err(PgError::InvalidOp(
+            "bigram enabled but vocab/dim is zero".into(),
+        ));
     }
     if spec.value_embedding.enabled && spec.value_embedding.dim == 0 {
-        return Err(PgError::InvalidOp("value embedding enabled but dim is zero".into()));
+        return Err(PgError::InvalidOp(
+            "value embedding enabled but dim is zero".into(),
+        ));
     }
     if spec.rope.dims > spec.model_dim / spec.num_heads {
         return Err(PgError::InvalidOp(format!(
@@ -243,16 +281,6 @@ fn validate_model_spec(spec: &ModelSpec) -> PgResult<()> {
             spec.rope.dims,
             spec.model_dim / spec.num_heads
         )));
-    }
-    if spec.recurrence.enabled {
-        return Err(PgError::InvalidOp(
-            "recurrence variants are not implemented in the Rust execution runtime yet".into(),
-        ));
-    }
-    if spec.parallel_residual.enabled {
-        return Err(PgError::InvalidOp(
-            "parallel residual variants are not implemented in the Rust execution runtime yet".into(),
-        ));
     }
     if spec.skip_topology != SkipTopology::Unet {
         return Err(PgError::InvalidOp(
@@ -274,6 +302,38 @@ fn validate_model_spec(spec: &ModelSpec) -> PgResult<()> {
 
 fn fingerprint(run_spec: &RunSpec) -> String {
     let mut hasher = DefaultHasher::new();
-    run_spec.name.hash(&mut hasher);
+    format!("{:?}", run_spec.model).hash(&mut hasher);
+    format!("{:?}", run_spec.quant).hash(&mut hasher);
+    format!("{:?}", run_spec.eval).hash(&mut hasher);
+    run_spec.train.batch_tokens.hash(&mut hasher);
+    run_spec.train.seq_len.hash(&mut hasher);
+    run_spec.train.warmup_steps.hash(&mut hasher);
+    run_spec.train.total_iterations.hash(&mut hasher);
+    run_spec.train.warmdown_iters.hash(&mut hasher);
+    run_spec
+        .train
+        .max_wallclock_seconds
+        .to_bits()
+        .hash(&mut hasher);
+    run_spec.train.matrix_lr.to_bits().hash(&mut hasher);
+    run_spec.train.scalar_lr.to_bits().hash(&mut hasher);
+    run_spec.train.embed_lr.to_bits().hash(&mut hasher);
+    run_spec.train.tied_embed_lr.to_bits().hash(&mut hasher);
+    run_spec.train.head_lr.to_bits().hash(&mut hasher);
+    run_spec.train.muon_momentum.to_bits().hash(&mut hasher);
+    run_spec
+        .train
+        .muon_momentum_warmup_start
+        .to_bits()
+        .hash(&mut hasher);
+    run_spec.train.muon_momentum_warmup_steps.hash(&mut hasher);
+    run_spec.train.muon_wd.to_bits().hash(&mut hasher);
+    run_spec.train.adam_wd.to_bits().hash(&mut hasher);
+    run_spec.train.ema_decay.to_bits().hash(&mut hasher);
+    run_spec
+        .train
+        .late_qat_threshold
+        .to_bits()
+        .hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }

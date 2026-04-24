@@ -19,7 +19,6 @@
 ///   ve_shared.proj.weight → model.ve_proj [kv_dim, ve_dim]
 ///   ve_shared.scale → model.ve_scale (scalar)
 ///   ve_layer_scales.{i} → model.ve_layer_scales[i] (scalar)
-
 use std::path::Path;
 
 use crate::safetensors::SafeTensorsFile;
@@ -29,7 +28,11 @@ use crate::safetensors::SafeTensorsFile;
 pub enum LoadError {
     Io(String),
     MissingTensor(String),
-    ShapeMismatch { name: String, expected: usize, got: usize },
+    ShapeMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -37,8 +40,16 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Io(msg) => write!(f, "IO error: {}", msg),
             LoadError::MissingTensor(name) => write!(f, "missing tensor: {}", name),
-            LoadError::ShapeMismatch { name, expected, got } => {
-                write!(f, "shape mismatch for '{}': expected {} elements, got {}", name, expected, got)
+            LoadError::ShapeMismatch {
+                name,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "shape mismatch for '{}': expected {} elements, got {}",
+                    name, expected, got
+                )
             }
         }
     }
@@ -95,7 +106,11 @@ pub fn load_from_safetensors(
                         $dest = data[0];
                         loaded.push($name.to_string());
                     } else {
-                        warnings.push(format!("{}: expected scalar, got {} elements", $name, data.len()));
+                        warnings.push(format!(
+                            "{}: expected scalar, got {} elements",
+                            $name,
+                            data.len()
+                        ));
                     }
                 }
                 Err(_) => {
@@ -129,7 +144,10 @@ pub fn load_from_safetensors(
     for i in 0..n {
         let prefix = format!("blocks.{}", i);
 
-        load_tensor!(&format!("{}.attn_scale", prefix), model.blocks[i].attn_scale);
+        load_tensor!(
+            &format!("{}.attn_scale", prefix),
+            model.blocks[i].attn_scale
+        );
         load_tensor!(&format!("{}.mlp_scale", prefix), model.blocks[i].mlp_scale);
         load_tensor!(&format!("{}.resid_mix", prefix), model.blocks[i].resid_mix);
         load_tensor!(&format!("{}.attn.q_gain", prefix), model.blocks[i].q_gain);
@@ -210,7 +228,7 @@ pub fn expected_tensor_names(config: &pg_model::config::ModelConfig) -> Vec<Stri
 /// Used by the round-trip test below and by the per-step equivalence harness
 /// to write the "ground truth" weight file that PyTorch will then re-import.
 pub fn dump_model_safetensors(model: &pg_model::GptModel) -> Vec<u8> {
-    use crate::writer::{f32_tensor, write_safetensors, OutTensor};
+    use crate::writer::{OutTensor, f32_tensor, write_safetensors};
 
     let c = &model.config;
     let n = c.num_layers;
@@ -221,15 +239,23 @@ pub fn dump_model_safetensors(model: &pg_model::GptModel) -> Vec<u8> {
     // Scalar storage — owned slices kept alive for the duration of the call
     let bigram_scale_buf = [model.bigram_scale];
     let ve_scale_buf = [model.ve_scale];
-    let ve_layer_scale_bufs: Vec<[f32; 1]> = model
-        .ve_layer_scales
-        .iter()
-        .map(|&v| [v])
-        .collect();
+    let ve_layer_scale_bufs: Vec<[f32; 1]> = model.ve_layer_scales.iter().map(|&v| [v]).collect();
 
-    let block_attn_scales: Vec<&[f32]> = model.blocks.iter().map(|b| b.attn_scale.as_slice()).collect();
-    let block_mlp_scales: Vec<&[f32]> = model.blocks.iter().map(|b| b.mlp_scale.as_slice()).collect();
-    let block_resid_mix: Vec<&[f32]> = model.blocks.iter().map(|b| b.resid_mix.as_slice()).collect();
+    let block_attn_scales: Vec<&[f32]> = model
+        .blocks
+        .iter()
+        .map(|b| b.attn_scale.as_slice())
+        .collect();
+    let block_mlp_scales: Vec<&[f32]> = model
+        .blocks
+        .iter()
+        .map(|b| b.mlp_scale.as_slice())
+        .collect();
+    let block_resid_mix: Vec<&[f32]> = model
+        .blocks
+        .iter()
+        .map(|b| b.resid_mix.as_slice())
+        .collect();
     let block_q_gain: Vec<&[f32]> = model.blocks.iter().map(|b| b.q_gain.as_slice()).collect();
 
     // Pre-format the per-block names so we can hand string slices to OutTensor
@@ -252,10 +278,22 @@ pub fn dump_model_safetensors(model: &pg_model::GptModel) -> Vec<u8> {
 
     tensors.push(f32_tensor("qo_bank", vec![2 * n, d, d], &model.qo_bank));
     tensors.push(f32_tensor("kv_bank", vec![2 * n, kv, d], &model.kv_bank));
-    tensors.push(f32_tensor("mlp_up_bank", vec![n, mlp, d], &model.mlp_up_bank));
-    tensors.push(f32_tensor("mlp_down_bank", vec![n, d, mlp], &model.mlp_down_bank));
+    tensors.push(f32_tensor(
+        "mlp_up_bank",
+        vec![n, mlp, d],
+        &model.mlp_up_bank,
+    ));
+    tensors.push(f32_tensor(
+        "mlp_down_bank",
+        vec![n, d, mlp],
+        &model.mlp_down_bank,
+    ));
 
-    tensors.push(f32_tensor("tok_emb.weight", vec![c.vocab_size, d], &model.tok_emb));
+    tensors.push(f32_tensor(
+        "tok_emb.weight",
+        vec![c.vocab_size, d],
+        &model.tok_emb,
+    ));
 
     tensors.push(f32_tensor(
         "bigram.embed.weight",
@@ -277,10 +315,22 @@ pub fn dump_model_safetensors(model: &pg_model::GptModel) -> Vec<u8> {
     ));
 
     for i in 0..n {
-        tensors.push(f32_tensor(&block_names[i][0], vec![d], block_attn_scales[i]));
+        tensors.push(f32_tensor(
+            &block_names[i][0],
+            vec![d],
+            block_attn_scales[i],
+        ));
         tensors.push(f32_tensor(&block_names[i][1], vec![d], block_mlp_scales[i]));
-        tensors.push(f32_tensor(&block_names[i][2], vec![2, d], block_resid_mix[i]));
-        tensors.push(f32_tensor(&block_names[i][3], vec![c.num_heads], block_q_gain[i]));
+        tensors.push(f32_tensor(
+            &block_names[i][2],
+            vec![2, d],
+            block_resid_mix[i],
+        ));
+        tensors.push(f32_tensor(
+            &block_names[i][3],
+            vec![c.num_heads],
+            block_q_gain[i],
+        ));
     }
 
     if c.ve_enabled {
@@ -338,6 +388,10 @@ mod tests {
             xsa_last_n: 0,
             logit_softcap: 30.0,
             qk_gain_init: 1.0,
+            recurrence_enabled: false,
+            recurrence_start_layer: 0,
+            recurrence_repeat_layers: 0,
+            parallel_residual: false,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,
@@ -363,21 +417,47 @@ mod tests {
             rng_state ^= rng_state << 5;
             (rng_state as f32 / u32::MAX as f32 - 0.5) * 0.2
         };
-        for v in model.tok_emb.iter_mut() { *v = next(); }
-        for v in model.qo_bank.iter_mut() { *v = next(); }
-        for v in model.kv_bank.iter_mut() { *v = next(); }
-        for v in model.mlp_up_bank.iter_mut() { *v = next(); }
-        for v in model.mlp_down_bank.iter_mut() { *v = next(); }
-        for v in model.bigram_embed.iter_mut() { *v = next(); }
-        for v in model.bigram_proj.iter_mut() { *v = next(); }
+        for v in model.tok_emb.iter_mut() {
+            *v = next();
+        }
+        for v in model.qo_bank.iter_mut() {
+            *v = next();
+        }
+        for v in model.kv_bank.iter_mut() {
+            *v = next();
+        }
+        for v in model.mlp_up_bank.iter_mut() {
+            *v = next();
+        }
+        for v in model.mlp_down_bank.iter_mut() {
+            *v = next();
+        }
+        for v in model.bigram_embed.iter_mut() {
+            *v = next();
+        }
+        for v in model.bigram_proj.iter_mut() {
+            *v = next();
+        }
         model.bigram_scale = next();
-        for v in model.smear_gate.iter_mut() { *v = next(); }
-        for v in model.skip_weights.iter_mut() { *v = next(); }
+        for v in model.smear_gate.iter_mut() {
+            *v = next();
+        }
+        for v in model.skip_weights.iter_mut() {
+            *v = next();
+        }
         for b in model.blocks.iter_mut() {
-            for v in b.attn_scale.iter_mut() { *v = next(); }
-            for v in b.mlp_scale.iter_mut() { *v = next(); }
-            for v in b.resid_mix.iter_mut() { *v = next(); }
-            for v in b.q_gain.iter_mut() { *v = next(); }
+            for v in b.attn_scale.iter_mut() {
+                *v = next();
+            }
+            for v in b.mlp_scale.iter_mut() {
+                *v = next();
+            }
+            for v in b.resid_mix.iter_mut() {
+                *v = next();
+            }
+            for v in b.q_gain.iter_mut() {
+                *v = next();
+            }
         }
     }
 

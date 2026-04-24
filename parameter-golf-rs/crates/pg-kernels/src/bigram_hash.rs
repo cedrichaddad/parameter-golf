@@ -118,7 +118,13 @@ mod tests {
         // Backward: grad_output = 1.0 everywhere
         let grad_output = vec![1.0f32; seq_len * embed_dim];
         let mut grad_table = vec![0.0f32; num_buckets * embed_dim];
-        bigram_hash_backward(&tokens, &grad_output, &mut grad_table, num_buckets, embed_dim);
+        bigram_hash_backward(
+            &tokens,
+            &grad_output,
+            &mut grad_table,
+            num_buckets,
+            embed_dim,
+        );
 
         let total_grad: f32 = grad_table.iter().sum();
         assert!((total_grad - (seq_len * embed_dim) as f32).abs() < 1e-6);
