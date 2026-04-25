@@ -152,6 +152,16 @@ pub fn export_model_with_spec(
             &format!("blocks.{}.q_gain", i),
             &model.blocks[i].q_gain,
         ));
+        if c.attn_out_gate_enabled {
+            tensors.push(f16_tensor(
+                &format!("blocks.{}.attn_gate_weight", i),
+                &model.blocks[i].attn_gate_weight,
+            ));
+            tensors.push(f16_tensor(
+                &format!("blocks.{}.attn_gate_bias", i),
+                &model.blocks[i].attn_gate_bias,
+            ));
+        }
     }
 
     // 7. VE params → f16
@@ -179,10 +189,10 @@ pub fn export_model_with_spec(
         raw_buf.len() as f64 / artifact_size as f64,
     );
 
-    if artifact_size > 16 * 1_048_576 {
+    if artifact_size > 16_000_000 {
         eprintln!(
-            "WARNING: artifact exceeds 16MB limit ({:.2}MB)",
-            artifact_size as f64 / 1_048_576.0
+            "WARNING: artifact exceeds 16,000,000-byte model budget ({:.2}MB decimal)",
+            artifact_size as f64 / 1_000_000.0
         );
     }
 
@@ -332,7 +342,7 @@ fn metadata_json(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","scheme":"{:?}","compression":"{:?}","prune_keep_ratio":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
+        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","scheme":"{:?}","compression":"{:?}","prune_keep_ratio":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
         variant_fingerprint,
         quant_spec.scheme,
         quant_spec.compression,
@@ -344,6 +354,8 @@ fn metadata_json(
         c.num_kv_heads,
         c.head_dim,
         mlp,
+        if c.attn_out_gate_enabled { 1 } else { 0 },
+        c.attn_out_gate_width,
         scheme.attn_q.bits.nbits(),
         scheme.attn_o.bits.nbits(),
         scheme.attn_k.bits.nbits(),
@@ -369,6 +381,12 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
     let mlp = c.mlp_dim;
 
     validate_artifact_metadata(&metadata, model)?;
+    if c.attn_out_gate_enabled {
+        for i in 0..n {
+            find_tensor_result(&tensors, &format!("blocks.{i}.attn_gate_weight"))?;
+            find_tensor_result(&tensors, &format!("blocks.{i}.attn_gate_bias"))?;
+        }
+    }
 
     let has_split_quant = find_tensor_opt(&tensors, "qo_bank.q.weight").is_some();
     if has_split_quant {
@@ -507,6 +525,12 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
                         "mlp_scale" => f16_into(&tensor.data, &mut model.blocks[idx].mlp_scale),
                         "resid_mix" => f16_into(&tensor.data, &mut model.blocks[idx].resid_mix),
                         "q_gain" => f16_into(&tensor.data, &mut model.blocks[idx].q_gain),
+                        "attn_gate_weight" => {
+                            f16_into(&tensor.data, &mut model.blocks[idx].attn_gate_weight)
+                        }
+                        "attn_gate_bias" => {
+                            f16_into(&tensor.data, &mut model.blocks[idx].attn_gate_bias)
+                        }
                         _ => {}
                     }
                 }
@@ -593,6 +617,11 @@ fn validate_artifact_metadata(metadata: &str, model: &GptModel) -> PgResult<()> 
             ("num_kv_heads", c.num_kv_heads),
             ("head_dim", c.head_dim),
             ("mlp_dim", c.mlp_dim),
+            (
+                "attn_out_gate_enabled",
+                if c.attn_out_gate_enabled { 1 } else { 0 },
+            ),
+            ("attn_out_gate_width", c.attn_out_gate_width),
         ] {
             if let Some(got) = metadata_usize(metadata, key) {
                 if got != expected {
@@ -798,6 +827,8 @@ mod tests {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
             vrl_enabled: false,
             ve_enabled: true,
             ve_dim: 8,

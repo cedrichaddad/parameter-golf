@@ -159,7 +159,10 @@ pub fn load_validation_tokens(pattern: &str) -> PgResult<Vec<u16>> {
 ///
 /// This preserves legal score-first ordering for proxy/smoke evaluation while
 /// avoiding full-shard materialization when only a small eval prefix is needed.
-pub fn load_validation_tokens_limited(pattern: &str, max_tokens: Option<usize>) -> PgResult<Vec<u16>> {
+pub fn load_validation_tokens_limited(
+    pattern: &str,
+    max_tokens: Option<usize>,
+) -> PgResult<Vec<u16>> {
     let mut files: Vec<PathBuf> = glob::glob(pattern)
         .map_err(|e| PgError::DataFormat(format!("invalid glob pattern: {}", e)))?
         .filter_map(Result::ok)

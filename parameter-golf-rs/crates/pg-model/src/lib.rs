@@ -12,6 +12,7 @@ pub use config::{ModelConfig, TrainConfig};
 pub use model::{ForwardBuffer, GptModel};
 pub use plan::ExecutionPlan;
 pub use spec::{
-    CompressionMode, EvalSpec, ModelSpec, QuantScheme, QuantSpec, RunMode, RunSpec, TrainBackend,
-    TrainSpec, VariantFamily,
+    AttentionBackend, AttnOutGateSpec, CompressionMode, DistributedOptimizerBackend,
+    EvalAdaptationBackend, EvalSpec, ModelSpec, QuantScheme, QuantSpec, RunMode, RunSpec,
+    TrainBackend, TrainSpec, VariantFamily,
 };

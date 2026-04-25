@@ -7,7 +7,7 @@ use std::ffi::c_void;
 
 #[cfg(has_cuda_cpp)]
 unsafe extern "C" {
-    fn run_cudnn_sdpa_f32(
+    fn run_naive_sdpa_f32(
         stream: *mut c_void,
         q: u64,
         k: u64,
@@ -20,13 +20,18 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// CUDA attention backend compiled from `cpp/sdpa.cu`.
-pub struct FlashAttention {
+/// CUDA C++ F32 SDPA backend compiled from `cpp/sdpa.cu`.
+///
+/// This is intentionally named as a C++ attention backend, not
+/// FlashAttention: the current kernel is a correctness-first F32 causal SDPA
+/// implementation. Record mode must use a separate production BF16 fused
+/// SDPA/FlashAttention backend.
+pub struct CudaCppAttention {
     #[cfg_attr(not(has_cuda_cpp), allow(dead_code))]
     stream: Arc<CudaStream>,
 }
 
-impl FlashAttention {
+impl CudaCppAttention {
     pub fn new(stream: Arc<CudaStream>) -> PgResult<Self> {
         #[cfg(has_cuda_cpp)]
         {
@@ -45,6 +50,10 @@ impl FlashAttention {
         cfg!(has_cuda_cpp)
     }
 
+    pub fn backend_name(&self) -> &'static str {
+        "naive_f32_cpp_sdpa"
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -59,7 +68,7 @@ impl FlashAttention {
     ) -> PgResult<()> {
         #[cfg(has_cuda_cpp)]
         unsafe {
-            let status = run_cudnn_sdpa_f32(
+            let status = run_naive_sdpa_f32(
                 self.stream.cu_stream() as *mut c_void,
                 q,
                 k,
@@ -96,3 +105,9 @@ impl FlashAttention {
         }
     }
 }
+
+#[deprecated(
+    since = "0.1.0",
+    note = "use CudaCppAttention; this backend is not FlashAttention"
+)]
+pub type FlashAttention = CudaCppAttention;

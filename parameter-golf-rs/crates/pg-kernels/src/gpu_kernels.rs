@@ -38,6 +38,7 @@ pub struct GpuKernels {
     q_gain_fwd: CudaFunction,
     q_gain_bwd: CudaFunction,
     dot_accumulate: CudaFunction,
+    clip_by_global_norm: CudaFunction,
     cross_entropy_fwd: CudaFunction,
     cross_entropy_bwd: CudaFunction,
     bigram_hash_embed: CudaFunction,
@@ -45,10 +46,15 @@ pub struct GpuKernels {
     add_scaled: CudaFunction,
     causal_attention_naive: CudaFunction,
     causal_attention_naive_bwd: CudaFunction,
+    causal_attention_online: CudaFunction,
+    causal_attention_online_bwd: CudaFunction,
+    attn_out_gate_fwd: CudaFunction,
+    attn_out_gate_bwd: CudaFunction,
     xsa_fwd: CudaFunction,
     xsa_bwd: CudaFunction,
     copy_fwd: CudaFunction,
     scale_inplace: CudaFunction,
+    normalize_matrices: CudaFunction,
     decay_sgd_step: CudaFunction,
     adamw_step: CudaFunction,
 }
@@ -85,6 +91,43 @@ extern "C" __global__ void scale_inplace(
         } else {
             x[idx] *= scale;
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Per-matrix L2 normalization for rank-3 banks:
+// dst[b, :, :] = src[b, :, :] / (||src[b, :, :]||_2 + eps)
+// One block handles one matrix slice.
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void normalize_matrices(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int matrix_numel,
+    int batch,
+    float eps
+) {
+    int b = blockIdx.x;
+    if (b >= batch) return;
+    int tid = threadIdx.x;
+    int base = b * matrix_numel;
+
+    float sum = 0.0f;
+    for (int i = tid; i < matrix_numel; i += blockDim.x) {
+        float v = src[base + i];
+        sum += v * v;
+    }
+
+    __shared__ float shared[256];
+    shared[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared[tid] += shared[tid + stride];
+        __syncthreads();
+    }
+
+    float inv_norm = 1.0f / (sqrtf(shared[0]) + eps);
+    for (int i = tid; i < matrix_numel; i += blockDim.x) {
+        dst[base + i] = src[base + i] * inv_norm;
     }
 }
 
@@ -388,6 +431,7 @@ extern "C" __global__ void smear_gate_forward(
     const float* __restrict__ gate,
     float* __restrict__ out,
     int tokens,
+    int seq_len,
     int dim
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -398,7 +442,7 @@ extern "C" __global__ void smear_gate_forward(
     int d = idx % dim;
     float sig = 1.0f / (1.0f + expf(-gate[d]));
     float x_val = x[idx];
-    float x_prev = (tok > 0) ? x[idx - dim] : 0.0f;
+    float x_prev = (tok % seq_len > 0) ? x[idx - dim] : 0.0f;
     out[idx] = (1.0f - sig) * x_val + sig * x_prev;
 }
 
@@ -415,6 +459,7 @@ extern "C" __global__ void smear_gate_backward(
     float* __restrict__ grad_x_prev,
     float* __restrict__ grad_gate,
     int tokens,
+    int seq_len,
     int dim
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -426,10 +471,10 @@ extern "C" __global__ void smear_gate_backward(
     float sig = 1.0f / (1.0f + expf(-gate[d]));
     float go = grad_output[idx];
     float x_val = x[idx];
-    float x_prev = (tok > 0) ? x[idx - dim] : 0.0f;
+    float x_prev = (tok % seq_len > 0) ? x[idx - dim] : 0.0f;
 
     grad_x[idx] = (1.0f - sig) * go;
-    grad_x_prev[idx] = sig * go;
+    grad_x_prev[idx] = (tok % seq_len > 0) ? sig * go : 0.0f;
     atomicAdd(&grad_gate[d], go * (x_prev - x_val) * sig * (1.0f - sig));
 }
 
@@ -723,6 +768,23 @@ extern "C" __global__ void dot_accumulate(
 }
 
 // ──────────────────────────────────────────────────────────────
+// Device-side global-norm clipping:
+// x *= min(1, max_norm / sqrt(sum_sq[0]))
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void clip_by_global_norm(
+    float* __restrict__ x,
+    const float* __restrict__ sum_sq,
+    float max_norm,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float norm = sqrtf(sum_sq[0]);
+    float scale = (norm > max_norm) ? (max_norm / (norm + 1e-12f)) : 1.0f;
+    x[idx] *= scale;
+}
+
+// ──────────────────────────────────────────────────────────────
 // Fused cross-entropy forward (with softcap)
 // One block per token, full reduction within CTA.
 // ──────────────────────────────────────────────────────────────
@@ -876,13 +938,14 @@ extern "C" __global__ void bigram_hash_embed(
     float* __restrict__ out,
     int bigram_vocab,
     int bigram_dim,
-    int tokens
+    int tokens,
+    int seq_len
 ) {
     int t = blockIdx.x;
     if (t >= tokens) return;
 
     int bucket;
-    if (t == 0) {
+    if (t % seq_len == 0) {
         bucket = bigram_vocab - 1;  // sentinel
     } else {
         unsigned int curr = (unsigned int)ids[t];
@@ -905,13 +968,14 @@ extern "C" __global__ void bigram_hash_embed_backward(
     float* __restrict__ grad_embed,
     int bigram_vocab,
     int bigram_dim,
-    int tokens
+    int tokens,
+    int seq_len
 ) {
     int t = blockIdx.x;
     if (t >= tokens) return;
 
     int bucket;
-    if (t == 0) {
+    if (t % seq_len == 0) {
         bucket = bigram_vocab - 1;
     } else {
         unsigned int curr = (unsigned int)ids[t];
@@ -950,6 +1014,7 @@ extern "C" __global__ void causal_attention_naive(
     const float* __restrict__ v,    // [T, Hkv, D]
     float* __restrict__ out,        // [T, H, D]
     int tokens,
+    int seq_len,
     int num_heads,
     int num_kv_heads,
     int head_dim
@@ -960,6 +1025,7 @@ extern "C" __global__ void causal_attention_naive(
     int t = head_idx / num_heads;
     int h = head_idx % num_heads;
     int hkv = h / (num_heads / num_kv_heads);  // GQA mapping
+    int seq_start = (t / seq_len) * seq_len;
 
     const float* q_head = q + head_idx * head_dim;
     float* out_head = out + head_idx * head_dim;
@@ -971,7 +1037,7 @@ extern "C" __global__ void causal_attention_naive(
 
     // First pass: compute max score for numerical stability
     float max_score = -1e30f;
-    for (int s = 0; s <= t; s++) {
+    for (int s = seq_start; s <= t; s++) {
         float score = 0.0f;
         for (int dd = 0; dd < head_dim; dd++) {
             score += q_head[dd] * k[(s * num_kv_heads + hkv) * head_dim + dd];
@@ -983,7 +1049,7 @@ extern "C" __global__ void causal_attention_naive(
     // Second pass: compute exp sum and weighted value
     float sum_exp = 0.0f;
     float val_acc = 0.0f;
-    for (int s = 0; s <= t; s++) {
+    for (int s = seq_start; s <= t; s++) {
         float score = 0.0f;
         for (int dd = 0; dd < head_dim; dd++) {
             score += q_head[dd] * k[(s * num_kv_heads + hkv) * head_dim + dd];
@@ -1011,6 +1077,7 @@ extern "C" __global__ void causal_attention_naive_backward(
     float* __restrict__ grad_k,
     float* __restrict__ grad_v,
     int tokens,
+    int seq_len,
     int num_heads,
     int num_kv_heads,
     int head_dim
@@ -1018,12 +1085,14 @@ extern "C" __global__ void causal_attention_naive_backward(
     const int MAX_TOKENS = 2048;
     int head_idx = blockIdx.x;
     int total_heads = tokens * num_heads;
-    if (head_idx >= total_heads || tokens > MAX_TOKENS) return;
+    if (head_idx >= total_heads || seq_len > MAX_TOKENS) return;
 
     int tok = head_idx / num_heads;
     int h = head_idx % num_heads;
     int group = num_heads / num_kv_heads;
     int kv_h = h / group;
+    int seq_start = (tok / seq_len) * seq_len;
+    int local_tok = tok - seq_start;
     float scale = rsqrtf((float)head_dim);
 
     const float* q_head = q + head_idx * head_dim;
@@ -1035,41 +1104,43 @@ extern "C" __global__ void causal_attention_naive_backward(
 
     if (threadIdx.x == 0) {
         float max_score = -1e30f;
-        for (int s = 0; s <= tok; ++s) {
+        for (int i = 0; i <= local_tok; ++i) {
+            int s = seq_start + i;
             const float* k_head = k + (s * num_kv_heads + kv_h) * head_dim;
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * k_head[d];
             }
             float score = dot * scale;
-            weights[s] = score;
+            weights[i] = score;
             if (score > max_score) max_score = score;
         }
 
         float sum_exp = 0.0f;
-        for (int s = 0; s <= tok; ++s) {
-            float w = expf(weights[s] - max_score);
-            weights[s] = w;
+        for (int i = 0; i <= local_tok; ++i) {
+            float w = expf(weights[i] - max_score);
+            weights[i] = w;
             sum_exp += w;
         }
         float inv_sum = 1.0f / sum_exp;
-        for (int s = 0; s <= tok; ++s) {
-            weights[s] *= inv_sum;
+        for (int i = 0; i <= local_tok; ++i) {
+            weights[i] *= inv_sum;
         }
 
         float dot_wg = 0.0f;
-        for (int s = 0; s <= tok; ++s) {
+        for (int i = 0; i <= local_tok; ++i) {
+            int s = seq_start + i;
             const float* v_head = v + (s * num_kv_heads + kv_h) * head_dim;
             float grad_w = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
                 grad_w += go_head[d] * v_head[d];
             }
-            grad_scores[s] = grad_w;
-            dot_wg += weights[s] * grad_w;
+            grad_scores[i] = grad_w;
+            dot_wg += weights[i] * grad_w;
         }
 
-        for (int s = 0; s <= tok; ++s) {
-            grad_scores[s] = weights[s] * (grad_scores[s] - dot_wg) * scale;
+        for (int i = 0; i <= local_tok; ++i) {
+            grad_scores[i] = weights[i] * (grad_scores[i] - dot_wg) * scale;
         }
     }
     __syncthreads();
@@ -1079,16 +1150,352 @@ extern "C" __global__ void causal_attention_naive_backward(
     }
     __syncthreads();
 
-    for (int s = 0; s <= tok; ++s) {
+    for (int i = 0; i <= local_tok; ++i) {
+        int s = seq_start + i;
         const float* k_head = k + (s * num_kv_heads + kv_h) * head_dim;
         int kv_off = (s * num_kv_heads + kv_h) * head_dim;
-        float w = weights[s];
-        float gs = grad_scores[s];
+        float w = weights[i];
+        float gs = grad_scores[i];
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             atomicAdd(&grad_v[kv_off + d], w * go_head[d]);
             atomicAdd(&grad_k[kv_off + d], gs * q_head[d]);
             gq_head[d] += gs * k_head[d];
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Flash-style causal attention forward (online softmax, f32).
+//
+// One CTA computes one (token, query-head) row. Unlike the parity kernel,
+// the QK dot product for each source token is reduced once across the CTA
+// and streamed directly into the output accumulator; no score matrix is
+// materialized and no output lane recomputes the full dot product.
+//
+// This is the production f32 path until the BF16 cuDNN/FA3 backend is wired.
+// It preserves exact row-major tensor layouts used by the CPU reference.
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void causal_attention_online(
+    const float* __restrict__ q,    // [T, H, D]
+    const float* __restrict__ k,    // [T, Hkv, D]
+    const float* __restrict__ v,    // [T, Hkv, D]
+    float* __restrict__ out,        // [T, H, D]
+    int tokens,
+    int seq_len,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= tokens * num_heads || head_dim > blockDim.x) return;
+
+    int tok = head_idx / num_heads;
+    int h = head_idx % num_heads;
+    int group = num_heads / num_kv_heads;
+    int kv_h = h / group;
+    int seq_start = (tok / seq_len) * seq_len;
+    float scale = rsqrtf((float)head_dim);
+
+    int tid = threadIdx.x;
+    const float* q_head = q + head_idx * head_dim;
+    float acc = 0.0f;
+
+    __shared__ float reduce[256];
+    __shared__ float max_score_s;
+    __shared__ float denom_s;
+    __shared__ float weight_s;
+
+    float max_score = -1e30f;
+    for (int s = seq_start; s <= tok; ++s) {
+        const float* k_head = k + (s * num_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            dot += q_head[d] * k_head[d];
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            if (score > max_score) max_score = score;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        max_score_s = max_score;
+        denom_s = 0.0f;
+    }
+    __syncthreads();
+
+    for (int s = seq_start; s <= tok; ++s) {
+        const float* k_head = k + (s * num_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            dot += q_head[d] * k_head[d];
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float w = expf(reduce[0] * scale - max_score_s);
+            weight_s = w;
+            denom_s += w;
+        }
+        __syncthreads();
+
+        if (tid < head_dim) {
+            acc += weight_s * v[(s * num_kv_heads + kv_h) * head_dim + tid];
+        }
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+        out[head_idx * head_dim + tid] = acc / denom_s;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Flash-style causal attention backward (f32).
+//
+// The backward pass mirrors the CPU reference but parallelizes the expensive
+// q·k and grad_out·v reductions across the CTA. K/V gradients remain atomics:
+// multiple future query rows legitimately contribute to the same KV row.
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void causal_attention_online_backward(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_q,
+    float* __restrict__ grad_k,
+    float* __restrict__ grad_v,
+    int tokens,
+    int seq_len,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    const int MAX_TOKENS = 2048;
+    int head_idx = blockIdx.x;
+    if (head_idx >= tokens * num_heads || seq_len > MAX_TOKENS || head_dim > blockDim.x) return;
+
+    int tok = head_idx / num_heads;
+    int h = head_idx % num_heads;
+    int group = num_heads / num_kv_heads;
+    int kv_h = h / group;
+    int seq_start = (tok / seq_len) * seq_len;
+    int local_tok = tok - seq_start;
+    int tid = threadIdx.x;
+    float scale = rsqrtf((float)head_dim);
+
+    const float* q_head = q + head_idx * head_dim;
+    const float* go_head = grad_output + head_idx * head_dim;
+    float* gq_head = grad_q + head_idx * head_dim;
+
+    __shared__ float weights[MAX_TOKENS];
+    __shared__ float grad_scores[MAX_TOKENS];
+    __shared__ float reduce[256];
+    __shared__ float dot_wg_s;
+
+    float max_score = -1e30f;
+    for (int i = 0; i <= local_tok; ++i) {
+        int s = seq_start + i;
+        const float* k_head = k + (s * num_kv_heads + kv_h) * head_dim;
+        float dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            dot += q_head[d] * k_head[d];
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float score = reduce[0] * scale;
+            weights[i] = score;
+            if (score > max_score) max_score = score;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float sum_exp = 0.0f;
+        for (int i = 0; i <= local_tok; ++i) {
+            float w = expf(weights[i] - max_score);
+            weights[i] = w;
+            sum_exp += w;
+        }
+        float inv_sum = 1.0f / sum_exp;
+        for (int i = 0; i <= local_tok; ++i) {
+            weights[i] *= inv_sum;
+        }
+        dot_wg_s = 0.0f;
+    }
+    __syncthreads();
+
+    for (int i = 0; i <= local_tok; ++i) {
+        int s = seq_start + i;
+        const float* v_head = v + (s * num_kv_heads + kv_h) * head_dim;
+        float grad_w = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            grad_w += go_head[d] * v_head[d];
+        }
+        reduce[tid] = grad_w;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            grad_scores[i] = reduce[0];
+            dot_wg_s += weights[i] * reduce[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        for (int i = 0; i <= local_tok; ++i) {
+            grad_scores[i] = weights[i] * (grad_scores[i] - dot_wg_s) * scale;
+        }
+    }
+    __syncthreads();
+
+    if (tid < head_dim) {
+        gq_head[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int i = 0; i <= local_tok; ++i) {
+        int s = seq_start + i;
+        int kv_off = (s * num_kv_heads + kv_h) * head_dim;
+        const float* k_head = k + kv_off;
+        float w = weights[i];
+        float gs = grad_scores[i];
+        if (tid < head_dim) {
+            atomicAdd(&grad_v[kv_off + tid], w * go_head[tid]);
+            atomicAdd(&grad_k[kv_off + tid], gs * q_head[tid]);
+            gq_head[tid] += gs * k_head[tid];
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Attention output gate.
+//
+// gate[t,h] = 2 * sigmoid(b[h] + dot(W[h], gate_input[t, :width]))
+// out[t,h,:] = attn_in[t,h,:] * gate[t,h]
+//
+// One CTA handles one (token, head). The gate dot and head-dim reductions
+// stay inside the CTA; parameter/input gradients use atomics because tokens
+// and heads legitimately share destinations.
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void attn_out_gate_forward(
+    const float* __restrict__ attn_in,
+    const float* __restrict__ gate_input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    float* __restrict__ gate_values,
+    int tokens,
+    int num_heads,
+    int head_dim,
+    int model_dim,
+    int gate_width
+) {
+    int row = blockIdx.x;
+    if (row >= tokens * num_heads) return;
+    int tok = row / num_heads;
+    int head = row % num_heads;
+    int tid = threadIdx.x;
+
+    __shared__ float reduce[256];
+    float score_part = 0.0f;
+    const float* w = weight + head * gate_width;
+    const float* x = gate_input + tok * model_dim;
+    for (int j = tid; j < gate_width; j += blockDim.x) {
+        score_part += w[j] * x[j];
+    }
+    reduce[tid] = score_part;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+
+    __shared__ float gate_s;
+    if (tid == 0) {
+        float score = reduce[0] + bias[head];
+        float sig = 1.0f / (1.0f + expf(-score));
+        gate_s = 2.0f * sig;
+        gate_values[row] = gate_s;
+    }
+    __syncthreads();
+
+    int base = row * head_dim;
+    for (int j = tid; j < head_dim; j += blockDim.x) {
+        out[base + j] = attn_in[base + j] * gate_s;
+    }
+}
+
+extern "C" __global__ void attn_out_gate_backward(
+    const float* __restrict__ attn_in,
+    const float* __restrict__ gate_input,
+    const float* __restrict__ gate_values,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ weight,
+    float* __restrict__ grad_attn_in,
+    float* __restrict__ grad_gate_input,
+    float* __restrict__ grad_weight,
+    float* __restrict__ grad_bias,
+    int tokens,
+    int num_heads,
+    int head_dim,
+    int model_dim,
+    int gate_width
+) {
+    int row = blockIdx.x;
+    if (row >= tokens * num_heads) return;
+    int tok = row / num_heads;
+    int head = row % num_heads;
+    int tid = threadIdx.x;
+    int base = row * head_dim;
+    float gate = gate_values[row];
+
+    __shared__ float reduce[256];
+    float grad_gate_part = 0.0f;
+    for (int j = tid; j < head_dim; j += blockDim.x) {
+        float go = grad_out[base + j];
+        grad_attn_in[base + j] = go * gate;
+        grad_gate_part += go * attn_in[base + j];
+    }
+    reduce[tid] = grad_gate_part;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+
+    __shared__ float grad_score_s;
+    if (tid == 0) {
+        float sig = 0.5f * gate;
+        grad_score_s = reduce[0] * 2.0f * sig * (1.0f - sig);
+        atomicAdd(&grad_bias[head], grad_score_s);
+    }
+    __syncthreads();
+
+    const float* x = gate_input + tok * model_dim;
+    const float* w = weight + head * gate_width;
+    for (int j = tid; j < gate_width; j += blockDim.x) {
+        atomicAdd(&grad_weight[head * gate_width + j], grad_score_s * x[j]);
+        atomicAdd(&grad_gate_input[tok * model_dim + j], grad_score_s * w[j]);
     }
 }
 
@@ -1340,6 +1747,9 @@ impl GpuKernels {
             dot_accumulate: module
                 .load_function("dot_accumulate")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            clip_by_global_norm: module
+                .load_function("clip_by_global_norm")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             cross_entropy_fwd: module
                 .load_function("cross_entropy_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -1361,6 +1771,20 @@ impl GpuKernels {
             causal_attention_naive_bwd: module
                 .load_function("causal_attention_naive_backward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            causal_attention_online: module
+                .load_function("causal_attention_online")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            causal_attention_online_bwd: module
+                .load_function("causal_attention_online_backward")
+                .map_err(|e| {
+                PgError::InvalidOp(format!("Failed to load kernel {}", e))
+            })?,
+            attn_out_gate_fwd: module
+                .load_function("attn_out_gate_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            attn_out_gate_bwd: module
+                .load_function("attn_out_gate_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             xsa_fwd: module
                 .load_function("xsa_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -1372,6 +1796,9 @@ impl GpuKernels {
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             scale_inplace: module
                 .load_function("scale_inplace")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            normalize_matrices: module
+                .load_function("normalize_matrices")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             decay_sgd_step: module
                 .load_function("decay_sgd_step")
@@ -1486,6 +1913,32 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("scale_inplace failed: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn normalize_matrices(
+        &self,
+        src: CudaPtr,
+        dst: CudaPtr,
+        matrix_numel: u32,
+        batch: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        unsafe {
+            self.stream
+                .launch_builder(&self.normalize_matrices)
+                .arg(&src)
+                .arg(&dst)
+                .arg(&(matrix_numel as i32))
+                .arg(&(batch as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (batch, 1, 1).into(),
+                    block_dim: (256, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("normalize_matrices failed: {:?}", e)))?;
         }
         Ok(())
     }
@@ -1748,6 +2201,7 @@ impl GpuKernels {
         gate: CudaPtr,
         out: CudaPtr,
         tokens: u32,
+        seq_len: u32,
         dim: u32,
     ) -> PgResult<()> {
         let n = tokens * dim;
@@ -1760,6 +2214,7 @@ impl GpuKernels {
                 .arg(&gate)
                 .arg(&out)
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .arg(&(dim as i32))
                 .launch(cudarc::driver::LaunchConfig {
                     grid_dim: (grid, 1, 1).into(),
@@ -1781,6 +2236,7 @@ impl GpuKernels {
         grad_x_prev: CudaPtr,
         grad_gate: CudaPtr,
         tokens: u32,
+        seq_len: u32,
         dim: u32,
     ) -> PgResult<()> {
         let n = tokens * dim;
@@ -1796,6 +2252,7 @@ impl GpuKernels {
                 .arg(&grad_x_prev)
                 .arg(&grad_gate)
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .arg(&(dim as i32))
                 .launch(cudarc::driver::LaunchConfig {
                     grid_dim: (grid, 1, 1).into(),
@@ -2083,6 +2540,32 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn clip_by_global_norm(
+        &self,
+        x: CudaPtr,
+        sum_sq: CudaPtr,
+        max_norm: f32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.clip_by_global_norm)
+                .arg(&x)
+                .arg(&sum_sq)
+                .arg(&max_norm)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("clip_by_global_norm launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
     /// Cross-entropy forward with softcap
     pub fn cross_entropy_fwd(
         &self,
@@ -2154,6 +2637,7 @@ impl GpuKernels {
         bigram_vocab: u32,
         bigram_dim: u32,
         tokens: u32,
+        seq_len: u32,
     ) -> PgResult<()> {
         let block = 128u32.min(bigram_dim.next_power_of_two());
         unsafe {
@@ -2165,6 +2649,7 @@ impl GpuKernels {
                 .arg(&(bigram_vocab as i32))
                 .arg(&(bigram_dim as i32))
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .launch(cudarc::driver::LaunchConfig {
                     grid_dim: (tokens, 1, 1).into(),
                     block_dim: (block, 1, 1).into(),
@@ -2184,6 +2669,7 @@ impl GpuKernels {
         bigram_vocab: u32,
         bigram_dim: u32,
         tokens: u32,
+        seq_len: u32,
     ) -> PgResult<()> {
         let block = 128u32.min(bigram_dim.next_power_of_two());
         unsafe {
@@ -2195,6 +2681,7 @@ impl GpuKernels {
                 .arg(&(bigram_vocab as i32))
                 .arg(&(bigram_dim as i32))
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .launch(cudarc::driver::LaunchConfig {
                     grid_dim: (tokens, 1, 1).into(),
                     block_dim: (block, 1, 1).into(),
@@ -2238,6 +2725,7 @@ impl GpuKernels {
         v: CudaPtr,
         out: CudaPtr,
         tokens: u32,
+        seq_len: u32,
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -2252,6 +2740,7 @@ impl GpuKernels {
                 .arg(&v)
                 .arg(&out)
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .arg(&(num_heads as i32))
                 .arg(&(num_kv_heads as i32))
                 .arg(&(head_dim as i32))
@@ -2276,6 +2765,7 @@ impl GpuKernels {
         grad_k: CudaPtr,
         grad_v: CudaPtr,
         tokens: u32,
+        seq_len: u32,
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -2293,6 +2783,7 @@ impl GpuKernels {
                 .arg(&grad_k)
                 .arg(&grad_v)
                 .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
                 .arg(&(num_heads as i32))
                 .arg(&(num_kv_heads as i32))
                 .arg(&(head_dim as i32))
@@ -2302,6 +2793,199 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("causal_attention_bwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Flash-style f32 causal attention forward.
+    /// One CTA computes one row using online softmax; no score matrix is materialized.
+    pub fn causal_attention_online_fwd(
+        &self,
+        q: CudaPtr,
+        k: CudaPtr,
+        v: CudaPtr,
+        out: CudaPtr,
+        tokens: u32,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> PgResult<()> {
+        if head_dim == 0 || head_dim > 256 {
+            return Err(PgError::InvalidOp(format!(
+                "online attention supports 1..=256 head_dim, got {head_dim}"
+            )));
+        }
+        let total_heads = tokens * num_heads;
+        let block = 32u32.max(head_dim.next_power_of_two()).min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.causal_attention_online)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&out)
+                .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("causal_attention_online launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Flash-style f32 causal attention backward.
+    pub fn causal_attention_online_bwd(
+        &self,
+        q: CudaPtr,
+        k: CudaPtr,
+        v: CudaPtr,
+        grad_output: CudaPtr,
+        grad_q: CudaPtr,
+        grad_k: CudaPtr,
+        grad_v: CudaPtr,
+        tokens: u32,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> PgResult<()> {
+        if head_dim == 0 || head_dim > 256 {
+            return Err(PgError::InvalidOp(format!(
+                "online attention backward supports 1..=256 head_dim, got {head_dim}"
+            )));
+        }
+        let total_heads = tokens * num_heads;
+        let block = 32u32.max(head_dim.next_power_of_two()).min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.causal_attention_online_bwd)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&grad_output)
+                .arg(&grad_q)
+                .arg(&grad_k)
+                .arg(&grad_v)
+                .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("causal_attention_online_bwd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn attn_out_gate_fwd(
+        &self,
+        attn_in: CudaPtr,
+        gate_input: CudaPtr,
+        weight: CudaPtr,
+        bias: CudaPtr,
+        out: CudaPtr,
+        gate_values: CudaPtr,
+        tokens: u32,
+        num_heads: u32,
+        head_dim: u32,
+        model_dim: u32,
+        gate_width: u32,
+    ) -> PgResult<()> {
+        if gate_width == 0 || gate_width > model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "invalid AttnOutGate width {gate_width} for model_dim {model_dim}"
+            )));
+        }
+        let block = 32u32
+            .max(gate_width.max(head_dim).next_power_of_two())
+            .min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.attn_out_gate_fwd)
+                .arg(&attn_in)
+                .arg(&gate_input)
+                .arg(&weight)
+                .arg(&bias)
+                .arg(&out)
+                .arg(&gate_values)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (tokens * num_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("attn_out_gate_fwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn attn_out_gate_bwd(
+        &self,
+        attn_in: CudaPtr,
+        gate_input: CudaPtr,
+        gate_values: CudaPtr,
+        grad_out: CudaPtr,
+        weight: CudaPtr,
+        grad_attn_in: CudaPtr,
+        grad_gate_input: CudaPtr,
+        grad_weight: CudaPtr,
+        grad_bias: CudaPtr,
+        tokens: u32,
+        num_heads: u32,
+        head_dim: u32,
+        model_dim: u32,
+        gate_width: u32,
+    ) -> PgResult<()> {
+        if gate_width == 0 || gate_width > model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "invalid AttnOutGate width {gate_width} for model_dim {model_dim}"
+            )));
+        }
+        let block = 32u32
+            .max(gate_width.max(head_dim).next_power_of_two())
+            .min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.attn_out_gate_bwd)
+                .arg(&attn_in)
+                .arg(&gate_input)
+                .arg(&gate_values)
+                .arg(&grad_out)
+                .arg(&weight)
+                .arg(&grad_attn_in)
+                .arg(&grad_gate_input)
+                .arg(&grad_weight)
+                .arg(&grad_bias)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (tokens * num_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("attn_out_gate_bwd launch: {:?}", e)))?;
         }
         Ok(())
     }

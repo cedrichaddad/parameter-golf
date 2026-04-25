@@ -52,6 +52,8 @@ pub struct GradBuffers {
     pub block_mlp_scale: Vec<Vec<f32>>,
     pub block_resid_mix: Vec<Vec<f32>>,
     pub block_q_gain: Vec<Vec<f32>>,
+    pub block_attn_gate_weight: Vec<Vec<f32>>,
+    pub block_attn_gate_bias: Vec<Vec<f32>>,
     pub ve_embed: Vec<f32>,
     pub ve_proj: Vec<f32>,
     pub ve_scale: f32,
@@ -80,6 +82,10 @@ impl GradBuffers {
             block_mlp_scale: (0..n).map(|_| vec![0.0; d]).collect(),
             block_resid_mix: (0..n).map(|_| vec![0.0; 2 * d]).collect(),
             block_q_gain: (0..n).map(|_| vec![0.0; config.num_heads]).collect(),
+            block_attn_gate_weight: (0..n)
+                .map(|_| vec![0.0; config.num_heads * config.attn_out_gate_width.max(1)])
+                .collect(),
+            block_attn_gate_bias: (0..n).map(|_| vec![0.0; config.num_heads]).collect(),
             ve_embed: vec![0.0; config.vocab_size * config.ve_dim],
             ve_proj: vec![0.0; kv * config.ve_dim],
             ve_scale: 0.0,
@@ -108,6 +114,12 @@ impl GradBuffers {
             v.fill(0.0);
         }
         for v in &mut self.block_q_gain {
+            v.fill(0.0);
+        }
+        for v in &mut self.block_attn_gate_weight {
+            v.fill(0.0);
+        }
+        for v in &mut self.block_attn_gate_bias {
             v.fill(0.0);
         }
         self.ve_embed.fill(0.0);
@@ -144,6 +156,12 @@ impl GradBuffers {
         for v in &self.block_q_gain {
             add(v, &mut sum_sq);
         }
+        for v in &self.block_attn_gate_weight {
+            add(v, &mut sum_sq);
+        }
+        for v in &self.block_attn_gate_bias {
+            add(v, &mut sum_sq);
+        }
         sum_sq.sqrt()
     }
 
@@ -175,6 +193,12 @@ impl GradBuffers {
                 clip(v, s);
             }
             for v in &mut self.block_q_gain {
+                clip(v, s);
+            }
+            for v in &mut self.block_attn_gate_weight {
+                clip(v, s);
+            }
+            for v in &mut self.block_attn_gate_bias {
                 clip(v, s);
             }
         }
@@ -381,12 +405,39 @@ impl GptModel {
         );
 
         // 8. XSA
-        let (attn_result, _xsa_out) = if bp.use_xsa {
+        let (attn_result_raw, _xsa_out) = if bp.use_xsa {
             let mut xo = vec![0.0f32; t * h * hd];
             pg_kernels::xsa::xsa_forward(&attn_out, &v_proj, &mut xo, t, h, hkv, hd);
             (xo.clone(), Some(xo))
         } else {
             (attn_out.clone(), None)
+        };
+        let mut attn_gate_values: Option<Vec<f32>> = None;
+        let attn_result = if self.attn_out_gate_enabled() {
+            let width = c.attn_out_gate_width;
+            let mut gate_values = vec![0.0f32; t * h];
+            let mut gated = vec![0.0f32; t * h * hd];
+            for tok in 0..t {
+                let gate_input = &attn_norm_out[tok * d..tok * d + width];
+                for head in 0..h {
+                    let mut score = bp.attn_gate_bias[head];
+                    let weight = &bp.attn_gate_weight[head * width..(head + 1) * width];
+                    for j in 0..width {
+                        score += weight[j] * gate_input[j];
+                    }
+                    let sig = 1.0 / (1.0 + (-score).exp());
+                    let gate = 2.0 * sig;
+                    gate_values[tok * h + head] = gate;
+                    let base = (tok * h + head) * hd;
+                    for j in 0..hd {
+                        gated[base + j] = attn_result_raw[base + j] * gate;
+                    }
+                }
+            }
+            attn_gate_values = Some(gate_values);
+            gated
+        } else {
+            attn_result_raw.clone()
         };
 
         // 9. Output projection
@@ -563,6 +614,38 @@ impl GptModel {
             grads.qo_bank[o_offset + i] += grad_o_w[i];
         }
 
+        let mut gate_grad_attn_norm = vec![0.0f32; t * d];
+        let grad_attn_raw = if let Some(gate_values) = attn_gate_values.as_ref() {
+            let width = c.attn_out_gate_width;
+            let mut grad_raw = vec![0.0f32; t * h * hd];
+            for tok in 0..t {
+                let gate_input = &attn_norm_out[tok * d..tok * d + width];
+                for head in 0..h {
+                    let gate = gate_values[tok * h + head];
+                    let sig = 0.5 * gate;
+                    let mut grad_gate = 0.0f32;
+                    let base = (tok * h + head) * hd;
+                    for j in 0..hd {
+                        let go = grad_attn_result[base + j];
+                        grad_raw[base + j] = go * gate;
+                        grad_gate += go * attn_result_raw[base + j];
+                    }
+
+                    let grad_score = grad_gate * 2.0 * sig * (1.0 - sig);
+                    grads.block_attn_gate_bias[layer][head] += grad_score;
+                    let weight = &bp.attn_gate_weight[head * width..(head + 1) * width];
+                    for j in 0..width {
+                        grads.block_attn_gate_weight[layer][head * width + j] +=
+                            grad_score * gate_input[j];
+                        gate_grad_attn_norm[tok * d + j] += grad_score * weight[j];
+                    }
+                }
+            }
+            grad_raw
+        } else {
+            grad_attn_result
+        };
+
         // 8. XSA backward
         let mut xsa_grad_v: Option<Vec<f32>> = None;
         let grad_attn_out = if bp.use_xsa {
@@ -571,7 +654,7 @@ impl GptModel {
             pg_kernels::xsa::xsa_backward(
                 &attn_out,
                 &v_proj,
-                &grad_attn_result,
+                &grad_attn_raw,
                 &mut grad_y,
                 &mut grad_v_xsa,
                 t,
@@ -582,7 +665,7 @@ impl GptModel {
             xsa_grad_v = Some(grad_v_xsa);
             grad_y
         } else {
-            grad_attn_result
+            grad_attn_raw
         };
 
         // 7. Attention backward — exact causal attention backward with GQA.
@@ -775,6 +858,9 @@ impl GptModel {
         }
         for i in 0..t * d {
             grad_attn_norm[i] += grad_attn_norm_v[i];
+        }
+        for i in 0..t * d {
+            grad_attn_norm[i] += gate_grad_attn_norm[i];
         }
 
         // 2. Attn norm backward
@@ -1155,6 +1241,8 @@ mod tests {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,

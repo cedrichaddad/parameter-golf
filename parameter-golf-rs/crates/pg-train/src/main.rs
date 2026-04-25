@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use pg_model::{QuantScheme, RunMode, RunSpec, TrainBackend, VariantFamily};
+use pg_model::{
+    AttentionBackend, DistributedOptimizerBackend, EvalAdaptationBackend, QuantScheme, RunMode,
+    RunSpec, TrainBackend, VariantFamily,
+};
 use pg_train::VariantRunner;
 
 fn main() {
@@ -30,6 +33,11 @@ fn main() {
             let mut tokenizer_vocab_path: Option<String> = None;
             let mut eval_max_tokens: Option<usize> = None;
             let mut eval_stride: Option<usize> = None;
+            let mut attention_backend: Option<AttentionBackend> = None;
+            let mut distributed_optimizer_backend: Option<DistributedOptimizerBackend> = None;
+            let mut eval_adaptation_backend: Option<EvalAdaptationBackend> = None;
+            let mut attn_out_gate: Option<bool> = None;
+            let mut attn_out_gate_width: Option<usize> = None;
             let mut quant_scheme: Option<QuantScheme> = None;
             let mut prune_keep_ratio: Option<f32> = None;
             let mut fast_bank_updates = false;
@@ -70,6 +78,25 @@ fn main() {
                     }
                     "--eval-stride" => {
                         eval_stride = args.next().and_then(|v| v.parse::<usize>().ok())
+                    }
+                    "--attention-backend" => {
+                        attention_backend = args.next().as_deref().and_then(parse_attention_backend)
+                    }
+                    "--distributed-optimizer" => {
+                        distributed_optimizer_backend = args
+                            .next()
+                            .as_deref()
+                            .and_then(parse_distributed_optimizer_backend)
+                    }
+                    "--eval-adaptation" => {
+                        eval_adaptation_backend = args
+                            .next()
+                            .as_deref()
+                            .and_then(parse_eval_adaptation_backend)
+                    }
+                    "--attn-out-gate" => attn_out_gate = Some(true),
+                    "--attn-out-gate-width" => {
+                        attn_out_gate_width = args.next().and_then(|v| v.parse::<usize>().ok())
                     }
                     "--quant-scheme" => {
                         quant_scheme = args.next().as_deref().and_then(parse_quant_scheme)
@@ -131,6 +158,22 @@ fn main() {
             if let Some(value) = eval_stride {
                 run_spec.eval.stride = value;
             }
+            if let Some(value) = attention_backend {
+                run_spec.model.attention_backend = value;
+            }
+            if let Some(value) = distributed_optimizer_backend {
+                run_spec.train.distributed_optimizer_backend = value;
+            }
+            if let Some(value) = eval_adaptation_backend {
+                run_spec.eval.adaptation_backend = value;
+                run_spec.eval.qttt = value != EvalAdaptationBackend::None;
+            }
+            if let Some(value) = attn_out_gate {
+                run_spec.model.attn_out_gate.enabled = value;
+            }
+            if let Some(value) = attn_out_gate_width {
+                run_spec.model.attn_out_gate.width = value;
+            }
             if let Some(value) = quant_scheme {
                 run_spec.quant.scheme = value;
             }
@@ -162,12 +205,32 @@ fn main() {
             println!("wallclock_seconds={:.3}", result.wallclock_seconds);
             println!("rank={}", result.rank);
             println!("world_size={}", result.world_size);
+            println!("seq_len={}", result.seq_len);
+            println!("global_batch_tokens={}", result.global_batch_tokens);
+            println!(
+                "local_microbatches_per_step={}",
+                result.local_microbatches_per_step
+            );
+            println!("tokens_seen_global={}", result.tokens_seen_global);
             println!("distributed_sync={}", result.distributed_sync);
+            println!("attention_backend={}", result.attention_backend);
+            println!(
+                "distributed_optimizer_backend={}",
+                result.distributed_optimizer_backend
+            );
+            println!("eval_adaptation_backend={}", result.eval_adaptation_backend);
+            println!("frontier_record_ready={}", result.frontier_record_ready);
             println!("bank_update_backend={}", result.bank_update_backend);
             println!("train_data_source={}", result.train_data_source);
             println!("bpb_byte_source={}", result.bpb_byte_source);
             if let Some(bytes) = result.artifact_bytes {
                 println!("artifact_bytes={bytes}");
+            }
+            if let Some(bytes) = result.submission_code_bytes {
+                println!("submission_code_bytes={bytes}");
+            }
+            if let Some(bytes) = result.submission_total_bytes {
+                println!("submission_total_bytes={bytes}");
             }
             if let Some(ok) = result.artifact_budget_ok {
                 println!("artifact_budget_ok={ok}");
@@ -202,6 +265,11 @@ fn main() {
             let mut tokenizer_vocab_path: Option<String> = None;
             let mut eval_max_tokens: Option<usize> = None;
             let mut eval_stride: Option<usize> = None;
+            let mut attention_backend: Option<AttentionBackend> = None;
+            let mut distributed_optimizer_backend: Option<DistributedOptimizerBackend> = None;
+            let mut eval_adaptation_backend: Option<EvalAdaptationBackend> = None;
+            let mut attn_out_gate: Option<bool> = None;
+            let mut attn_out_gate_width: Option<usize> = None;
             let mut quant_scheme: Option<QuantScheme> = None;
             let mut prune_keep_ratio: Option<f32> = None;
             let mut fast_bank_updates = false;
@@ -236,6 +304,25 @@ fn main() {
                     }
                     "--eval-stride" => {
                         eval_stride = args.next().and_then(|v| v.parse::<usize>().ok())
+                    }
+                    "--attention-backend" => {
+                        attention_backend = args.next().as_deref().and_then(parse_attention_backend)
+                    }
+                    "--distributed-optimizer" => {
+                        distributed_optimizer_backend = args
+                            .next()
+                            .as_deref()
+                            .and_then(parse_distributed_optimizer_backend)
+                    }
+                    "--eval-adaptation" => {
+                        eval_adaptation_backend = args
+                            .next()
+                            .as_deref()
+                            .and_then(parse_eval_adaptation_backend)
+                    }
+                    "--attn-out-gate" => attn_out_gate = Some(true),
+                    "--attn-out-gate-width" => {
+                        attn_out_gate_width = args.next().and_then(|v| v.parse::<usize>().ok())
                     }
                     "--quant-scheme" => {
                         quant_scheme = args.next().as_deref().and_then(parse_quant_scheme)
@@ -306,6 +393,22 @@ fn main() {
                 if let Some(value) = eval_stride {
                     run_spec.eval.stride = value;
                 }
+                if let Some(value) = attention_backend {
+                    run_spec.model.attention_backend = value;
+                }
+                if let Some(value) = distributed_optimizer_backend {
+                    run_spec.train.distributed_optimizer_backend = value;
+                }
+                if let Some(value) = eval_adaptation_backend {
+                    run_spec.eval.adaptation_backend = value;
+                    run_spec.eval.qttt = value != EvalAdaptationBackend::None;
+                }
+                if let Some(value) = attn_out_gate {
+                    run_spec.model.attn_out_gate.enabled = value;
+                }
+                if let Some(value) = attn_out_gate_width {
+                    run_spec.model.attn_out_gate.width = value;
+                }
                 if let Some(value) = quant_scheme {
                     run_spec.quant.scheme = value;
                 }
@@ -318,7 +421,7 @@ fn main() {
                 match VariantRunner::new(run_spec.clone()).and_then(|runner| runner.run(mode)) {
                     Ok(result) => {
                         println!(
-                            "variant={:?} status=ok backend={:?} fingerprint={} steps={} loss={:.6} ms_per_step={:.3} rank={} world_size={} distributed_sync={} bank_update_backend={} train_data_source={} bpb_byte_source={} proxy_bpb={} proxy_metric_source={} final_bpb={} artifact_budget_ok={}",
+                            "variant={:?} status=ok backend={:?} fingerprint={} steps={} loss={:.6} ms_per_step={:.3} rank={} world_size={} seq_len={} global_batch_tokens={} local_microbatches_per_step={} tokens_seen_global={} distributed_sync={} attention_backend={} distributed_optimizer_backend={} eval_adaptation_backend={} frontier_record_ready={} bank_update_backend={} train_data_source={} bpb_byte_source={} proxy_bpb={} proxy_metric_source={} final_bpb={} artifact_bytes={} submission_total_bytes={} artifact_budget_ok={}",
                             family,
                             result.train_backend,
                             result.variant_fingerprint,
@@ -327,7 +430,15 @@ fn main() {
                             result.ms_per_step,
                             result.rank,
                             result.world_size,
+                            result.seq_len,
+                            result.global_batch_tokens,
+                            result.local_microbatches_per_step,
+                            result.tokens_seen_global,
                             result.distributed_sync,
+                            result.attention_backend,
+                            result.distributed_optimizer_backend,
+                            result.eval_adaptation_backend,
+                            result.frontier_record_ready,
                             result.bank_update_backend,
                             result.train_data_source,
                             result.bpb_byte_source,
@@ -342,6 +453,14 @@ fn main() {
                             result
                                 .final_bpb
                                 .map(|v| format!("{v:.6}"))
+                                .unwrap_or_else(|| "none".to_string()),
+                            result
+                                .artifact_bytes
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            result
+                                .submission_total_bytes
+                                .map(|v| v.to_string())
                                 .unwrap_or_else(|| "none".to_string()),
                             result
                                 .artifact_budget_ok
@@ -372,18 +491,36 @@ fn print_usage() {
     eprintln!("               [--rank n] [--world-size n] [--batch-tokens n] [--seq-len n]");
     eprintln!("               [--total-iterations n] [--max-wallclock-seconds n]");
     eprintln!("               [--tokenizer-vocab path] [--eval-max-tokens n] [--eval-stride n]");
-    eprintln!("               [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]");
+    eprintln!("               [--attention-backend naive_f32|flash_f32|cudnn_sdpa_bf16]");
+    eprintln!(
+        "               [--distributed-optimizer all_reduce_replicated_muon|sharded_parallel_muon]"
+    );
+    eprintln!("               [--eval-adaptation none|cpu_q_only|gpu_lora_phased]");
+    eprintln!("               [--attn-out-gate] [--attn-out-gate-width n]");
+    eprintln!(
+        "               [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]"
+    );
     eprintln!("               [--prune-keep-ratio f]");
     eprintln!("               [--fast-bank-updates] [--allow-unsupported-variants]");
+    eprintln!("               record requires --backend cuda-distributed and real --train-data");
     eprintln!("  pg-train sweep [--mode smoke|proxy]");
     eprintln!("                 [--backend cpu|cuda-single|cuda-single-parity|cuda-distributed]");
     eprintln!("                 [--train-data glob] [--val-data glob]");
     eprintln!("                 [--rank n] [--world-size n] [--batch-tokens n] [--seq-len n]");
     eprintln!("                 [--total-iterations n] [--max-wallclock-seconds n]");
     eprintln!("                 [--tokenizer-vocab path] [--eval-max-tokens n] [--eval-stride n]");
-    eprintln!("                 [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]");
+    eprintln!("                 [--attention-backend naive_f32|flash_f32|cudnn_sdpa_bf16]");
+    eprintln!(
+        "                 [--distributed-optimizer all_reduce_replicated_muon|sharded_parallel_muon]"
+    );
+    eprintln!("                 [--eval-adaptation none|cpu_q_only|gpu_lora_phased]");
+    eprintln!("                 [--attn-out-gate] [--attn-out-gate-width n]");
+    eprintln!(
+        "                 [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]"
+    );
     eprintln!("                 [--prune-keep-ratio f]");
     eprintln!("                 [--fast-bank-updates] [--allow-unsupported-variants]");
+    eprintln!("  env: PG_SUBMISSION_CODE_BYTES overrides executable-size budget accounting");
 }
 
 fn parse_mode(raw: &str) -> Option<RunMode> {
@@ -401,6 +538,32 @@ fn parse_backend(raw: &str) -> Option<TrainBackend> {
         "cuda-single" => Some(TrainBackend::CudaSingle),
         "cuda-single-parity" => Some(TrainBackend::CudaSingleParity),
         "cuda-distributed" => Some(TrainBackend::CudaDistributed),
+        _ => None,
+    }
+}
+
+fn parse_attention_backend(raw: &str) -> Option<AttentionBackend> {
+    match raw {
+        "naive_f32" => Some(AttentionBackend::NaiveF32),
+        "flash_f32" => Some(AttentionBackend::FlashF32),
+        "cudnn_sdpa_bf16" => Some(AttentionBackend::CudnnSdpaBf16),
+        _ => None,
+    }
+}
+
+fn parse_distributed_optimizer_backend(raw: &str) -> Option<DistributedOptimizerBackend> {
+    match raw {
+        "all_reduce_replicated_muon" => Some(DistributedOptimizerBackend::AllReduceReplicatedMuon),
+        "sharded_parallel_muon" => Some(DistributedOptimizerBackend::ShardedParallelMuon),
+        _ => None,
+    }
+}
+
+fn parse_eval_adaptation_backend(raw: &str) -> Option<EvalAdaptationBackend> {
+    match raw {
+        "none" => Some(EvalAdaptationBackend::None),
+        "cpu_q_only" => Some(EvalAdaptationBackend::CpuQOnly),
+        "gpu_lora_phased" => Some(EvalAdaptationBackend::GpuLoraPhased),
         _ => None,
     }
 }

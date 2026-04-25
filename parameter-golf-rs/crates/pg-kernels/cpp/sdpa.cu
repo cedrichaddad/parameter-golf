@@ -71,7 +71,7 @@ __global__ void sdpa_naive_f32_kernel(
 
 extern "C" {
 
-int run_cudnn_sdpa_f32(
+int run_naive_sdpa_f32(
     void* stream,
     uint64_t q_ptr,
     uint64_t k_ptr,

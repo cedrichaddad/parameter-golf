@@ -2,11 +2,11 @@
 ///
 /// Maps the CPU-verified model logic to GPU kernels:
 ///   - cuBLASLt for all GEMM (QKV projections, MLP, output, Newton-Schulz)
-///   - cuDNN Flash Attention 3 for fused attention forward+backward
-///   - CubeCL fused element-wise kernels (RMSNorm, RoPE, activations, residuals)
-///   - NCCL for multi-GPU (reduce-scatter/all-gather/all-reduce)
+///   - F32 CUDA SDPA parity kernels today; production BF16 fused SDPA is gated
+///   - CUDA element-wise kernels (RMSNorm, RoPE, activations, residuals)
+///   - NCCL all-reduce multi-GPU today; sharded Parallel Muon is gated
 ///
-/// Memory layout: all parameter banks are contiguous BF16 on device.
+/// Memory layout: all parameter banks are contiguous F32 on device today.
 /// Activations are allocated from BufferPool (zero runtime malloc).
 ///
 /// This module requires the `cuda` feature.
@@ -37,10 +37,12 @@ pub struct GpuWeights {
     pub tok_emb: GpuTensor, // [vocab, d]
 
     // Scalar params — F32 (small, precision-sensitive)
-    pub attn_scales: Vec<GpuTensor>, // per-layer [d]
-    pub mlp_scales: Vec<GpuTensor>,  // per-layer [d]
-    pub resid_mix: Vec<GpuTensor>,   // per-layer [2, d]
-    pub q_gains: Vec<GpuTensor>,     // per-layer [h]
+    pub attn_scales: Vec<GpuTensor>,       // per-layer [d]
+    pub mlp_scales: Vec<GpuTensor>,        // per-layer [d]
+    pub resid_mix: Vec<GpuTensor>,         // per-layer [2, d]
+    pub q_gains: Vec<GpuTensor>,           // per-layer [h]
+    pub attn_gate_weights: Vec<GpuTensor>, // per-layer [h, gate_width]
+    pub attn_gate_biases: Vec<GpuTensor>,  // per-layer [h]
 
     // Misc
     pub bigram_embed: GpuTensor,
@@ -79,6 +81,8 @@ impl GpuWeights {
         let mut mlp_scales = Vec::new();
         let mut resid_mix = Vec::new();
         let mut q_gains = Vec::new();
+        let mut attn_gate_weights = Vec::new();
+        let mut attn_gate_biases = Vec::new();
 
         for i in 0..l {
             let b = &cpu.blocks[i];
@@ -86,6 +90,13 @@ impl GpuWeights {
             mlp_scales.push(to_gpu(&stream, &b.mlp_scale, &[d])?);
             resid_mix.push(to_gpu(&stream, &b.resid_mix, &[2, d])?);
             q_gains.push(to_gpu(&stream, &b.q_gain, &[c.num_heads])?);
+            let gate_width = c.attn_out_gate_width.max(1);
+            attn_gate_weights.push(to_gpu(
+                &stream,
+                &b.attn_gate_weight,
+                &[c.num_heads, gate_width],
+            )?);
+            attn_gate_biases.push(to_gpu(&stream, &b.attn_gate_bias, &[c.num_heads])?);
         }
 
         Ok(Self {
@@ -98,6 +109,8 @@ impl GpuWeights {
             mlp_scales,
             resid_mix,
             q_gains,
+            attn_gate_weights,
+            attn_gate_biases,
             bigram_embed: to_gpu(
                 &stream,
                 &cpu.bigram_embed,
@@ -128,6 +141,8 @@ impl GpuWeights {
             || self.mlp_scales.len() != l
             || self.resid_mix.len() != l
             || self.q_gains.len() != l
+            || self.attn_gate_weights.len() != l
+            || self.attn_gate_biases.len() != l
         {
             return Err(pg_core::PgError::InvalidOp(
                 "GPU weight layout no longer matches CPU model layer count".into(),
@@ -145,6 +160,8 @@ impl GpuWeights {
             sync_f32(&mut self.mlp_scales[i], &b.mlp_scale)?;
             sync_f32(&mut self.resid_mix[i], &b.resid_mix)?;
             sync_f32(&mut self.q_gains[i], &b.q_gain)?;
+            sync_f32(&mut self.attn_gate_weights[i], &b.attn_gate_weight)?;
+            sync_f32(&mut self.attn_gate_biases[i], &b.attn_gate_bias)?;
         }
         sync_f32(&mut self.bigram_embed, &cpu.bigram_embed)?;
         sync_f32(&mut self.bigram_proj, &cpu.bigram_proj)?;
@@ -171,6 +188,8 @@ impl GpuWeights {
             || self.mlp_scales.len() != l
             || self.resid_mix.len() != l
             || self.q_gains.len() != l
+            || self.attn_gate_weights.len() != l
+            || self.attn_gate_biases.len() != l
         {
             return Err(pg_core::PgError::InvalidOp(
                 "GPU weight layout no longer matches CPU model layer count".into(),
@@ -187,6 +206,8 @@ impl GpuWeights {
             cpu.blocks[i].mlp_scale = download_f32(&self.mlp_scales[i])?;
             cpu.blocks[i].resid_mix = download_f32(&self.resid_mix[i])?;
             cpu.blocks[i].q_gain = download_f32(&self.q_gains[i])?;
+            cpu.blocks[i].attn_gate_weight = download_f32(&self.attn_gate_weights[i])?;
+            cpu.blocks[i].attn_gate_bias = download_f32(&self.attn_gate_biases[i])?;
         }
         cpu.bigram_embed = download_f32(&self.bigram_embed)?;
         cpu.bigram_proj = download_f32(&self.bigram_proj)?;
@@ -216,12 +237,18 @@ pub struct GpuActivations {
     pub ve_embed_out: GpuTensor,
     pub attn_out: GpuTensor,
     pub xsa_out: GpuTensor,
+    pub attn_gated: GpuTensor,
+    pub attn_gate_values: GpuTensor,
+    pub attn_gate_grad_input: GpuTensor,
     pub proj_out: GpuTensor,
     pub mlp_up: GpuTensor,
     pub mlp_act: GpuTensor,
     pub mlp_out: GpuTensor,
     pub bigram_out: GpuTensor,
     pub bigram_proj_out: GpuTensor,
+    pub lora_tmp: GpuTensor,
+    pub lora_delta: GpuTensor,
+    pub lora_grad_tmp: GpuTensor,
     pub logits: GpuTensor,
 
     pub encoder_skips: Vec<GpuTensor>,
@@ -257,12 +284,18 @@ impl GpuActivations {
             ve_embed_out: zeros(&[tokens, ve_dim])?,
             attn_out: zeros(&[tokens, config.num_heads, config.head_dim])?,
             xsa_out: zeros(&[tokens, config.num_heads, config.head_dim])?,
+            attn_gated: zeros(&[tokens, config.num_heads, config.head_dim])?,
+            attn_gate_values: zeros(&[tokens, config.num_heads])?,
+            attn_gate_grad_input: zeros(&[tokens, d])?,
             proj_out: zeros(&[tokens, d])?,
             mlp_up: zeros(&[tokens, mlp])?,
             mlp_act: zeros(&[tokens, mlp])?,
             mlp_out: zeros(&[tokens, d])?,
             bigram_out: zeros(&[tokens, bigram_dim])?,
             bigram_proj_out: zeros(&[tokens, d])?,
+            lora_tmp: zeros(&[tokens, d])?,
+            lora_delta: zeros(&[tokens, d])?,
+            lora_grad_tmp: zeros(&[tokens, d])?,
             logits: zeros(&[tokens, vocab])?,
             encoder_skips,
         })
@@ -298,6 +331,8 @@ pub struct GpuGradBuffers {
     pub block_mlp_scale: Vec<GpuTensor>,
     pub block_resid_mix: Vec<GpuTensor>,
     pub block_q_gain: Vec<GpuTensor>,
+    pub block_attn_gate_weight: Vec<GpuTensor>,
+    pub block_attn_gate_bias: Vec<GpuTensor>,
     pub ve_embed: GpuTensor,
     pub ve_proj: GpuTensor,
     pub ve_scale: GpuTensor,
@@ -330,11 +365,63 @@ impl GpuGradBuffers {
             block_q_gain: (0..n)
                 .map(|_| zeros(&[config.num_heads]))
                 .collect::<PgResult<_>>()?,
+            block_attn_gate_weight: (0..n)
+                .map(|_| zeros(&[config.num_heads, config.attn_out_gate_width.max(1)]))
+                .collect::<PgResult<_>>()?,
+            block_attn_gate_bias: (0..n)
+                .map(|_| zeros(&[config.num_heads]))
+                .collect::<PgResult<_>>()?,
             ve_embed: zeros(&[config.vocab_size, config.ve_dim.max(1)])?,
             ve_proj: zeros(&[kv, config.ve_dim.max(1)])?,
             ve_scale: zeros(&[1])?,
             ve_layer_scales: zeros(&[config.ve_layers.len().max(1)])?,
         })
+    }
+
+    pub fn zero(&self, kernels: &pg_kernels::gpu_kernels::GpuKernels) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        let zero = |tensor: &GpuTensor| {
+            kernels.scale_inplace(
+                CudaPtr(tensor.cu_ptr(kernels.stream())?),
+                0.0,
+                tensor.numel() as u32,
+            )
+        };
+
+        zero(&self.tok_emb)?;
+        zero(&self.bigram_embed)?;
+        zero(&self.bigram_proj)?;
+        zero(&self.bigram_scale)?;
+        zero(&self.smear_gate)?;
+        zero(&self.skip_weights)?;
+        zero(&self.qo_bank)?;
+        zero(&self.kv_bank)?;
+        zero(&self.mlp_up_bank)?;
+        zero(&self.mlp_down_bank)?;
+        for tensor in &self.block_attn_scale {
+            zero(tensor)?;
+        }
+        for tensor in &self.block_mlp_scale {
+            zero(tensor)?;
+        }
+        for tensor in &self.block_resid_mix {
+            zero(tensor)?;
+        }
+        for tensor in &self.block_q_gain {
+            zero(tensor)?;
+        }
+        for tensor in &self.block_attn_gate_weight {
+            zero(tensor)?;
+        }
+        for tensor in &self.block_attn_gate_bias {
+            zero(tensor)?;
+        }
+        zero(&self.ve_embed)?;
+        zero(&self.ve_proj)?;
+        zero(&self.ve_scale)?;
+        zero(&self.ve_layer_scales)?;
+        Ok(())
     }
 }
 
@@ -446,9 +533,8 @@ impl GpuBackwardState {
 ///
 /// Key optimizations:
 /// - Activation checkpointing layers 3-8 (saves ~40% memory)
-/// - Fused attention (cuDNN FlashAttn3): QKV→softmax→output in one kernel
-/// - Fused element-wise: RMSNorm+residual, LeakyReLU²+scale, RoPE+QKnorm
-/// - 3-stream overlap: compute, NCCL, memcpy never block each other
+/// - Production record gaps are explicit in `ModelSpec` / `TrainSpec`.
+/// - Current distributed path prioritizes correctness over overlap.
 
 /// Bank shapes for the Muon optimizer.
 pub fn bank_shapes(config: &ModelConfig) -> Vec<[usize; 3]> {
@@ -562,12 +648,85 @@ mod tests {
 }
 
 #[cfg(feature = "cuda")]
+pub struct GpuQProjectionLora {
+    pub rank: usize,
+    pub alpha: f32,
+    pub scale: f32,
+    /// A matrices are stored row-major as [rank, model_dim].
+    pub a: Vec<GpuTensor>,
+    /// B matrices are stored row-major as [model_dim, rank].
+    pub b: Vec<GpuTensor>,
+    pub grad_a: Vec<GpuTensor>,
+    pub grad_b: Vec<GpuTensor>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuQProjectionLora {
+    fn new(
+        config: &ModelConfig,
+        stream: Arc<CudaStream>,
+        rank: usize,
+        alpha: f32,
+    ) -> PgResult<Self> {
+        if rank == 0 || rank > config.model_dim {
+            return Err(pg_core::PgError::InvalidOp(format!(
+                "LoRA rank must be in 1..={}, got {rank}",
+                config.model_dim
+            )));
+        }
+        let d = config.model_dim;
+        let scale = alpha / rank as f32;
+        let zeros = |shape: &[usize]| GpuTensor::zeros_gpu(stream.clone(), shape, DType::F32);
+
+        let mut a = Vec::with_capacity(config.num_layers);
+        let mut b = Vec::with_capacity(config.num_layers);
+        let mut grad_a = Vec::with_capacity(config.num_layers);
+        let mut grad_b = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let mut a_host = vec![0.0f32; rank * d];
+            // Warm-start A deterministically and keep B at zero. This matches the
+            // frontier LoRA-TTT convention: first update moves B, later updates
+            // can move both factors without perturbing score-before-update logits.
+            for r in 0..rank {
+                for col in 0..d {
+                    let x = (layer as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        ^ (r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                        ^ (col as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    let centered = ((x >> 40) as f32 / 16_777_216.0) - 0.5;
+                    a_host[r * d + col] = centered * 0.01;
+                }
+            }
+            a.push(GpuTensor::from_host_data_gpu(
+                stream.clone(),
+                bytemuck::cast_slice(&a_host),
+                &[rank, d],
+                DType::F32,
+            )?);
+            b.push(zeros(&[d, rank])?);
+            grad_a.push(zeros(&[rank, d])?);
+            grad_b.push(zeros(&[d, rank])?);
+        }
+
+        Ok(Self {
+            rank,
+            alpha,
+            scale,
+            a,
+            b,
+            grad_a,
+            grad_b,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub struct GpuModel {
     pub config: ModelConfig,
     pub weights: GpuWeights,
     pub gemm: pg_kernels::gemm::GemmEngine,
     pub kernels: pg_kernels::gpu_kernels::GpuKernels,
-    pub flash_attn: Option<pg_kernels::flash_attn::FlashAttention>,
+    pub cuda_cpp_attention: Option<pg_kernels::flash_attn::CudaCppAttention>,
+    pub q_lora: Option<GpuQProjectionLora>,
     pub _ctx: Arc<CudaContext>,
 }
 
@@ -583,13 +742,15 @@ impl GpuModel {
         let weights = GpuWeights::from_cpu(cpu, stream.clone())?;
         let gemm = pg_kernels::gemm::GemmEngine::new(stream.clone())?;
         let kernels = pg_kernels::gpu_kernels::GpuKernels::new(ctx.clone(), stream)?;
-        let flash_attn = pg_kernels::flash_attn::FlashAttention::new(gemm.stream().clone()).ok();
+        let cuda_cpp_attention =
+            pg_kernels::flash_attn::CudaCppAttention::new(gemm.stream().clone()).ok();
         Ok(Self {
             config: cpu.config.clone(),
             weights,
             gemm,
             kernels,
-            flash_attn,
+            cuda_cpp_attention,
+            q_lora: None,
             _ctx: ctx,
         })
     }
@@ -606,6 +767,77 @@ impl GpuModel {
     pub fn sync_to_cpu_reference(&self, cpu: &mut GptModel, plan: &ExecutionPlan) -> PgResult<()> {
         plan.validate_model_config(&cpu.config)?;
         self.weights.sync_to_cpu(cpu)
+    }
+
+    pub fn enable_q_lora(&mut self, rank: usize, alpha: f32) -> PgResult<()> {
+        let stream = self.gemm.stream().clone();
+        self.q_lora = Some(GpuQProjectionLora::new(&self.config, stream, rank, alpha)?);
+        Ok(())
+    }
+
+    pub fn q_lora_enabled(&self) -> bool {
+        self.q_lora.is_some()
+    }
+
+    pub fn zero_q_lora_grads(&self) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        if let Some(lora) = &self.q_lora {
+            let stream = self.gemm.stream();
+            for layer in 0..self.config.num_layers {
+                self.kernels.scale_inplace(
+                    CudaPtr(lora.grad_a[layer].cu_ptr(stream)?),
+                    0.0,
+                    lora.grad_a[layer].numel() as u32,
+                )?;
+                self.kernels.scale_inplace(
+                    CudaPtr(lora.grad_b[layer].cu_ptr(stream)?),
+                    0.0,
+                    lora.grad_b[layer].numel() as u32,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reset_q_lora_b(&self) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        if let Some(lora) = &self.q_lora {
+            let stream = self.gemm.stream();
+            for b in &lora.b {
+                self.kernels
+                    .scale_inplace(CudaPtr(b.cu_ptr(stream)?), 0.0, b.numel() as u32)?;
+            }
+            self.zero_q_lora_grads()?;
+        }
+        Ok(())
+    }
+
+    pub fn step_q_lora_sgd(&self, lr: f32, weight_decay: f32) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        if let Some(lora) = &self.q_lora {
+            let stream = self.gemm.stream();
+            for layer in 0..self.config.num_layers {
+                self.kernels.decay_sgd_step(
+                    CudaPtr(lora.a[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_a[layer].cu_ptr(stream)?),
+                    lr,
+                    weight_decay,
+                    lora.a[layer].numel() as u32,
+                )?;
+                self.kernels.decay_sgd_step(
+                    CudaPtr(lora.b[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_b[layer].cu_ptr(stream)?),
+                    lr,
+                    weight_decay,
+                    lora.b[layer].numel() as u32,
+                )?;
+            }
+            self.zero_q_lora_grads()?;
+        }
+        Ok(())
     }
 
     fn ln_scale_factor(&self, layer: usize) -> f32 {
@@ -634,19 +866,36 @@ impl GpuModel {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        seq_len: usize,
     ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        if let Some(flash_attn) = &self.flash_attn {
-            return flash_attn.forward(q, k, v, out, tokens, num_heads, num_kv_heads, head_dim);
+        if std::env::var("PG_USE_CPP_NAIVE_ATTENTION")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+            && seq_len == tokens
+        {
+            if let Some(cuda_cpp_attention) = &self.cuda_cpp_attention {
+                return cuda_cpp_attention.forward(
+                    q,
+                    k,
+                    v,
+                    out,
+                    tokens,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                );
+            }
         }
 
-        self.kernels.causal_attention_naive_fwd(
+        self.kernels.causal_attention_online_fwd(
             CudaPtr(q),
             CudaPtr(k),
             CudaPtr(v),
             CudaPtr(out),
             tokens as u32,
+            seq_len as u32,
             num_heads as u32,
             num_kv_heads as u32,
             head_dim as u32,
@@ -690,6 +939,101 @@ impl GpuModel {
         )
     }
 
+    fn apply_q_lora_forward(&self, layer: usize, buf: &mut GpuActivations) -> PgResult<()> {
+        if let Some(lora) = &self.q_lora {
+            let stream = self.gemm.stream();
+            let t = buf.attn_norm.shape()[0];
+            let d = self.config.model_dim;
+            let r = lora.rank;
+            unsafe {
+                self.gemm.matmul_f32(
+                    buf.attn_norm.cu_ptr(stream)?,
+                    lora.a[layer].cu_ptr(stream)?,
+                    buf.lora_tmp.cu_ptr(stream)?,
+                    t,
+                    r,
+                    d,
+                    1.0,
+                    0.0,
+                )?;
+                self.gemm.matmul_f32(
+                    buf.lora_tmp.cu_ptr(stream)?,
+                    lora.b[layer].cu_ptr(stream)?,
+                    buf.lora_delta.cu_ptr(stream)?,
+                    t,
+                    d,
+                    r,
+                    lora.scale,
+                    0.0,
+                )?;
+            }
+            let lora_delta_q =
+                buf.lora_delta
+                    .reshape(&[t, self.config.num_heads, self.config.head_dim])?;
+            self.add_inplace(&buf.q, &lora_delta_q, 1.0)?;
+        }
+        Ok(())
+    }
+
+    fn backward_q_lora(
+        &self,
+        layer: usize,
+        grad_q_proj: &GpuTensor,
+        grad_attn_norm: &GpuTensor,
+        buf: &mut GpuActivations,
+    ) -> PgResult<()> {
+        if let Some(lora) = &self.q_lora {
+            let stream = self.gemm.stream();
+            let t = buf.attn_norm.shape()[0];
+            let d = self.config.model_dim;
+            let r = lora.rank;
+            unsafe {
+                self.gemm.linear_backward_weight_f32(
+                    grad_q_proj.cu_ptr(stream)?,
+                    buf.lora_tmp.cu_ptr(stream)?,
+                    lora.grad_b[layer].cu_ptr(stream)?,
+                    t,
+                    d,
+                    r,
+                    lora.scale,
+                    1.0,
+                )?;
+                self.gemm.linear_backward_input_f32(
+                    grad_q_proj.cu_ptr(stream)?,
+                    lora.b[layer].cu_ptr(stream)?,
+                    buf.lora_grad_tmp.cu_ptr(stream)?,
+                    t,
+                    d,
+                    r,
+                    lora.scale,
+                    0.0,
+                )?;
+                self.gemm.linear_backward_weight_f32(
+                    buf.lora_grad_tmp.cu_ptr(stream)?,
+                    buf.attn_norm.cu_ptr(stream)?,
+                    lora.grad_a[layer].cu_ptr(stream)?,
+                    t,
+                    r,
+                    d,
+                    1.0,
+                    1.0,
+                )?;
+                self.gemm.linear_backward_input_f32(
+                    buf.lora_grad_tmp.cu_ptr(stream)?,
+                    lora.a[layer].cu_ptr(stream)?,
+                    buf.lora_delta.cu_ptr(stream)?,
+                    t,
+                    r,
+                    d,
+                    1.0,
+                    0.0,
+                )?;
+            }
+            self.add_inplace(grad_attn_norm, &buf.lora_delta, 1.0)?;
+        }
+        Ok(())
+    }
+
     fn zeros_f32(&self, shape: &[usize]) -> PgResult<GpuTensor> {
         GpuTensor::zeros_gpu(self.gemm.stream().clone(), shape, DType::F32)
     }
@@ -715,6 +1059,25 @@ impl GpuModel {
         Ok(values.iter().sum::<f32>() / tokens as f32)
     }
 
+    pub fn cross_entropy_losses(
+        &self,
+        logits: &GpuTensor,
+        targets: &GpuTensor,
+        losses: &GpuTensor,
+        tokens: usize,
+    ) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        self.kernels.cross_entropy_fwd(
+            CudaPtr(logits.cu_ptr(self.gemm.stream())?),
+            CudaPtr(targets.cu_ptr(self.gemm.stream())?),
+            CudaPtr(losses.cu_ptr(self.gemm.stream())?),
+            self.config.vocab_size as u32,
+            self.config.logit_softcap,
+            tokens as u32,
+        )
+    }
+
     fn block_recompute_for_backward(
         &self,
         layer: usize,
@@ -723,6 +1086,7 @@ impl GpuModel {
         x0: &GpuTensor,
         buf: &mut GpuActivations,
         cache: &mut GpuBlockBackwardCache,
+        runtime_seq_len: usize,
     ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -790,6 +1154,7 @@ impl GpuModel {
                 0.0,
             )?;
         }
+        self.apply_q_lora_forward(layer, buf)?;
         self.copy_tensor(&buf.q, &cache.q_pre_norm)?;
         self.copy_tensor(&buf.k, &cache.k_pre_norm)?;
 
@@ -838,7 +1203,7 @@ impl GpuModel {
                 CudaPtr(buf.q.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 h as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -848,7 +1213,7 @@ impl GpuModel {
                 CudaPtr(buf.k.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 hkv as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -873,6 +1238,7 @@ impl GpuModel {
             h,
             hkv,
             hd,
+            runtime_seq_len,
         )?;
 
         let attn_src = if layer >= n.saturating_sub(self.config.xsa_last_n) {
@@ -888,6 +1254,24 @@ impl GpuModel {
             &buf.xsa_out
         } else {
             &buf.attn_out
+        };
+        let attn_src = if self.config.attn_out_gate_enabled {
+            self.kernels.attn_out_gate_fwd(
+                CudaPtr(attn_src.cu_ptr(stream)?),
+                CudaPtr(buf.attn_norm.cu_ptr(stream)?),
+                CudaPtr(self.weights.attn_gate_weights[layer].cu_ptr(stream)?),
+                CudaPtr(self.weights.attn_gate_biases[layer].cu_ptr(stream)?),
+                CudaPtr(buf.attn_gated.cu_ptr(stream)?),
+                CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
+                t as u32,
+                h as u32,
+                hd as u32,
+                d as u32,
+                self.config.attn_out_gate_width as u32,
+            )?;
+            &buf.attn_gated
+        } else {
+            attn_src
         };
 
         let o_w = self.weights.qo_bank.slice_first(n + layer)?;
@@ -984,10 +1368,19 @@ impl GpuModel {
         grad_x: &GpuTensor,
         grad_x0: &GpuTensor,
         grads: &mut GpuGradBuffers,
+        runtime_seq_len: usize,
     ) -> PgResult<GpuTensor> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        self.block_recompute_for_backward(layer, input_ids, layer_x, x0, buf, block_cache)?;
+        self.block_recompute_for_backward(
+            layer,
+            input_ids,
+            layer_x,
+            x0,
+            buf,
+            block_cache,
+            runtime_seq_len,
+        )?;
 
         let t = input_ids.shape().iter().product::<usize>();
         let d = self.config.model_dim;
@@ -1121,7 +1514,9 @@ impl GpuModel {
             )?;
             self.gemm.linear_backward_weight_f32(
                 grad_proj_out.cu_ptr(stream)?,
-                if layer >= n.saturating_sub(self.config.xsa_last_n) {
+                if self.config.attn_out_gate_enabled {
+                    buf.attn_gated.cu_ptr(stream)?
+                } else if layer >= n.saturating_sub(self.config.xsa_last_n) {
                     buf.xsa_out.cu_ptr(stream)?
                 } else {
                     buf.attn_out.cu_ptr(stream)?
@@ -1135,13 +1530,46 @@ impl GpuModel {
             )?;
         }
 
+        let grad_attn_pre_gate = if self.config.attn_out_gate_enabled {
+            let raw_src = if layer >= n.saturating_sub(self.config.xsa_last_n) {
+                &buf.xsa_out
+            } else {
+                &buf.attn_out
+            };
+            let grad_raw = self.zeros_f32(&[t, h, hd])?;
+            self.kernels.scale_inplace(
+                CudaPtr(buf.attn_gate_grad_input.cu_ptr(stream)?),
+                0.0,
+                (t * d) as u32,
+            )?;
+            self.kernels.attn_out_gate_bwd(
+                CudaPtr(raw_src.cu_ptr(stream)?),
+                CudaPtr(buf.attn_norm.cu_ptr(stream)?),
+                CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
+                CudaPtr(grad_attn_result.cu_ptr(stream)?),
+                CudaPtr(self.weights.attn_gate_weights[layer].cu_ptr(stream)?),
+                CudaPtr(grad_raw.cu_ptr(stream)?),
+                CudaPtr(buf.attn_gate_grad_input.cu_ptr(stream)?),
+                CudaPtr(grads.block_attn_gate_weight[layer].cu_ptr(stream)?),
+                CudaPtr(grads.block_attn_gate_bias[layer].cu_ptr(stream)?),
+                t as u32,
+                h as u32,
+                hd as u32,
+                d as u32,
+                self.config.attn_out_gate_width as u32,
+            )?;
+            grad_raw
+        } else {
+            grad_attn_result
+        };
+
         let grad_attn_out = self.zeros_f32(&[t, h, hd])?;
         let grad_v_xsa = self.zeros_f32(&[t, hkv, hd])?;
         if layer >= n.saturating_sub(self.config.xsa_last_n) {
             self.kernels.xsa_bwd(
                 CudaPtr(buf.attn_out.cu_ptr(stream)?),
                 CudaPtr(buf.v.cu_ptr(stream)?),
-                CudaPtr(grad_attn_result.cu_ptr(stream)?),
+                CudaPtr(grad_attn_pre_gate.cu_ptr(stream)?),
                 CudaPtr(grad_attn_out.cu_ptr(stream)?),
                 CudaPtr(grad_v_xsa.cu_ptr(stream)?),
                 t as u32,
@@ -1150,13 +1578,13 @@ impl GpuModel {
                 hd as u32,
             )?;
         } else {
-            self.copy_tensor(&grad_attn_result, &grad_attn_out)?;
+            self.copy_tensor(&grad_attn_pre_gate, &grad_attn_out)?;
         }
 
         let grad_q_post_gain = self.zeros_f32(&[t, h, hd])?;
         let grad_k_attn = self.zeros_f32(&[t, hkv, hd])?;
         let grad_v_projection = self.zeros_f32(&[t, hkv, hd])?;
-        self.kernels.causal_attention_naive_bwd(
+        self.kernels.causal_attention_online_bwd(
             CudaPtr(buf.q.cu_ptr(stream)?),
             CudaPtr(buf.k.cu_ptr(stream)?),
             CudaPtr(buf.v.cu_ptr(stream)?),
@@ -1165,6 +1593,7 @@ impl GpuModel {
             CudaPtr(grad_k_attn.cu_ptr(stream)?),
             CudaPtr(grad_v_projection.cu_ptr(stream)?),
             t as u32,
+            runtime_seq_len as u32,
             h as u32,
             hkv as u32,
             hd as u32,
@@ -1189,7 +1618,7 @@ impl GpuModel {
                 CudaPtr(grad_q_post_rope.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 h as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -1199,7 +1628,7 @@ impl GpuModel {
                 CudaPtr(grad_k_attn.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 hkv as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -1249,6 +1678,7 @@ impl GpuModel {
                 1.0,
             )?;
         }
+        self.backward_q_lora(layer, &grad_q_proj, &grad_attn_norm, buf)?;
 
         let grad_attn_norm_k = self.zeros_f32(&[t, d])?;
         unsafe {
@@ -1360,6 +1790,9 @@ impl GpuModel {
             )?;
         }
         self.add_inplace(&grad_attn_norm, &grad_attn_norm_v, 1.0)?;
+        if self.config.attn_out_gate_enabled {
+            self.add_inplace(&grad_attn_norm, &buf.attn_gate_grad_input, 1.0)?;
+        }
 
         let grad_x_in_from_norm = self.zeros_f32(&[t, d])?;
         self.kernels.rms_norm_backward(
@@ -1400,11 +1833,20 @@ impl GpuModel {
         grad_x: &GpuTensor,
         grad_x0: &GpuTensor,
         grads: &mut GpuGradBuffers,
+        runtime_seq_len: usize,
     ) -> PgResult<GpuTensor> {
         if self.is_recurrent_layer(layer) {
             let t = input_ids.shape().iter().product::<usize>();
             let pass1_out = self.zeros_f32(&[t, self.config.model_dim])?;
-            self.block_recompute_for_backward(layer, input_ids, layer_x, x0, buf, block_cache)?;
+            self.block_recompute_for_backward(
+                layer,
+                input_ids,
+                layer_x,
+                x0,
+                buf,
+                block_cache,
+                runtime_seq_len,
+            )?;
             self.copy_tensor(&buf.x, &pass1_out)?;
             let grad_mid = self.block_backward_single(
                 layer,
@@ -1416,6 +1858,7 @@ impl GpuModel {
                 grad_x,
                 grad_x0,
                 grads,
+                runtime_seq_len,
             )?;
             return self.block_backward_single(
                 layer,
@@ -1427,6 +1870,7 @@ impl GpuModel {
                 &grad_mid,
                 grad_x0,
                 grads,
+                runtime_seq_len,
             );
         }
 
@@ -1440,6 +1884,7 @@ impl GpuModel {
             grad_x,
             grad_x0,
             grads,
+            runtime_seq_len,
         )
     }
 
@@ -1448,6 +1893,7 @@ impl GpuModel {
         layer: usize,
         input_ids: &GpuTensor,
         buf: &mut GpuActivations,
+        runtime_seq_len: usize,
     ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -1533,6 +1979,7 @@ impl GpuModel {
                 0.0,
             )?;
         }
+        self.apply_q_lora_forward(layer, buf)?;
 
         if let Some(ve_idx) = self.config.ve_layers.iter().position(|&l| l == layer) {
             self.kernels.embedding_gather_fwd(
@@ -1571,7 +2018,7 @@ impl GpuModel {
                 q,
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 h as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -1581,7 +2028,7 @@ impl GpuModel {
                 k,
                 CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                 CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
+                runtime_seq_len as u32,
                 hkv as u32,
                 hd as u32,
                 self.config.rope_dims as u32,
@@ -1605,15 +2052,34 @@ impl GpuModel {
             h,
             hkv,
             hd,
+            runtime_seq_len,
         )?;
 
-        let attn_src = if layer >= n.saturating_sub(self.config.xsa_last_n) {
+        let attn_src_tensor = if layer >= n.saturating_sub(self.config.xsa_last_n) {
             self.kernels.xsa_fwd(
                 attn_out, v, xsa_out, t as u32, h as u32, hkv as u32, hd as u32,
             )?;
-            buf.xsa_out.cu_ptr(stream)?
+            &buf.xsa_out
         } else {
-            buf.attn_out.cu_ptr(stream)?
+            &buf.attn_out
+        };
+        let attn_src_tensor = if self.config.attn_out_gate_enabled {
+            self.kernels.attn_out_gate_fwd(
+                CudaPtr(attn_src_tensor.cu_ptr(stream)?),
+                CudaPtr(buf.attn_norm.cu_ptr(stream)?),
+                CudaPtr(self.weights.attn_gate_weights[layer].cu_ptr(stream)?),
+                CudaPtr(self.weights.attn_gate_biases[layer].cu_ptr(stream)?),
+                CudaPtr(buf.attn_gated.cu_ptr(stream)?),
+                CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
+                t as u32,
+                h as u32,
+                hd as u32,
+                d as u32,
+                self.config.attn_out_gate_width as u32,
+            )?;
+            &buf.attn_gated
+        } else {
+            attn_src_tensor
         };
 
         let o_w = self
@@ -1623,7 +2089,7 @@ impl GpuModel {
             .cu_ptr(stream)?;
         unsafe {
             self.gemm.matmul_f32(
-                attn_src,
+                attn_src_tensor.cu_ptr(stream)?,
                 o_w,
                 buf.proj_out.cu_ptr(stream)?,
                 t,
@@ -1709,18 +2175,30 @@ impl GpuModel {
         layer: usize,
         input_ids: &GpuTensor,
         buf: &mut GpuActivations,
+        runtime_seq_len: usize,
     ) -> PgResult<()> {
-        self.block_forward_once(layer, input_ids, buf)?;
+        self.block_forward_once(layer, input_ids, buf, runtime_seq_len)?;
         if self.is_recurrent_layer(layer) {
-            self.block_forward_once(layer, input_ids, buf)?;
+            self.block_forward_once(layer, input_ids, buf, runtime_seq_len)?;
         }
         Ok(())
     }
 
     pub fn forward(&self, input_ids: &GpuTensor, buf: &mut GpuActivations) -> PgResult<()> {
+        let t = input_ids.shape().iter().product::<usize>();
+        self.forward_with_seq_len(input_ids, buf, t)
+    }
+
+    pub fn forward_with_seq_len(
+        &self,
+        input_ids: &GpuTensor,
+        buf: &mut GpuActivations,
+        runtime_seq_len: usize,
+    ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         let t = input_ids.shape().iter().product::<usize>();
+        let runtime_seq_len = runtime_seq_len.min(t).max(1);
         let d = self.config.model_dim;
         let vocab = self.config.vocab_size;
         let stream = self.gemm.stream();
@@ -1745,6 +2223,7 @@ impl GpuModel {
                 self.config.bigram_vocab_size as u32,
                 self.config.bigram_dim as u32,
                 t as u32,
+                runtime_seq_len as u32,
             )?;
             unsafe {
                 self.gemm.matmul_f32(
@@ -1773,6 +2252,7 @@ impl GpuModel {
             CudaPtr(self.weights.smear_gate.cu_ptr(stream)?),
             x,
             t as u32,
+            runtime_seq_len as u32,
             d as u32,
         )?;
         self.kernels.copy_fwd(x, x0, (t * d) as u32)?;
@@ -1780,7 +2260,7 @@ impl GpuModel {
         let n_enc = self.config.num_encoder_layers();
         let n_dec = self.config.num_decoder_layers();
         for layer in 0..n_enc {
-            self.block_forward(layer, input_ids, buf)?;
+            self.block_forward(layer, input_ids, buf, runtime_seq_len)?;
             self.kernels.copy_fwd(
                 CudaPtr(buf.x.cu_ptr(stream)?),
                 CudaPtr(buf.encoder_skips[layer].cu_ptr(stream)?),
@@ -1799,7 +2279,7 @@ impl GpuModel {
                     (t * d) as u32,
                 )?;
             }
-            self.block_forward(n_enc + i, input_ids, buf)?;
+            self.block_forward(n_enc + i, input_ids, buf, runtime_seq_len)?;
         }
 
         self.kernels.rms_norm_forward(
@@ -1831,9 +2311,21 @@ impl GpuModel {
         buf: &mut GpuActivations,
         cache: &mut GpuForwardCache,
     ) -> PgResult<()> {
+        let t = input_ids.shape().iter().product::<usize>();
+        self.forward_with_cache_seq_len(input_ids, buf, cache, t)
+    }
+
+    pub fn forward_with_cache_seq_len(
+        &self,
+        input_ids: &GpuTensor,
+        buf: &mut GpuActivations,
+        cache: &mut GpuForwardCache,
+        runtime_seq_len: usize,
+    ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         let t = input_ids.shape().iter().product::<usize>();
+        let runtime_seq_len = runtime_seq_len.min(t).max(1);
         let d = self.config.model_dim;
         let vocab = self.config.vocab_size;
         let stream = self.gemm.stream();
@@ -1858,6 +2350,7 @@ impl GpuModel {
                 self.config.bigram_vocab_size as u32,
                 self.config.bigram_dim as u32,
                 t as u32,
+                runtime_seq_len as u32,
             )?;
             unsafe {
                 self.gemm.matmul_f32(
@@ -1890,6 +2383,7 @@ impl GpuModel {
             CudaPtr(self.weights.smear_gate.cu_ptr(stream)?),
             x,
             t as u32,
+            runtime_seq_len as u32,
             d as u32,
         )?;
         self.kernels.copy_fwd(x, x0, (t * d) as u32)?;
@@ -1899,7 +2393,7 @@ impl GpuModel {
         let n_dec = self.config.num_decoder_layers();
         for layer in 0..n_enc {
             self.copy_tensor(&buf.x, &cache.layer_x[layer])?;
-            self.block_forward(layer, input_ids, buf)?;
+            self.block_forward(layer, input_ids, buf, runtime_seq_len)?;
             self.kernels.copy_fwd(
                 CudaPtr(buf.x.cu_ptr(stream)?),
                 CudaPtr(buf.encoder_skips[layer].cu_ptr(stream)?),
@@ -1920,7 +2414,7 @@ impl GpuModel {
                 )?;
             }
             self.copy_tensor(&buf.x, &cache.layer_x[n_enc + i])?;
-            self.block_forward(n_enc + i, input_ids, buf)?;
+            self.block_forward(n_enc + i, input_ids, buf, runtime_seq_len)?;
         }
 
         self.copy_tensor(&buf.x, &cache.x_final)?;
@@ -2020,6 +2514,74 @@ impl GpuModel {
         state: &mut GpuBackwardState,
         grads: &mut GpuGradBuffers,
     ) -> PgResult<f32> {
+        let t = input_ids.shape().iter().product::<usize>();
+        self.backward_with_state_seq_len_loss_mode(input_ids, targets, buf, state, grads, true, t)
+    }
+
+    pub fn backward_with_state_no_loss(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+    ) -> PgResult<()> {
+        let t = input_ids.shape().iter().product::<usize>();
+        self.backward_with_state_seq_len_loss_mode(input_ids, targets, buf, state, grads, false, t)
+            .map(|_| ())
+    }
+
+    pub fn backward_with_state_seq_len(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+        runtime_seq_len: usize,
+    ) -> PgResult<f32> {
+        self.backward_with_state_seq_len_loss_mode(
+            input_ids,
+            targets,
+            buf,
+            state,
+            grads,
+            true,
+            runtime_seq_len,
+        )
+    }
+
+    pub fn backward_with_state_seq_len_no_loss(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+        runtime_seq_len: usize,
+    ) -> PgResult<()> {
+        self.backward_with_state_seq_len_loss_mode(
+            input_ids,
+            targets,
+            buf,
+            state,
+            grads,
+            false,
+            runtime_seq_len,
+        )
+        .map(|_| ())
+    }
+
+    fn backward_with_state_seq_len_loss_mode(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+        compute_loss: bool,
+        runtime_seq_len: usize,
+    ) -> PgResult<f32> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         let t = input_ids.shape().iter().product::<usize>();
@@ -2028,9 +2590,14 @@ impl GpuModel {
         let n_dec = self.config.num_decoder_layers();
         let n_skip = self.config.num_skip_weights();
         let stream = self.gemm.stream();
+        let runtime_seq_len = runtime_seq_len.min(t).max(1);
 
-        self.forward_with_cache(input_ids, buf, &mut state.cache)?;
-        let loss = self.mean_loss(&buf.logits, targets, t)?;
+        self.forward_with_cache_seq_len(input_ids, buf, &mut state.cache, runtime_seq_len)?;
+        let loss = if compute_loss {
+            self.mean_loss(&buf.logits, targets, t)?
+        } else {
+            0.0
+        };
 
         let mut grad_x = self.backward_output_loss_only(&state.cache, buf, targets, grads)?;
         let grad_x0 = self.zeros_f32(&[t, d])?;
@@ -2050,6 +2617,7 @@ impl GpuModel {
                 &grad_x,
                 &grad_x0,
                 grads,
+                runtime_seq_len,
             )?;
 
             if i < n_skip {
@@ -2083,6 +2651,7 @@ impl GpuModel {
                 &grad_x,
                 &grad_x0,
                 grads,
+                runtime_seq_len,
             )?;
         }
 
@@ -2098,6 +2667,7 @@ impl GpuModel {
             CudaPtr(grad_x_prev.cu_ptr(stream)?),
             CudaPtr(grads.smear_gate.cu_ptr(stream)?),
             t as u32,
+            runtime_seq_len as u32,
             d as u32,
         )?;
 
@@ -2128,6 +2698,7 @@ impl GpuModel {
                 self.config.bigram_vocab_size as u32,
                 self.config.bigram_dim as u32,
                 t as u32,
+                runtime_seq_len as u32,
             )?;
             unsafe {
                 self.gemm.matmul_f32(
@@ -2188,6 +2759,7 @@ impl GpuModel {
                 self.config.bigram_vocab_size as u32,
                 self.config.bigram_dim as u32,
                 t as u32,
+                runtime_seq_len as u32,
             )?;
         }
 

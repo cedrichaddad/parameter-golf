@@ -16,11 +16,13 @@ use pg_core::PgResult;
 
 /// Per-block learnable parameters (non-banked).
 pub struct BlockParams {
-    pub attn_scale: Vec<f32>, // [model_dim]
-    pub mlp_scale: Vec<f32>,  // [model_dim]
-    pub resid_mix: Vec<f32>,  // [2, model_dim] — resid_mix[0] and resid_mix[1]
-    pub q_gain: Vec<f32>,     // [num_heads]
-    pub ln_scale_factor: f32, // 1/sqrt(layer_idx + 1) if ln_scale
+    pub attn_scale: Vec<f32>,       // [model_dim]
+    pub mlp_scale: Vec<f32>,        // [model_dim]
+    pub resid_mix: Vec<f32>,        // [2, model_dim] — resid_mix[0] and resid_mix[1]
+    pub q_gain: Vec<f32>,           // [num_heads]
+    pub attn_gate_weight: Vec<f32>, // [num_heads, attn_out_gate_width]
+    pub attn_gate_bias: Vec<f32>,   // [num_heads]
+    pub ln_scale_factor: f32,       // 1/sqrt(layer_idx + 1) if ln_scale
     pub use_xsa: bool,
 }
 
@@ -86,6 +88,8 @@ pub struct ForwardBuffer {
     pub v: Vec<f32>,               // [tokens, num_kv_heads, head_dim]
     pub attn_out: Vec<f32>,        // [tokens, num_heads, head_dim]
     pub xsa_out: Vec<f32>,         // [tokens, num_heads, head_dim]
+    pub attn_gated: Vec<f32>,      // [tokens, num_heads, head_dim]
+    pub attn_gate: Vec<f32>,       // [tokens, num_heads]
     pub proj_out: Vec<f32>,        // [tokens, model_dim]
     pub mlp_up: Vec<f32>,          // [tokens, mlp_dim]
     pub mlp_act: Vec<f32>,         // [tokens, mlp_dim] (after activation)
@@ -146,6 +150,8 @@ impl ForwardBuffer {
             v: vec![0.0; tokens * hkv * hd],
             attn_out: vec![0.0; tokens * h * hd],
             xsa_out: vec![0.0; tokens * h * hd],
+            attn_gated: vec![0.0; tokens * h * hd],
+            attn_gate: vec![0.0; tokens * h],
             proj_out: vec![0.0; tokens * d],
             mlp_up: vec![0.0; tokens * mlp],
             mlp_act: vec![0.0; tokens * mlp],
@@ -164,6 +170,10 @@ impl ForwardBuffer {
 }
 
 impl GptModel {
+    pub(crate) fn attn_out_gate_enabled(&self) -> bool {
+        self.config.attn_out_gate_enabled
+    }
+
     pub(crate) fn parallel_residual_enabled(&self) -> bool {
         self.config.parallel_residual
     }
@@ -204,6 +214,8 @@ impl GptModel {
                     rm
                 },
                 q_gain: vec![config.qk_gain_init; config.num_heads],
+                attn_gate_weight: vec![0.0; config.num_heads * config.attn_out_gate_width.max(1)],
+                attn_gate_bias: vec![0.0; config.num_heads],
                 ln_scale_factor,
                 use_xsa,
             });
@@ -295,6 +307,12 @@ impl GptModel {
             }
             for (head, gain) in block.q_gain.iter_mut().enumerate() {
                 *gain = self.config.qk_gain_init * (0.9 + 0.04 * (((layer + head) % 3) as f32));
+            }
+            if self.config.attn_out_gate_enabled {
+                fill(&mut block.attn_gate_weight, 7 + layer, 3, 23, 0.002, -0.022);
+                for (head, bias) in block.attn_gate_bias.iter_mut().enumerate() {
+                    *bias = -0.04 + 0.02 * (((layer + head) % 5) as f32);
+                }
             }
         }
     }
@@ -507,7 +525,7 @@ impl GptModel {
         );
 
         // 11. XSA (last N layers)
-        let attn_result = if bp.use_xsa {
+        let attn_result_raw = if bp.use_xsa {
             pg_kernels::xsa::xsa_forward(
                 &buf.attn_out[..t * h * hd],
                 &buf.v[..t * hkv * hd],
@@ -520,6 +538,31 @@ impl GptModel {
             &buf.xsa_out[..t * h * hd]
         } else {
             &buf.attn_out[..t * h * hd]
+        };
+
+        let attn_result = if self.attn_out_gate_enabled() {
+            let width = self.config.attn_out_gate_width;
+            debug_assert!(width <= d);
+            for tok in 0..t {
+                let gate_input = &buf.attn_norm_out[tok * d..tok * d + width];
+                for head in 0..h {
+                    let mut score = bp.attn_gate_bias[head];
+                    let w = &bp.attn_gate_weight[head * width..(head + 1) * width];
+                    for j in 0..width {
+                        score += w[j] * gate_input[j];
+                    }
+                    let sig = 1.0 / (1.0 + (-score).exp());
+                    let gate = 2.0 * sig;
+                    buf.attn_gate[tok * h + head] = gate;
+                    let base = (tok * h + head) * hd;
+                    for j in 0..hd {
+                        buf.attn_gated[base + j] = attn_result_raw[base + j] * gate;
+                    }
+                }
+            }
+            &buf.attn_gated[..t * h * hd]
+        } else {
+            attn_result_raw
         };
 
         // 12. Reshape [tokens, num_heads, head_dim] → [tokens, model_dim] and output projection
@@ -779,6 +822,8 @@ mod tests {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,
@@ -833,6 +878,69 @@ mod tests {
         assert!(loss.is_finite(), "loss is not finite: {}", loss);
         assert!(loss > 0.0, "loss should be positive: {}", loss);
         eprintln!("Loss with zero-init weights: {}", loss);
+    }
+
+    #[test]
+    fn test_attn_out_gate_zero_init_is_identity() {
+        let mut gated_config = tiny_config();
+        gated_config.attn_out_gate_enabled = true;
+        gated_config.attn_out_gate_width = 4;
+        let mut plain_config = gated_config.clone();
+        plain_config.attn_out_gate_enabled = false;
+
+        let mut gated = GptModel::new(gated_config.clone());
+        gated.fill_deterministic();
+        for block in &mut gated.blocks {
+            block.attn_gate_weight.fill(0.0);
+            block.attn_gate_bias.fill(0.0);
+        }
+
+        let mut plain = GptModel::new(plain_config.clone());
+        plain.tok_emb.clone_from(&gated.tok_emb);
+        plain.bigram_embed.clone_from(&gated.bigram_embed);
+        plain.bigram_proj.clone_from(&gated.bigram_proj);
+        plain.bigram_scale = gated.bigram_scale;
+        plain.smear_gate.clone_from(&gated.smear_gate);
+        plain.skip_weights.clone_from(&gated.skip_weights);
+        plain.qo_bank.clone_from(&gated.qo_bank);
+        plain.kv_bank.clone_from(&gated.kv_bank);
+        plain.mlp_up_bank.clone_from(&gated.mlp_up_bank);
+        plain.mlp_down_bank.clone_from(&gated.mlp_down_bank);
+        plain.ve_embed.clone_from(&gated.ve_embed);
+        plain.ve_proj.clone_from(&gated.ve_proj);
+        plain.ve_scale = gated.ve_scale;
+        plain.ve_layer_scales.clone_from(&gated.ve_layer_scales);
+        for layer in 0..plain.blocks.len() {
+            plain.blocks[layer]
+                .attn_scale
+                .clone_from(&gated.blocks[layer].attn_scale);
+            plain.blocks[layer]
+                .mlp_scale
+                .clone_from(&gated.blocks[layer].mlp_scale);
+            plain.blocks[layer]
+                .resid_mix
+                .clone_from(&gated.blocks[layer].resid_mix);
+            plain.blocks[layer]
+                .q_gain
+                .clone_from(&gated.blocks[layer].q_gain);
+        }
+
+        let tokens = vec![1u32, 5, 3, 7, 2, 4];
+        let mut gated_buf = ForwardBuffer::new(&gated_config, tokens.len());
+        let mut plain_buf = ForwardBuffer::new(&plain_config, tokens.len());
+        gated.forward(&tokens, &mut gated_buf);
+        plain.forward(&tokens, &mut plain_buf);
+
+        let max_diff = gated_buf
+            .logits
+            .iter()
+            .zip(plain_buf.logits.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "identity gate changed logits by {max_diff}"
+        );
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct ModelConfig {
     pub recurrence_start_layer: usize,
     pub recurrence_repeat_layers: usize,
     pub parallel_residual: bool,
+    pub attn_out_gate_enabled: bool,
+    pub attn_out_gate_width: usize,
 
     // Value Residual Learning
     pub vrl_enabled: bool,
@@ -79,6 +81,8 @@ impl ModelConfig {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
 
             vrl_enabled: false, // value_residual flag (separate from VE)
             ve_enabled: true,
@@ -161,8 +165,21 @@ impl ModelConfig {
         };
         // Per-layer scalars: attn_scale, mlp_scale, resid_mix, q_gain, etc.
         let per_layer_scalars = n * (d + d + 2 * d + self.num_heads); // approximate
+        let attn_out_gate = if self.attn_out_gate_enabled {
+            n * self.num_heads * (self.attn_out_gate_width + 1)
+        } else {
+            0
+        };
 
-        embeddings + qo_bank + kv_bank + mlp_up + mlp_down + bigram + ve + per_layer_scalars
+        embeddings
+            + qo_bank
+            + kv_bank
+            + mlp_up
+            + mlp_down
+            + bigram
+            + ve
+            + per_layer_scalars
+            + attn_out_gate
     }
 }
 

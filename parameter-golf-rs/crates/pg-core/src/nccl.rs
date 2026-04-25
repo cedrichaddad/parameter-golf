@@ -150,6 +150,80 @@ impl NcclComm {
             .map_err(|e| PgError::Nccl(format!("all_reduce_sum_tensor_f32_in_place failed: {e:?}")))
     }
 
+    pub fn reduce_scatter_sum_tensor_f32(
+        &self,
+        send: &GpuTensor,
+        recv: &mut GpuTensor,
+    ) -> PgResult<()> {
+        if send.dtype() != crate::DType::F32 || recv.dtype() != crate::DType::F32 {
+            return Err(PgError::Nccl(format!(
+                "reduce_scatter_sum_tensor_f32 requires F32 tensors, got {:?} -> {:?}",
+                send.dtype(),
+                recv.dtype()
+            )));
+        }
+        if send.numel() != recv.numel() * self.world_size {
+            return Err(PgError::Nccl(format!(
+                "reduce_scatter_sum_tensor_f32 shape mismatch: send elements {} must equal recv elements {} * world_size {}",
+                send.numel(),
+                recv.numel(),
+                self.world_size
+            )));
+        }
+        let stream = self.comm()?.stream();
+        let send_ptr = send.cu_ptr(&stream)?;
+        let recv_ptr = recv.cu_ptr(&stream)?;
+        let raw_send = RawF32Buffer {
+            ptr: send_ptr,
+            len: send.numel(),
+            stream: stream.clone(),
+        };
+        let mut raw_recv = RawF32Buffer {
+            ptr: recv_ptr,
+            len: recv.numel(),
+            stream,
+        };
+        self.comm()?
+            .reduce_scatter::<_, _, f32>(&raw_send, &mut raw_recv, &ReduceOp::Sum)
+            .map(|_| ())
+            .map_err(|e| PgError::Nccl(format!("reduce_scatter_sum_tensor_f32 failed: {e:?}")))
+    }
+
+    pub fn all_gather_tensor_f32(&self, send: &GpuTensor, recv: &mut GpuTensor) -> PgResult<()> {
+        if send.dtype() != crate::DType::F32 || recv.dtype() != crate::DType::F32 {
+            return Err(PgError::Nccl(format!(
+                "all_gather_tensor_f32 requires F32 tensors, got {:?} -> {:?}",
+                send.dtype(),
+                recv.dtype()
+            )));
+        }
+        if recv.numel() != send.numel() * self.world_size {
+            return Err(PgError::Nccl(format!(
+                "all_gather_tensor_f32 shape mismatch: recv elements {} must equal send elements {} * world_size {}",
+                recv.numel(),
+                send.numel(),
+                self.world_size
+            )));
+        }
+        let stream = self.comm()?.stream();
+        let send_ptr = send.cu_ptr(&stream)?;
+        let recv_ptr = recv.cu_ptr(&stream)?;
+        let raw_send = RawF32Buffer {
+            ptr: send_ptr,
+            len: send.numel(),
+            stream: stream.clone(),
+        };
+        let mut raw_recv = RawF32Buffer {
+            ptr: recv_ptr,
+            len: recv.numel(),
+            stream,
+        };
+        self.comm()?
+            .all_gather::<_, _, f32>(&raw_send, &mut raw_recv)
+            .map(|_| ())
+            .map_err(|e| PgError::Nccl(format!("all_gather_tensor_f32 failed: {e:?}")))
+    }
+
     fn comm(&self) -> PgResult<&Comm> {
         self.comm.as_ref().ok_or_else(|| {
             PgError::Nccl(

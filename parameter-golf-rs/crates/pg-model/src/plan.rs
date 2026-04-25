@@ -6,7 +6,8 @@ use pg_core::error::{PgError, PgResult};
 use crate::config::ModelConfig;
 use crate::gpu::{bank_shapes, checkpoint_layers, estimate_memory};
 use crate::spec::{
-    CompressionMode, ModelSpec, QuantScheme, RopeMode, RunMode, RunSpec, SkipTopology,
+    AttentionBackend, CompressionMode, EvalAdaptationBackend, ModelSpec, QuantScheme, RopeMode,
+    RunMode, RunSpec, SkipTopology,
 };
 
 #[derive(Debug, Clone)]
@@ -16,6 +17,7 @@ pub struct LayerFeatureMask {
     pub checkpointed: bool,
     pub recurrent: bool,
     pub parallel_residual: bool,
+    pub attn_out_gate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,12 @@ pub struct EvalPlan {
     pub stride: usize,
     pub legal_score_first: bool,
     pub qttt: bool,
+    pub adaptation_backend: EvalAdaptationBackend,
+    pub lora_rank: usize,
+    pub lora_alpha: f32,
+    pub phased_ttt_prefix_docs: usize,
+    pub phased_ttt_phases: usize,
+    pub phased_ttt_weight_decay: f32,
     pub chunk_tokens: usize,
 }
 
@@ -95,6 +103,7 @@ impl ExecutionPlan {
                 checkpointed: checkpointed[layer],
                 recurrent,
                 parallel_residual: run_spec.model.parallel_residual.enabled,
+                attn_out_gate: run_spec.model.attn_out_gate.enabled,
             });
         }
 
@@ -111,6 +120,12 @@ impl ExecutionPlan {
             stride: run_spec.eval.stride,
             legal_score_first: run_spec.eval.legal_score_first,
             qttt: run_spec.eval.qttt,
+            adaptation_backend: run_spec.eval.adaptation_backend,
+            lora_rank: run_spec.eval.lora_rank,
+            lora_alpha: run_spec.eval.lora_alpha,
+            phased_ttt_prefix_docs: run_spec.eval.phased_ttt_prefix_docs,
+            phased_ttt_phases: run_spec.eval.phased_ttt_phases,
+            phased_ttt_weight_decay: run_spec.eval.phased_ttt_weight_decay,
             chunk_tokens: run_spec.eval.chunk_tokens,
         };
 
@@ -207,6 +222,18 @@ impl ExecutionPlan {
                 config.parallel_residual,
             )));
         }
+        if spec.attn_out_gate.enabled != config.attn_out_gate_enabled {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for attn_out_gate_enabled: expected {}, got {}",
+                spec.attn_out_gate.enabled, config.attn_out_gate_enabled,
+            )));
+        }
+        if spec.attn_out_gate.width != config.attn_out_gate_width {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for attn_out_gate_width: expected {}, got {}",
+                spec.attn_out_gate.width, config.attn_out_gate_width,
+            )));
+        }
         if spec.ln_scale != config.ln_scale {
             return Err(PgError::InvalidOp(format!(
                 "execution plan mismatch for ln_scale: expected {}, got {}",
@@ -297,6 +324,24 @@ fn validate_run_spec(run_spec: &RunSpec) -> PgResult<()> {
             "disabling SmearGate is not implemented in the Rust execution runtime".into(),
         ));
     }
+    if spec.attention_backend == AttentionBackend::CudnnSdpaBf16 {
+        return Err(PgError::InvalidOp(
+            "attention_backend=cudnn_sdpa_bf16 is declared but the production BF16 cuDNN/FlashAttention forward+backward path is not implemented yet".into(),
+        ));
+    }
+    if spec.attn_out_gate.enabled {
+        if spec.attn_out_gate.width == 0 {
+            return Err(PgError::InvalidOp(
+                "AttnOutGate is enabled but width is zero".into(),
+            ));
+        }
+        if spec.attn_out_gate.width > spec.model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "AttnOutGate width {} exceeds model_dim {}",
+                spec.attn_out_gate.width, spec.model_dim
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -305,8 +350,11 @@ fn fingerprint(run_spec: &RunSpec) -> String {
     format!("{:?}", run_spec.model).hash(&mut hasher);
     format!("{:?}", run_spec.quant).hash(&mut hasher);
     format!("{:?}", run_spec.eval).hash(&mut hasher);
+    format!("{:?}", run_spec.train.backend).hash(&mut hasher);
+    format!("{:?}", run_spec.train.distributed_optimizer_backend).hash(&mut hasher);
     run_spec.train.batch_tokens.hash(&mut hasher);
     run_spec.train.seq_len.hash(&mut hasher);
+    run_spec.train.fast_bank_updates.hash(&mut hasher);
     run_spec.train.warmup_steps.hash(&mut hasher);
     run_spec.train.total_iterations.hash(&mut hasher);
     run_spec.train.warmdown_iters.hash(&mut hasher);
@@ -336,4 +384,31 @@ fn fingerprint(run_spec: &RunSpec) -> String {
         .to_bits()
         .hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RunSpec, VariantFamily};
+
+    #[test]
+    fn hybrid_competitive_plan_accepts_attn_out_gate() {
+        let spec = RunSpec::for_family(VariantFamily::HybridCompetitiveSp8192);
+        let plan = ExecutionPlan::from_run_spec(&spec).unwrap();
+        let config = spec.model.to_model_config();
+        assert!(config.attn_out_gate_enabled);
+        assert_eq!(config.attn_out_gate_width, 24);
+        plan.validate_model_config(&config).unwrap();
+    }
+
+    #[test]
+    fn attn_out_gate_rejects_invalid_width() {
+        let mut spec = RunSpec::for_family(VariantFamily::HybridCompetitiveSp8192);
+        spec.model.attn_out_gate.width = spec.model.model_dim + 1;
+        let err = ExecutionPlan::from_run_spec(&spec).unwrap_err();
+        assert!(
+            err.to_string().contains("AttnOutGate width"),
+            "unexpected error: {err}"
+        );
+    }
 }

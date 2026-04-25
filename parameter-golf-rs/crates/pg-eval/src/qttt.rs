@@ -433,6 +433,8 @@ mod tests {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,

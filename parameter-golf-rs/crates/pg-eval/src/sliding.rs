@@ -168,6 +168,7 @@ pub fn score_chunk(
     let mut loss_sum = 0.0f64;
     let mut token_count = 0u64;
     let mut byte_count = 0.0f64;
+    let mut buf = ForwardBuffer::new(&model.config, seq_len);
 
     for &ws in &chunk.windows {
         let end = (ws + seq_len).min(total_tokens);
@@ -176,7 +177,7 @@ pub fn score_chunk(
         let input = &val_tokens[ws..end];
         let target = &val_tokens[ws + 1..end + 1];
 
-        let mut buf = ForwardBuffer::new(&model.config, wlen);
+        buf.resize_tokens(wlen);
         model.forward(input, &mut buf);
 
         let vocab = model.config.vocab_size;
@@ -294,6 +295,8 @@ mod tests {
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            attn_out_gate_enabled: false,
+            attn_out_gate_width: 24,
             vrl_enabled: false,
             ve_enabled: false,
             ve_dim: 4,

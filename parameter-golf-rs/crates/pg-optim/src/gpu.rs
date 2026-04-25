@@ -96,7 +96,6 @@ impl GpuMuonBankState {
 #[cfg(feature = "cuda")]
 pub struct GpuMuon {
     gemm: GemmEngine,
-    norm_scratch: GpuTensor,
     pub lr: f32,
     pub momentum: f32,
     pub nesterov: bool,
@@ -124,7 +123,6 @@ impl GpuMuon {
             .collect::<PgResult<Vec<_>>>()?;
         Ok(Self {
             gemm,
-            norm_scratch: GpuTensor::zeros_gpu(stream, &[1], DType::F32)?,
             lr,
             momentum,
             nesterov,
@@ -191,35 +189,13 @@ impl GpuMuon {
             )?;
         }
 
-        for bi in 0..state.batch {
-            let update_i = state.ns_update.slice_first(bi)?;
-            let x_i = state.ns_x.slice_first(bi)?;
-            self.norm_scratch
-                .copy_from_host_bytes(bytemuck::bytes_of(&0.0f32))?;
-            kernels.dot_accumulate(
-                CudaPtr(update_i.cu_ptr(kernels.stream())?),
-                CudaPtr(update_i.cu_ptr(kernels.stream())?),
-                CudaPtr(self.norm_scratch.cu_ptr(kernels.stream())?),
-                1.0,
-                update_i.numel() as u32,
-            )?;
-            kernels
-                .stream()
-                .synchronize()
-                .map_err(|e| PgError::InvalidOp(format!("GpuMuon norm sync failed: {e:?}")))?;
-            let sum_sq = bytemuck::cast_slice::<u8, f32>(&self.norm_scratch.to_host_bytes()?)[0];
-            let inv_norm = 1.0 / (sum_sq.sqrt() + 1e-7);
-            kernels.copy_fwd(
-                CudaPtr(update_i.cu_ptr(kernels.stream())?),
-                CudaPtr(x_i.cu_ptr(kernels.stream())?),
-                update_i.numel() as u32,
-            )?;
-            kernels.scale_inplace(
-                CudaPtr(x_i.cu_ptr(kernels.stream())?),
-                inv_norm,
-                x_i.numel() as u32,
-            )?;
-        }
+        kernels.normalize_matrices(
+            CudaPtr(state.ns_update.cu_ptr(kernels.stream())?),
+            CudaPtr(state.ns_x.cu_ptr(kernels.stream())?),
+            (state.rows * state.cols) as u32,
+            state.batch as u32,
+            1e-7,
+        )?;
 
         for _ in 0..self.ns_steps {
             for bi in 0..state.batch {
@@ -400,21 +376,13 @@ impl GpuOptimizer {
                 grad.numel() as u32,
             )?;
         }
-        kernels
-            .stream()
-            .synchronize()
-            .map_err(|e| PgError::InvalidOp(format!("clip_grad_norm sync failed: {:?}", e)))?;
-        let sum_sq = bytemuck::cast_slice::<u8, f32>(&scratch_sum_sq.to_host_bytes()?)[0];
-        let norm = sum_sq.sqrt();
-        if norm > max_norm {
-            let scale = max_norm / norm;
-            for grad in grads {
-                kernels.scale_inplace(
-                    CudaPtr(grad.cu_ptr(kernels.stream())?),
-                    scale,
-                    grad.numel() as u32,
-                )?;
-            }
+        for grad in grads {
+            kernels.clip_by_global_norm(
+                CudaPtr(grad.cu_ptr(kernels.stream())?),
+                CudaPtr(scratch_sum_sq.cu_ptr(kernels.stream())?),
+                max_norm,
+                grad.numel() as u32,
+            )?;
         }
         Ok(())
     }

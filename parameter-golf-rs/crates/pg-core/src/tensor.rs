@@ -100,14 +100,12 @@ impl GpuTensor {
             .alloc_zeros::<u8>(expected_bytes)
             .map_err(|e| PgError::InvalidOp(format!("GPU alloc failed: {:?}", e)))?;
 
-        stream
-            .memcpy_htod(host_data, &mut dev_data)
-            .map_err(|e| {
-                PgError::InvalidOp(format!(
-                    "GPU memcpy failed for from_host_data_gpu shape {:?} dtype {:?} bytes {}: {:?}",
-                    shape, dtype, expected_bytes, e
-                ))
-            })?;
+        stream.memcpy_htod(host_data, &mut dev_data).map_err(|e| {
+            PgError::InvalidOp(format!(
+                "GPU memcpy failed for from_host_data_gpu shape {:?} dtype {:?} bytes {}: {:?}",
+                shape, dtype, expected_bytes, e
+            ))
+        })?;
 
         Ok(Self {
             data: TensorStorage::Gpu {
@@ -154,10 +152,9 @@ impl GpuTensor {
             TensorStorage::Cpu(data) => Ok(data[self.offset..self.offset + nbytes].to_vec()),
             #[cfg(feature = "cuda")]
             TensorStorage::Gpu { data, stream } => {
-                stream
-                    .context()
-                    .bind_to_thread()
-                    .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+                stream.context().bind_to_thread().map_err(|e| {
+                    PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e))
+                })?;
                 let all_data = stream
                     .memcpy_dtov(data.as_ref())
                     .map_err(|e| PgError::InvalidOp(format!("GPU memcpy failed: {:?}", e)))?;
@@ -195,10 +192,9 @@ impl GpuTensor {
             }
             #[cfg(feature = "cuda")]
             TensorStorage::Gpu { data, stream } => {
-                stream
-                    .context()
-                    .bind_to_thread()
-                    .map_err(|e| PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e)))?;
+                stream.context().bind_to_thread().map_err(|e| {
+                    PgError::InvalidOp(format!("CUDA context bind failed: {:?}", e))
+                })?;
                 let dev = std::sync::Arc::get_mut(data).ok_or_else(|| {
                     PgError::InvalidOp(
                         "cannot copy into shared GPU storage; tensor has outstanding aliases"

@@ -53,6 +53,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     run_cross_entropy_bwd(&kernels, &stream)?;
     run_attention(&kernels, &stream)?;
     run_attention_bwd(&kernels, &stream)?;
+    run_attention_block_causal_batch(&kernels, &stream)?;
     run_xsa(&kernels, &stream)?;
     run_xsa_bwd(&kernels, &stream)?;
     run_bigram_hash_bwd(&kernels, &stream)?;
@@ -198,6 +199,7 @@ fn run_bigram_hash(kernels: &GpuKernels, stream: &Arc<cudarc::driver::CudaStream
         8,
         4,
         ids.len() as u32,
+        ids.len() as u32,
     )?;
     report("bigram_hash", &cpu, &download_f32(stream, &out_gpu)?);
     Ok(())
@@ -301,6 +303,7 @@ fn run_smear_gate(kernels: &GpuKernels, stream: &Arc<cudarc::driver::CudaStream>
         CudaPtr(gate_gpu.cu_ptr(stream)?),
         CudaPtr(out_gpu.cu_ptr(stream)?),
         3,
+        3,
         4,
     )?;
     report("smear_gate", &cpu, &download_f32(stream, &out_gpu)?);
@@ -332,6 +335,9 @@ fn run_smear_gate_bwd(
         3,
         4,
     );
+    // GPU backward returns the shift-ready previous-token gradient used by
+    // model backward, so sequence starts are zeroed to avoid boundary leakage.
+    cpu_dx_prev[0..4].fill(0.0);
     let x_gpu = upload_f32(stream, &x, &[3, 4])?;
     let gate_gpu = upload_f32(stream, &gate, &[4])?;
     let go_gpu = upload_f32(stream, &grad_out, &[3, 4])?;
@@ -345,6 +351,7 @@ fn run_smear_gate_bwd(
         CudaPtr(dx_gpu.cu_ptr(stream)?),
         CudaPtr(dx_prev_gpu.cu_ptr(stream)?),
         CudaPtr(dgate_gpu.cu_ptr(stream)?),
+        3,
         3,
         4,
     )?;
@@ -730,17 +737,18 @@ fn run_attention(kernels: &GpuKernels, stream: &Arc<cudarc::driver::CudaStream>)
     let k_gpu = upload_f32(stream, &k, &[3, 2, 4])?;
     let v_gpu = upload_f32(stream, &v, &[3, 2, 4])?;
     let out_gpu = zeros(stream, &[3, 2, 4])?;
-    kernels.causal_attention_naive_fwd(
+    kernels.causal_attention_online_fwd(
         CudaPtr(q_gpu.cu_ptr(stream)?),
         CudaPtr(k_gpu.cu_ptr(stream)?),
         CudaPtr(v_gpu.cu_ptr(stream)?),
         CudaPtr(out_gpu.cu_ptr(stream)?),
         3,
+        3,
         2,
         2,
         4,
     )?;
-    report("attention", &cpu, &download_f32(stream, &out_gpu)?);
+    report("attention_online", &cpu, &download_f32(stream, &out_gpu)?);
     Ok(())
 }
 
@@ -778,7 +786,7 @@ fn run_attention_bwd(
     let dq_gpu = zeros(stream, &[3, 2, 4])?;
     let dk_gpu = zeros(stream, &[3, 2, 4])?;
     let dv_gpu = zeros(stream, &[3, 2, 4])?;
-    kernels.causal_attention_naive_bwd(
+    kernels.causal_attention_online_bwd(
         CudaPtr(q_gpu.cu_ptr(stream)?),
         CudaPtr(k_gpu.cu_ptr(stream)?),
         CudaPtr(v_gpu.cu_ptr(stream)?),
@@ -787,13 +795,141 @@ fn run_attention_bwd(
         CudaPtr(dk_gpu.cu_ptr(stream)?),
         CudaPtr(dv_gpu.cu_ptr(stream)?),
         3,
+        3,
         2,
         2,
         4,
     )?;
-    report("attention_bwd_q", &cpu_dq, &download_f32(stream, &dq_gpu)?);
-    report("attention_bwd_k", &cpu_dk, &download_f32(stream, &dk_gpu)?);
-    report("attention_bwd_v", &cpu_dv, &download_f32(stream, &dv_gpu)?);
+    report(
+        "attention_online_bwd_q",
+        &cpu_dq,
+        &download_f32(stream, &dq_gpu)?,
+    );
+    report(
+        "attention_online_bwd_k",
+        &cpu_dk,
+        &download_f32(stream, &dk_gpu)?,
+    );
+    report(
+        "attention_online_bwd_v",
+        &cpu_dv,
+        &download_f32(stream, &dv_gpu)?,
+    );
+    Ok(())
+}
+
+fn run_attention_block_causal_batch(
+    kernels: &GpuKernels,
+    stream: &Arc<cudarc::driver::CudaStream>,
+) -> PgResult<()> {
+    let batches = 2usize;
+    let seq_len = 3usize;
+    let tokens = batches * seq_len;
+    let num_heads = 2usize;
+    let num_kv_heads = 2usize;
+    let head_dim = 4usize;
+    let q: Vec<f32> = (0..tokens * num_heads * head_dim)
+        .map(|i| i as f32 * 0.017 - 0.31)
+        .collect();
+    let k: Vec<f32> = (0..tokens * num_kv_heads * head_dim)
+        .map(|i| i as f32 * -0.013 + 0.22)
+        .collect();
+    let v: Vec<f32> = (0..tokens * num_kv_heads * head_dim)
+        .map(|i| i as f32 * 0.019 - 0.18)
+        .collect();
+    let grad_out: Vec<f32> = (0..tokens * num_heads * head_dim)
+        .map(|i| i as f32 * -0.011 + 0.27)
+        .collect();
+
+    let mut cpu_out = vec![0.0; q.len()];
+    let mut cpu_dq = vec![0.0; q.len()];
+    let mut cpu_dk = vec![0.0; k.len()];
+    let mut cpu_dv = vec![0.0; v.len()];
+    for b in 0..batches {
+        let q_base = b * seq_len * num_heads * head_dim;
+        let kv_base = b * seq_len * num_kv_heads * head_dim;
+        let q_end = q_base + seq_len * num_heads * head_dim;
+        let kv_end = kv_base + seq_len * num_kv_heads * head_dim;
+        pg_kernels::attention::causal_attention_forward(
+            &q[q_base..q_end],
+            &k[kv_base..kv_end],
+            &v[kv_base..kv_end],
+            &mut cpu_out[q_base..q_end],
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+        pg_kernels::attention::causal_attention_backward(
+            &q[q_base..q_end],
+            &k[kv_base..kv_end],
+            &v[kv_base..kv_end],
+            &cpu_out[q_base..q_end],
+            &grad_out[q_base..q_end],
+            &mut cpu_dq[q_base..q_end],
+            &mut cpu_dk[kv_base..kv_end],
+            &mut cpu_dv[kv_base..kv_end],
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+    }
+
+    let q_gpu = upload_f32(stream, &q, &[tokens, num_heads, head_dim])?;
+    let k_gpu = upload_f32(stream, &k, &[tokens, num_kv_heads, head_dim])?;
+    let v_gpu = upload_f32(stream, &v, &[tokens, num_kv_heads, head_dim])?;
+    let out_gpu = zeros(stream, &[tokens, num_heads, head_dim])?;
+    kernels.causal_attention_online_fwd(
+        CudaPtr(q_gpu.cu_ptr(stream)?),
+        CudaPtr(k_gpu.cu_ptr(stream)?),
+        CudaPtr(v_gpu.cu_ptr(stream)?),
+        CudaPtr(out_gpu.cu_ptr(stream)?),
+        tokens as u32,
+        seq_len as u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+        head_dim as u32,
+    )?;
+    report(
+        "attention_online_block_causal_batch",
+        &cpu_out,
+        &download_f32(stream, &out_gpu)?,
+    );
+
+    let go_gpu = upload_f32(stream, &grad_out, &[tokens, num_heads, head_dim])?;
+    let dq_gpu = zeros(stream, &[tokens, num_heads, head_dim])?;
+    let dk_gpu = zeros(stream, &[tokens, num_kv_heads, head_dim])?;
+    let dv_gpu = zeros(stream, &[tokens, num_kv_heads, head_dim])?;
+    kernels.causal_attention_online_bwd(
+        CudaPtr(q_gpu.cu_ptr(stream)?),
+        CudaPtr(k_gpu.cu_ptr(stream)?),
+        CudaPtr(v_gpu.cu_ptr(stream)?),
+        CudaPtr(go_gpu.cu_ptr(stream)?),
+        CudaPtr(dq_gpu.cu_ptr(stream)?),
+        CudaPtr(dk_gpu.cu_ptr(stream)?),
+        CudaPtr(dv_gpu.cu_ptr(stream)?),
+        tokens as u32,
+        seq_len as u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+        head_dim as u32,
+    )?;
+    report(
+        "attention_online_block_causal_batch_bwd_q",
+        &cpu_dq,
+        &download_f32(stream, &dq_gpu)?,
+    );
+    report(
+        "attention_online_block_causal_batch_bwd_k",
+        &cpu_dk,
+        &download_f32(stream, &dk_gpu)?,
+    );
+    report(
+        "attention_online_block_causal_batch_bwd_v",
+        &cpu_dv,
+        &download_f32(stream, &dv_gpu)?,
+    );
     Ok(())
 }
 
@@ -863,6 +999,7 @@ fn run_bigram_hash_bwd(
         CudaPtr(grad_gpu.cu_ptr(stream)?),
         8,
         4,
+        ids.len() as u32,
         ids.len() as u32,
     )?;
     report("bigram_hash_bwd", &cpu, &download_f32(stream, &grad_gpu)?);

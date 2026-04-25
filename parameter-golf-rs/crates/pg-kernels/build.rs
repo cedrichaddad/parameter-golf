@@ -11,26 +11,25 @@ fn main() {
 
     // Check if nvcc is available
     if Command::new("nvcc").arg("--version").status().is_err() {
-        println!("cargo:warning=nvcc not found. Skipping cuDNN SDPA wrapper compilation.");
+        println!("cargo:warning=nvcc not found. Skipping CUDA/C++ F32 SDPA compilation.");
         return;
     }
 
-    // We only compile the C++ cuDNN wrapper if nvcc is found.
+    // We only compile the CUDA/C++ F32 SDPA backend if nvcc is found.
     // Ensure `cc` is listed in build-dependencies.
     let mut build = cc::Build::new();
 
     build
         .cuda(true)
         .flag("-O3")
-        // Allow C++17 for cuDNN headers
+        // Allow C++17 for CUDA/C++ attention sources.
         .flag("-std=c++17")
         .file("cpp/sdpa.cu")
-        .compile("flash_attn_cudnn");
+        .compile("naive_sdpa_f32");
 
     println!("cargo:rustc-cfg=has_cuda_cpp");
 
-    // Link against cudnn and cudart
-    println!("cargo:rustc-link-lib=cudnn");
+    // Link against cudart. The current C++ SDPA backend does not use cuDNN.
     println!("cargo:rustc-link-lib=cudart");
 
     // Re-run if the C++ file changes

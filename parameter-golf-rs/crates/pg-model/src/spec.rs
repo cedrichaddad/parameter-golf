@@ -26,6 +26,44 @@ pub enum TrainBackend {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum AttentionBackend {
+    /// Debug-only parity kernel with duplicated QK work. Kept as a fallback.
+    NaiveF32,
+    /// F32 flash-style online softmax kernel with forward and backward support.
+    /// This is the production Rust fallback while BF16 cuDNN SDPA is pending.
+    #[default]
+    FlashF32,
+    /// Intended production backend: fused cuDNN/FlashAttention-style BF16 SDPA.
+    /// This is explicit so record runs cannot accidentally report the F32
+    /// parity kernel as FlashAttention.
+    CudnnSdpaBf16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedOptimizerBackend {
+    /// Current distributed path: NCCL all-reduce grads, every rank updates a
+    /// full replica. Correctness-first, but not Parallel Muon.
+    #[default]
+    AllReduceReplicatedMuon,
+    /// Intended production path: reduce-scatter bank grads, shard-local NS5,
+    /// all-gather updated banks.
+    ShardedParallelMuon,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalAdaptationBackend {
+    #[default]
+    None,
+    /// Existing CPU q-only score-first TTT reference.
+    CpuQOnly,
+    /// Intended production frontier evaluator: GPU LoRA/phased score-first TTT.
+    GpuLoraPhased,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum VariantFamily {
     #[default]
     BaselineSp8192,
@@ -170,8 +208,25 @@ impl Default for ParallelResidualSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct AttnOutGateSpec {
+    pub enabled: bool,
+    pub width: usize,
+}
+
+impl Default for AttnOutGateSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: 24,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ModelSpec {
     pub family: VariantFamily,
+    pub attention_backend: AttentionBackend,
     pub vocab_size: usize,
     pub num_layers: usize,
     pub model_dim: usize,
@@ -186,6 +241,7 @@ pub struct ModelSpec {
     pub skip_topology: SkipTopology,
     pub recurrence: RecurrenceSpec,
     pub parallel_residual: ParallelResidualSpec,
+    pub attn_out_gate: AttnOutGateSpec,
     pub rope: RopeSpec,
     pub smear_gate: bool,
     pub logit_softcap: f32,
@@ -204,6 +260,7 @@ impl ModelSpec {
     pub fn for_family(family: VariantFamily) -> Self {
         let mut spec = Self {
             family,
+            attention_backend: AttentionBackend::NaiveF32,
             vocab_size: 8192,
             num_layers: 11,
             model_dim: 512,
@@ -218,6 +275,7 @@ impl ModelSpec {
             skip_topology: SkipTopology::Unet,
             recurrence: RecurrenceSpec::default(),
             parallel_residual: ParallelResidualSpec::default(),
+            attn_out_gate: AttnOutGateSpec::default(),
             rope: RopeSpec::default(),
             smear_gate: true,
             logit_softcap: 30.0,
@@ -241,11 +299,14 @@ impl ModelSpec {
             }
             VariantFamily::HybridCompetitiveSp8192 => {
                 spec.xsa_last_n = spec.num_layers;
+                spec.qk_gain_init = 5.25;
                 spec.recurrence.enabled = true;
                 spec.recurrence.start_layer = 4;
                 spec.recurrence.repeat_layers = 2;
                 spec.parallel_residual.enabled = true;
                 spec.parallel_residual.split_attention_mlp = true;
+                spec.attn_out_gate.enabled = true;
+                spec.attn_out_gate.width = 24;
                 spec.bigram.vocab_size = 3072;
                 spec.bigram.dim = 112;
             }
@@ -275,6 +336,8 @@ impl ModelSpec {
             recurrence_repeat_layers: self.recurrence.repeat_layers,
             parallel_residual: self.parallel_residual.enabled
                 && self.parallel_residual.split_attention_mlp,
+            attn_out_gate_enabled: self.attn_out_gate.enabled,
+            attn_out_gate_width: self.attn_out_gate.width,
             vrl_enabled: false,
             ve_enabled: self.value_embedding.enabled,
             ve_dim: self.value_embedding.dim,
@@ -302,6 +365,7 @@ impl ModelSpec {
 #[serde(default)]
 pub struct TrainSpec {
     pub backend: TrainBackend,
+    pub distributed_optimizer_backend: DistributedOptimizerBackend,
     pub batch_tokens: usize,
     pub seq_len: usize,
     pub train_data_pattern: Option<String>,
@@ -332,6 +396,7 @@ impl Default for TrainSpec {
     fn default() -> Self {
         Self {
             backend: TrainBackend::Cpu,
+            distributed_optimizer_backend: DistributedOptimizerBackend::AllReduceReplicatedMuon,
             batch_tokens: 524_288,
             seq_len: 2048,
             train_data_pattern: None,
@@ -428,6 +493,12 @@ pub struct EvalSpec {
     pub stride: usize,
     pub legal_score_first: bool,
     pub qttt: bool,
+    pub adaptation_backend: EvalAdaptationBackend,
+    pub lora_rank: usize,
+    pub lora_alpha: f32,
+    pub phased_ttt_prefix_docs: usize,
+    pub phased_ttt_phases: usize,
+    pub phased_ttt_weight_decay: f32,
     pub chunk_tokens: usize,
     pub tokenizer_vocab_path: Option<String>,
     pub max_tokens: Option<usize>,
@@ -439,6 +510,12 @@ impl Default for EvalSpec {
             stride: 64,
             legal_score_first: true,
             qttt: false,
+            adaptation_backend: EvalAdaptationBackend::None,
+            lora_rank: 128,
+            lora_alpha: 144.0,
+            phased_ttt_prefix_docs: 2_000,
+            phased_ttt_phases: 3,
+            phased_ttt_weight_decay: 1.0,
             chunk_tokens: 32_768,
             tokenizer_vocab_path: None,
             max_tokens: None,
