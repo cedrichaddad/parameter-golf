@@ -21,6 +21,17 @@ use pg_kernels::gpu_kernels::{CudaPtr, GpuKernels};
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
+fn batched_muon_ns_enabled() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_MUON_BATCHED_NS")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub struct AdamWHyper {
     pub lr: f32,
@@ -147,22 +158,35 @@ impl GpuMuon {
             .get_mut(bank_idx)
             .ok_or_else(|| PgError::InvalidOp(format!("invalid Muon bank index {bank_idx}")))?;
         if param.shape() != grad.shape()
-            || param.shape() != state.momentum_buffer.shape()
             || param.shape().len() != 3
+            || param.shape()[0] > state.batch
+            || param.shape()[1] != state.rows
+            || param.shape()[2] != state.cols
         {
             return Err(PgError::InvalidOp(
-                "GpuMuon::step_bank expects matching rank-3 bank tensors".into(),
+                "GpuMuon::step_bank expects rank-3 bank tensors fitting the allocated state".into(),
             ));
         }
 
+        let active_batch = param.shape()[0];
+        if active_batch == 0 {
+            return Ok(());
+        }
+        let momentum = state.momentum_buffer.slice_range(0, active_batch)?;
+        let ns_update = state.ns_update.slice_range(0, active_batch)?;
+        let ns_x = state.ns_x.slice_range(0, active_batch)?;
+        let ns_a = state.ns_a.slice_range(0, active_batch)?;
+        let ns_aa = state.ns_aa.slice_range(0, active_batch)?;
+        let ns_b = state.ns_b.slice_range(0, active_batch)?;
+        let ns_tmp = state.ns_tmp.slice_range(0, active_batch)?;
         let bank_numel = param.numel() as u32;
         kernels.scale_inplace(
-            CudaPtr(state.momentum_buffer.cu_ptr(kernels.stream())?),
+            CudaPtr(momentum.cu_ptr(kernels.stream())?),
             self.momentum,
             bank_numel,
         )?;
         kernels.add_scaled_fwd(
-            CudaPtr(state.momentum_buffer.cu_ptr(kernels.stream())?),
+            CudaPtr(momentum.cu_ptr(kernels.stream())?),
             CudaPtr(grad.cu_ptr(kernels.stream())?),
             1.0,
             bank_numel,
@@ -171,55 +195,51 @@ impl GpuMuon {
         if self.nesterov {
             kernels.copy_fwd(
                 CudaPtr(grad.cu_ptr(kernels.stream())?),
-                CudaPtr(state.ns_update.cu_ptr(kernels.stream())?),
+                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
                 bank_numel,
             )?;
             kernels.add_scaled_fwd(
-                CudaPtr(state.ns_update.cu_ptr(kernels.stream())?),
-                CudaPtr(state.momentum_buffer.cu_ptr(kernels.stream())?),
+                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+                CudaPtr(momentum.cu_ptr(kernels.stream())?),
                 self.momentum,
                 bank_numel,
             )?;
         } else {
             kernels.copy_fwd(
-                CudaPtr(state.momentum_buffer.cu_ptr(kernels.stream())?),
-                CudaPtr(state.ns_update.cu_ptr(kernels.stream())?),
+                CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
                 bank_numel,
             )?;
         }
 
         kernels.normalize_matrices(
-            CudaPtr(state.ns_update.cu_ptr(kernels.stream())?),
-            CudaPtr(state.ns_x.cu_ptr(kernels.stream())?),
+            CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+            CudaPtr(ns_x.cu_ptr(kernels.stream())?),
             (state.rows * state.cols) as u32,
-            state.batch as u32,
+            active_batch as u32,
             1e-7,
         )?;
 
-        for _ in 0..self.ns_steps {
-            for bi in 0..state.batch {
-                let x_i = state.ns_x.slice_first(bi)?;
-                let a_i = state.ns_a.slice_first(bi)?;
-                let aa_i = state.ns_aa.slice_first(bi)?;
-                let b_i = state.ns_b.slice_first(bi)?;
-                let tmp_i = state.ns_tmp.slice_first(bi)?;
-
+        if batched_muon_ns_enabled() {
+            for _ in 0..self.ns_steps {
                 if state.rows <= state.cols {
                     unsafe {
-                        self.gemm.matmul_f32(
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            a_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_bt(
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.rows,
                             state.rows,
                             state.cols,
                             1.0,
                             0.0,
                         )?;
-                        self.gemm.matmul_f32_nn(
-                            a_i.cu_ptr(self.gemm.stream())?,
-                            a_i.cu_ptr(self.gemm.stream())?,
-                            aa_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_nn(
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            ns_aa.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.gram_dim,
                             state.gram_dim,
                             state.gram_dim,
@@ -228,26 +248,27 @@ impl GpuMuon {
                         )?;
                     }
                     kernels.copy_fwd(
-                        CudaPtr(a_i.cu_ptr(kernels.stream())?),
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                        a_i.numel() as u32,
+                        CudaPtr(ns_a.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
+                        ns_a.numel() as u32,
                     )?;
                     kernels.scale_inplace(
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
                         NS_B,
-                        b_i.numel() as u32,
+                        ns_b.numel() as u32,
                     )?;
                     kernels.add_scaled_fwd(
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                        CudaPtr(aa_i.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         NS_C,
-                        b_i.numel() as u32,
+                        ns_b.numel() as u32,
                     )?;
                     unsafe {
-                        self.gemm.matmul_f32_nn(
-                            b_i.cu_ptr(self.gemm.stream())?,
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            tmp_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_nn(
+                            ns_b.cu_ptr(self.gemm.stream())?,
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_tmp.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.rows,
                             state.cols,
                             state.rows,
@@ -257,20 +278,22 @@ impl GpuMuon {
                     }
                 } else {
                     unsafe {
-                        self.gemm.matmul_f32_tn(
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            a_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_tn(
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.cols,
                             state.cols,
                             state.rows,
                             1.0,
                             0.0,
                         )?;
-                        self.gemm.matmul_f32_nn(
-                            a_i.cu_ptr(self.gemm.stream())?,
-                            a_i.cu_ptr(self.gemm.stream())?,
-                            aa_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_nn(
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            ns_a.cu_ptr(self.gemm.stream())?,
+                            ns_aa.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.gram_dim,
                             state.gram_dim,
                             state.gram_dim,
@@ -279,26 +302,27 @@ impl GpuMuon {
                         )?;
                     }
                     kernels.copy_fwd(
-                        CudaPtr(a_i.cu_ptr(kernels.stream())?),
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                        a_i.numel() as u32,
+                        CudaPtr(ns_a.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
+                        ns_a.numel() as u32,
                     )?;
                     kernels.scale_inplace(
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
                         NS_B,
-                        b_i.numel() as u32,
+                        ns_b.numel() as u32,
                     )?;
                     kernels.add_scaled_fwd(
-                        CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                        CudaPtr(aa_i.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
+                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         NS_C,
-                        b_i.numel() as u32,
+                        ns_b.numel() as u32,
                     )?;
                     unsafe {
-                        self.gemm.matmul_f32_nn(
-                            x_i.cu_ptr(self.gemm.stream())?,
-                            b_i.cu_ptr(self.gemm.stream())?,
-                            tmp_i.cu_ptr(self.gemm.stream())?,
+                        self.gemm.batched_matmul_f32_nn(
+                            ns_x.cu_ptr(self.gemm.stream())?,
+                            ns_b.cu_ptr(self.gemm.stream())?,
+                            ns_tmp.cu_ptr(self.gemm.stream())?,
+                            active_batch,
                             state.rows,
                             state.cols,
                             state.cols,
@@ -307,29 +331,154 @@ impl GpuMuon {
                         )?;
                     }
                 }
-
                 kernels.scale_inplace(
-                    CudaPtr(x_i.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
                     NS_A,
-                    x_i.numel() as u32,
+                    ns_x.numel() as u32,
                 )?;
                 kernels.add_scaled_fwd(
-                    CudaPtr(x_i.cu_ptr(kernels.stream())?),
-                    CudaPtr(tmp_i.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_tmp.cu_ptr(kernels.stream())?),
                     1.0,
-                    x_i.numel() as u32,
+                    ns_x.numel() as u32,
                 )?;
+            }
+        } else {
+            for _ in 0..self.ns_steps {
+                for bi in 0..active_batch {
+                    let x_i = ns_x.slice_first(bi)?;
+                    let a_i = ns_a.slice_first(bi)?;
+                    let aa_i = ns_aa.slice_first(bi)?;
+                    let b_i = ns_b.slice_first(bi)?;
+                    let tmp_i = ns_tmp.slice_first(bi)?;
+
+                    if state.rows <= state.cols {
+                        unsafe {
+                            self.gemm.matmul_f32(
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                state.rows,
+                                state.rows,
+                                state.cols,
+                                1.0,
+                                0.0,
+                            )?;
+                            self.gemm.matmul_f32_nn(
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                aa_i.cu_ptr(self.gemm.stream())?,
+                                state.gram_dim,
+                                state.gram_dim,
+                                state.gram_dim,
+                                1.0,
+                                0.0,
+                            )?;
+                        }
+                        kernels.copy_fwd(
+                            CudaPtr(a_i.cu_ptr(kernels.stream())?),
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            a_i.numel() as u32,
+                        )?;
+                        kernels.scale_inplace(
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            NS_B,
+                            b_i.numel() as u32,
+                        )?;
+                        kernels.add_scaled_fwd(
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
+                            NS_C,
+                            b_i.numel() as u32,
+                        )?;
+                        unsafe {
+                            self.gemm.matmul_f32_nn(
+                                b_i.cu_ptr(self.gemm.stream())?,
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                tmp_i.cu_ptr(self.gemm.stream())?,
+                                state.rows,
+                                state.cols,
+                                state.rows,
+                                1.0,
+                                0.0,
+                            )?;
+                        }
+                    } else {
+                        unsafe {
+                            self.gemm.matmul_f32_tn(
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                state.cols,
+                                state.cols,
+                                state.rows,
+                                1.0,
+                                0.0,
+                            )?;
+                            self.gemm.matmul_f32_nn(
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                a_i.cu_ptr(self.gemm.stream())?,
+                                aa_i.cu_ptr(self.gemm.stream())?,
+                                state.gram_dim,
+                                state.gram_dim,
+                                state.gram_dim,
+                                1.0,
+                                0.0,
+                            )?;
+                        }
+                        kernels.copy_fwd(
+                            CudaPtr(a_i.cu_ptr(kernels.stream())?),
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            a_i.numel() as u32,
+                        )?;
+                        kernels.scale_inplace(
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            NS_B,
+                            b_i.numel() as u32,
+                        )?;
+                        kernels.add_scaled_fwd(
+                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
+                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
+                            NS_C,
+                            b_i.numel() as u32,
+                        )?;
+                        unsafe {
+                            self.gemm.matmul_f32_nn(
+                                x_i.cu_ptr(self.gemm.stream())?,
+                                b_i.cu_ptr(self.gemm.stream())?,
+                                tmp_i.cu_ptr(self.gemm.stream())?,
+                                state.rows,
+                                state.cols,
+                                state.cols,
+                                1.0,
+                                0.0,
+                            )?;
+                        }
+                    }
+
+                    kernels.scale_inplace(
+                        CudaPtr(x_i.cu_ptr(kernels.stream())?),
+                        NS_A,
+                        x_i.numel() as u32,
+                    )?;
+                    kernels.add_scaled_fwd(
+                        CudaPtr(x_i.cu_ptr(kernels.stream())?),
+                        CudaPtr(tmp_i.cu_ptr(kernels.stream())?),
+                        1.0,
+                        x_i.numel() as u32,
+                    )?;
+                }
             }
         }
 
         kernels.scale_inplace(
-            CudaPtr(state.ns_x.cu_ptr(kernels.stream())?),
+            CudaPtr(ns_x.cu_ptr(kernels.stream())?),
             state.scale,
             bank_numel,
         )?;
         kernels.decay_sgd_step(
             CudaPtr(param.cu_ptr(kernels.stream())?),
-            CudaPtr(state.ns_x.cu_ptr(kernels.stream())?),
+            CudaPtr(ns_x.cu_ptr(kernels.stream())?),
             self.lr,
             self.weight_decay,
             bank_numel,

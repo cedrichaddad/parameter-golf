@@ -160,8 +160,23 @@ fn cuda_stage_timing_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn cuda_backward_graph_enabled() -> bool {
+    matches!(
+        std::env::var("PG_CUDA_BACKWARD_GRAPH")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    ) && !cuda_stage_timing_enabled()
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_timing_backend_label() -> &'static str {
-    if cuda_event_timing_enabled() && cuda_stage_timing_enabled() {
+    if cuda_backward_graph_enabled() && cuda_event_timing_enabled() {
+        "cuda_event_max_per_replica_backward_graph"
+    } else if cuda_backward_graph_enabled() {
+        "host_wallclock_cuda_boundary_backward_graph"
+    } else if cuda_event_timing_enabled() && cuda_stage_timing_enabled() {
         "cuda_event_max_per_replica_stage_instrumented"
     } else if cuda_event_timing_enabled() {
         "cuda_event_max_per_replica"
@@ -172,12 +187,12 @@ fn cuda_timing_backend_label() -> &'static str {
 
 #[cfg(feature = "cuda")]
 fn gpu_saved_layer_activations_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("PG_GPU_SAVE_LAYER_ACTS")
-            .unwrap_or_default()
+            .unwrap_or_else(|_| "off".to_string())
             .to_ascii_lowercase()
             .as_str(),
-        "1" | "true" | "yes" | "on"
+        "" | "0" | "false" | "no" | "off"
     )
 }
 
@@ -212,6 +227,14 @@ fn cuda_timing_backend_label() -> &'static str {
 }
 
 #[cfg(feature = "cuda")]
+struct CudaBackwardGraph(cudarc::driver::CudaGraph);
+
+// The graph is owned by one GPU replica. Scoped worker threads may move that
+// replica across steps, but a replica's graph is never launched concurrently.
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaBackwardGraph {}
+
+#[cfg(feature = "cuda")]
 struct CudaSingleHybridRuntime {
     gpu_model: pg_model::gpu::GpuModel,
     backward_state: pg_model::gpu::GpuBackwardState,
@@ -225,7 +248,9 @@ impl CudaSingleHybridRuntime {
         let ctx = cudarc::driver::CudaContext::new(0).map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda context init failed: {:?}", e))
         })?;
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda stream init failed: {:?}", e))
+        })?;
         let gpu_model =
             pg_model::gpu::GpuModel::from_cpu_reference(model, plan, ctx, stream.clone())?;
         Ok(Self {
@@ -249,6 +274,8 @@ impl CudaSingleHybridRuntime {
 struct CudaSingleFastRuntime {
     gpu_model: pg_model::gpu::GpuModel,
     backward_state: pg_model::gpu::GpuBackwardState,
+    backward_graph: Option<CudaBackwardGraph>,
+    backward_graph_seq_len: usize,
     input_ids: pg_core::GpuTensor,
     targets: pg_core::GpuTensor,
     host_input_ids: Vec<u32>,
@@ -298,7 +325,9 @@ impl CudaSingleFastRuntime {
         let ctx = cudarc::driver::CudaContext::new(device_ordinal).map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda context init failed: {:?}", e))
         })?;
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda stream init failed: {:?}", e))
+        })?;
         let gpu_model =
             pg_model::gpu::GpuModel::from_cpu_reference(model, plan, ctx, stream.clone())?;
         let gpu_buf = pg_model::gpu::GpuActivations::new_for_plan(plan, tokens, stream.clone())?;
@@ -315,6 +344,8 @@ impl CudaSingleFastRuntime {
                 tokens,
                 stream.clone(),
             )?,
+            backward_graph: None,
+            backward_graph_seq_len: 0,
             input_ids: pg_core::GpuTensor::zeros_gpu(
                 stream.clone(),
                 &[tokens],
@@ -445,6 +476,13 @@ struct ShardedBankBuffers {
 #[cfg(feature = "cuda")]
 struct NonBankSyncBuffers {
     packed_grad: pg_core::GpuTensor,
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_bank_real_batch(buffers: &ShardedBankBuffers, rank: usize) -> usize {
+    let shard_start = rank * buffers.chunk_batch;
+    let shard_end = (shard_start + buffers.chunk_batch).min(buffers.real_batch);
+    shard_end.saturating_sub(shard_start)
 }
 
 #[cfg(feature = "cuda")]
@@ -1680,6 +1718,9 @@ fn cuda_fast_accumulate_runtime_grads(
             &mut runtime.gpu_grads,
             runtime_seq_len,
         )
+    } else if cuda_backward_graph_enabled() {
+        cuda_fast_accumulate_runtime_grads_no_loss_graph(runtime, runtime_seq_len)?;
+        Ok(0.0)
     } else {
         runtime.gpu_model.backward_with_state_seq_len_no_loss(
             &runtime.input_ids,
@@ -1691,6 +1732,65 @@ fn cuda_fast_accumulate_runtime_grads(
         )?;
         Ok(0.0)
     }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_fast_accumulate_runtime_grads_no_loss_graph(
+    runtime: &mut CudaSingleFastRuntime,
+    runtime_seq_len: usize,
+) -> PgResult<()> {
+    let stream = runtime.gpu_model.gemm.stream().clone();
+    if runtime.backward_graph.is_some() && runtime.backward_graph_seq_len == runtime_seq_len {
+        runtime
+            .backward_graph
+            .as_ref()
+            .expect("checked graph exists")
+            .0
+            .launch()
+            .map_err(|e| pg_core::PgError::InvalidOp(format!("cuda graph launch failed: {e:?}")))?;
+        return Ok(());
+    }
+
+    if runtime.backward_graph.is_some() {
+        runtime.backward_graph = None;
+        runtime.backward_graph_seq_len = 0;
+    }
+
+    stream
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda backward graph capture begin failed: {e:?}"))
+        })?;
+    let capture_result = runtime.gpu_model.backward_with_state_seq_len_no_loss(
+        &runtime.input_ids,
+        &runtime.targets,
+        &mut runtime.gpu_buf,
+        &mut runtime.backward_state,
+        &mut runtime.gpu_grads,
+        runtime_seq_len,
+    );
+    let graph = stream
+        .end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda backward graph capture end failed: {e:?}"))
+        })?;
+    capture_result?;
+    runtime.backward_graph = graph.map(CudaBackwardGraph);
+    runtime.backward_graph_seq_len = runtime_seq_len;
+    runtime
+        .backward_graph
+        .as_ref()
+        .ok_or_else(|| {
+            pg_core::PgError::InvalidOp("cuda backward graph capture produced no graph".into())
+        })?
+        .0
+        .launch()
+        .map_err(|e| pg_core::PgError::InvalidOp(format!("cuda graph launch failed: {e:?}")))?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -2589,8 +2689,12 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 let param = bank_param(replica, bank_idx)?;
                 let grad = bank_grad(replica, bank_idx)?;
                 let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
-                scale_gpu_tensor(kernels, &buffers.padded_grad, 0.0)?;
-                scale_gpu_tensor(kernels, &buffers.shard_param, 0.0)?;
+                if buffers.real_batch < buffers.padded_grad.shape()[0] {
+                    let tail = buffers
+                        .padded_grad
+                        .slice_range(buffers.real_batch, buffers.padded_grad.shape()[0])?;
+                    scale_gpu_tensor(kernels, &tail, 0.0)?;
+                }
                 let grad_dst = buffers.padded_grad.slice_range(0, buffers.real_batch)?;
                 kernels.copy_fwd(
                     pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
@@ -2657,12 +2761,17 @@ fn cuda_distributed_sharded_parallel_muon_step(
             .as_ref()
             .expect("validated sharded Parallel Muon runtime");
         for buffers in &parallel_muon.replicas[rank].banks {
+            let active_batch = sharded_bank_real_batch(buffers, rank);
+            if active_batch == 0 {
+                continue;
+            }
+            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
             kernels.dot_accumulate(
-                pg_kernels::gpu_kernels::CudaPtr(buffers.shard_grad.cu_ptr(kernels.stream())?),
-                pg_kernels::gpu_kernels::CudaPtr(buffers.shard_grad.cu_ptr(kernels.stream())?),
+                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
+                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
                 scratch,
                 1.0,
-                buffers.shard_grad.numel() as u32,
+                shard_grad.numel() as u32,
             )?;
         }
     }
@@ -2693,11 +2802,16 @@ fn cuda_distributed_sharded_parallel_muon_step(
             .as_ref()
             .expect("validated sharded Parallel Muon runtime");
         for buffers in &parallel_muon.replicas[rank].banks {
+            let active_batch = sharded_bank_real_batch(buffers, rank);
+            if active_batch == 0 {
+                continue;
+            }
+            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
             kernels.clip_by_global_norm(
-                pg_kernels::gpu_kernels::CudaPtr(buffers.shard_grad.cu_ptr(kernels.stream())?),
+                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
                 scratch,
                 train_config.grad_clip_norm,
-                buffers.shard_grad.numel() as u32,
+                shard_grad.numel() as u32,
             )?;
         }
     }
@@ -2712,14 +2826,20 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 let replica = &runtime.replicas[rank];
                 let sharded_replica = &mut parallel_muon.replicas[rank];
                 let buffers = &mut sharded_replica.banks[bank_idx];
+                let active_batch = sharded_bank_real_batch(buffers, rank);
+                if active_batch == 0 {
+                    continue;
+                }
+                let shard_param = buffers.shard_param.slice_range(0, active_batch)?;
+                let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
                 sharded_replica.muon.lr = train_config.matrix_lr * lr_scale;
                 sharded_replica.muon.momentum = train_config.muon_momentum_at(step);
                 sharded_replica.muon.weight_decay = train_config.muon_wd;
                 sharded_replica.muon.step_bank(
                     &replica.gpu_model.kernels,
                     bank_idx,
-                    &buffers.shard_param,
-                    &buffers.shard_grad,
+                    &shard_param,
+                    &shard_grad,
                 )?;
             }
             cudarc::nccl::group_start()
@@ -3210,6 +3330,82 @@ fn record_path_audit_json(
         qkv_dx_beta_accum_enabled_for_audit()
     ));
     fields.push(format!(
+        "\"fused_qk_rope_gain_backward\":{}",
+        fused_qk_rope_gain_backward_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"fused_qk_rope_gain_forward\":{}",
+        fused_qk_rope_gain_forward_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"fused_residual_mix_norm\":{}",
+        fused_residual_mix_norm_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"fused_mlp_activation_bf16\":{}",
+        fused_mlp_activation_bf16_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_mlp_up_output\":{}",
+        bf16_mlp_up_output_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_norm_side_outputs\":{}",
+        bf16_norm_side_outputs_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_norm_grad_path\":{}",
+        bf16_norm_grad_path_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_residual_projection_output\":{}",
+        bf16_residual_projection_output_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_attention_projection_output\":{}",
+        bf16_attention_projection_output_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"recompute_residual_mix_norm_inputs\":{}",
+        recompute_residual_mix_norm_inputs_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"fused_attention_residual_from_base\":{}",
+        fused_attention_residual_from_base_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"fused_parallel_attn_residual_rms_norm\":{}",
+        fused_parallel_attn_residual_rms_norm_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"batched_muon_newton_schulz\":{}",
+        batched_muon_newton_schulz_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"cudnn_saved_bf16_attention\":{}",
+        cudnn_saved_bf16_attention_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"cudnn_prepacked_bf16_attention\":{}",
+        cudnn_prepacked_bf16_attention_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"skip_f32_attention_saved_activations\":{}",
+        skip_f32_attention_saved_activations_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"lean_bf16_saved_layer_cache\":{}",
+        lean_bf16_saved_layer_cache_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"direct_saved_layer_activations\":{}",
+        direct_saved_layer_activations_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"saved_bf16_layer_activation_shadows\":{}",
+        saved_bf16_layer_activation_shadows_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
         "\"bf16_output_projection_gemm\":{}",
         bf16_output_projection_gemm_enabled(run_spec)
     ));
@@ -3217,7 +3413,10 @@ fn record_path_audit_json(
         "\"bf16_output_backward_gemm\":{}",
         bf16_output_backward_gemm_enabled(run_spec)
     ));
-    fields.push("\"fused_output_cross_entropy\":false".to_string());
+    fields.push(format!(
+        "\"fused_output_cross_entropy\":{}",
+        fused_output_cross_entropy_enabled_for_audit(run_spec)
+    ));
     fields.push("\"materializes_full_logits\":true".to_string());
     fields.push(format!(
         "\"frontier_record_ready\":{}",
@@ -3236,8 +3435,16 @@ fn record_path_audit_json(
         cuda_timing_backend_label(),
     ));
     fields.push(format!(
+        "\"cuda_backward_graph\":{}",
+        cuda_backward_graph_enabled()
+    ));
+    fields.push(format!(
         "\"save_layer_activations\":{}",
         gpu_saved_layer_activations_enabled()
+    ));
+    fields.push(json_str_field(
+        "save_layer_activation_mode",
+        &gpu_saved_layer_activations_mode_for_audit(),
     ));
     fields.push(json_str_field(
         "gemm_compute_mode",
@@ -3336,10 +3543,243 @@ fn qkv_dx_beta_accum_enabled_for_audit() -> bool {
     )
 }
 
+fn fused_qk_rope_gain_backward_enabled_for_audit() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_FUSED_QK_ROPE_GAIN_BWD")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn fused_qk_rope_gain_forward_enabled_for_audit() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_FUSED_QK_ROPE_GAIN_FWD")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn fused_residual_mix_norm_enabled_for_audit() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_FUSED_RESIDUAL_MIX_NORM")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn fused_mlp_activation_bf16_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_forward_projection_gemm_enabled(run_spec)
+        && !matches!(
+            std::env::var("PG_GPU_FUSED_MLP_ACT_BF16")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn bf16_mlp_up_output_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_MLP_UP_OUTPUT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn bf16_norm_side_outputs_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_NORM_SIDE_OUTPUTS")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn bf16_norm_grad_path_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_NORM_GRAD_PATH")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn bf16_residual_projection_output_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn bf16_attention_projection_output_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_ATTN_PROJ_OUTPUT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn recompute_residual_mix_norm_inputs_enabled_for_audit() -> bool {
+    matches!(
+        std::env::var("PG_GPU_RECOMPUTE_RESIDUAL_MIX_NORM_INPUTS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn fused_attention_residual_from_base_enabled_for_audit() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_FUSED_ATTN_RESIDUAL_FROM_BASE")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn fused_parallel_attn_residual_rms_norm_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.parallel_residual.enabled
+        && fused_attention_residual_from_base_enabled_for_audit()
+        && !matches!(
+            std::env::var("PG_GPU_FUSED_PARALLEL_ATTN_RESID_RMS")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn batched_muon_newton_schulz_enabled_for_audit() -> bool {
+    !matches!(
+        std::env::var("PG_GPU_MUON_BATCHED_NS")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn cudnn_saved_bf16_attention_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    matches!(
+        run_spec.model.attention_backend,
+        AttentionBackend::CudnnSdpaBf16
+    ) && !matches!(
+        std::env::var("PG_GPU_CUDNN_SAVED_BF16_ATTN")
+            .unwrap_or_else(|_| "1".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn cudnn_prepacked_bf16_attention_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    cudnn_saved_bf16_attention_enabled_for_audit(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_CUDNN_PREPACKED_BF16_ATTN")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn skip_f32_attention_saved_activations_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    cudnn_saved_bf16_attention_enabled_for_audit(run_spec)
+        && direct_saved_layer_activations_enabled_for_audit()
+        && run_spec.model.xsa_last_n >= run_spec.model.num_layers
+        && !matches!(
+            std::env::var("PG_GPU_SKIP_F32_ATTN_SAVED_ACTS")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn lean_bf16_saved_layer_cache_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    skip_f32_attention_saved_activations_enabled_for_audit(run_spec)
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && !matches!(
+            std::env::var("PG_GPU_LEAN_BF16_SAVED_ACTS")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn direct_saved_layer_activations_enabled_for_audit() -> bool {
+    matches!(
+        std::env::var("PG_GPU_DIRECT_SAVED_ACTS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn gpu_saved_layer_activations_mode_for_audit() -> String {
+    std::env::var("PG_GPU_SAVE_LAYER_ACTS").unwrap_or_else(|_| "off".to_string())
+}
+
+fn saved_bf16_layer_activation_shadows_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    direct_saved_layer_activations_enabled_for_audit()
+        && bf16_primary_forward_projection_gemm_enabled(run_spec)
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && !matches!(
+            gpu_saved_layer_activations_mode_for_audit()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
 fn bf16_output_backward_gemm_enabled(run_spec: &RunSpec) -> bool {
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && !matches!(
             std::env::var("PG_GPU_BF16_OUTPUT_BACKWARD_GEMM")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+fn fused_output_cross_entropy_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    bf16_output_backward_gemm_enabled(run_spec)
+        && !matches!(
+            std::env::var("PG_GPU_FUSED_CE_LOSS_BWD")
                 .unwrap_or_else(|_| "1".to_string())
                 .to_ascii_lowercase()
                 .as_str(),
@@ -3396,7 +3836,7 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
             gaps.push("compute_precision=bf16_tensor_core is requested, but Rust still stores activations/gradients in f32; projection/output GEMMs use BF16 shadows, but a full BF16/FP16 activation graph is not implemented yet");
         }
     }
-    gaps.push("fused softcapped cross-entropy/output-gradient path is not implemented; current GPU path materializes full [batch_tokens, vocab] logits and grad_logits");
+    gaps.push("current GPU output path still materializes full [batch_tokens, vocab] logits; fused softcapped cross-entropy/output-gradient is present, but the record path still needs a fused output-projection+CE hot path");
     if !run_spec.model.recurrence.enabled {
         gaps.push("frontier record target requires recurrence enabled");
     }
@@ -4209,6 +4649,10 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("\"qkv_dx_beta_accum\":false"), "{json}");
+        assert!(
+            json.contains("\"direct_saved_layer_activations\":false"),
+            "{json}"
+        );
     }
 
     #[test]

@@ -16,6 +16,11 @@ const SHAPES: &[(&str, usize, usize, usize)] = &[
     // Larger batch
     ("attn_qvo  768x512x512", 768, 512, 512),
     ("mlp_up    768x1536x512", 768, 1536, 512),
+    // Record-shaped local batch: B=48, T=2048 => M=98,304 per rank.
+    ("record_qkv 98304x1024x512", 98_304, 1024, 512),
+    ("record_o   98304x512x512", 98_304, 512, 512),
+    ("record_up  98304x1536x512", 98_304, 1536, 512),
+    ("record_dn  98304x512x1536", 98_304, 512, 1536),
     // Newton-Schulz square (per-layer, not batched here)
     ("ns_square 512x512x512", 512, 512, 512),
 ];

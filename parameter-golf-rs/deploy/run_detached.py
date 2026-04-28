@@ -52,12 +52,27 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--backward-stage-timing" in forwarded:
         forwarded.remove("--backward-stage-timing")
         os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1"
+    if "--cuda-stage-timing" in forwarded:
+        forwarded.remove("--cuda-stage-timing")
+        os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1"
+    if "--cuda-backward-graph" in forwarded:
+        forwarded.remove("--cuda-backward-graph")
+        os.environ["PG_CUDA_BACKWARD_GRAPH"] = "1"
     if "--save-layer-acts" in forwarded:
         forwarded.remove("--save-layer-acts")
         os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "1"
+    if "--save-recurrent-layer-acts" in forwarded:
+        forwarded.remove("--save-recurrent-layer-acts")
+        os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "recurrent"
+    if "--save-inner-layer-acts" in forwarded:
+        forwarded.remove("--save-inner-layer-acts")
+        os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "inner"
     if "--save-all-layer-acts" in forwarded:
         forwarded.remove("--save-all-layer-acts")
         os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "all"
+    if "--direct-saved-layer-acts" in forwarded:
+        forwarded.remove("--direct-saved-layer-acts")
+        os.environ["PG_GPU_DIRECT_SAVED_ACTS"] = "1"
     if "--ttt-audit" in forwarded:
         forwarded.remove("--ttt-audit")
         os.environ["PG_TTT_AUDIT"] = "1"
@@ -68,6 +83,12 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         forwarded.remove("--fast-tf32")
         os.environ["PG_CUBLAS_FAST_TF32"] = "1"
         os.environ.setdefault("PG_CUBLAS_FORCE_TENSOR_OP_ALGO", "1")
+    if "--bf16-gemm-algo" in forwarded:
+        idx = forwarded.index("--bf16-gemm-algo")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--bf16-gemm-algo requires an algorithm id")
+        os.environ["PG_CUBLAS_BF16_ALGO"] = forwarded[idx + 1]
+        del forwarded[idx : idx + 2]
     if "--disable-bf16-forward-gemm" in forwarded:
         forwarded.remove("--disable-bf16-forward-gemm")
         os.environ["PG_GPU_BF16_FORWARD_GEMM"] = "0"
@@ -86,6 +107,9 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-bf16-output-backward-gemm" in forwarded:
         forwarded.remove("--disable-bf16-output-backward-gemm")
         os.environ["PG_GPU_BF16_OUTPUT_BACKWARD_GEMM"] = "0"
+    if "--disable-fused-ce-loss-bwd" in forwarded:
+        forwarded.remove("--disable-fused-ce-loss-bwd")
+        os.environ["PG_GPU_FUSED_CE_LOSS_BWD"] = "0"
     if "--enable-qkv-dx-beta-accum" in forwarded:
         forwarded.remove("--enable-qkv-dx-beta-accum")
         os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
@@ -95,6 +119,75 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--qkv-dx-beta-accum" in forwarded:
         forwarded.remove("--qkv-dx-beta-accum")
         os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
+    if "--disable-fused-qk-rope-gain-bwd" in forwarded:
+        forwarded.remove("--disable-fused-qk-rope-gain-bwd")
+        os.environ["PG_GPU_FUSED_QK_ROPE_GAIN_BWD"] = "0"
+    if "--disable-fused-qk-rope-gain-fwd" in forwarded:
+        forwarded.remove("--disable-fused-qk-rope-gain-fwd")
+        os.environ["PG_GPU_FUSED_QK_ROPE_GAIN_FWD"] = "0"
+    if "--disable-fused-residual-mix-norm" in forwarded:
+        forwarded.remove("--disable-fused-residual-mix-norm")
+        os.environ["PG_GPU_FUSED_RESIDUAL_MIX_NORM"] = "0"
+    if "--disable-fused-mlp-act-bf16" in forwarded:
+        forwarded.remove("--disable-fused-mlp-act-bf16")
+        os.environ["PG_GPU_FUSED_MLP_ACT_BF16"] = "0"
+    if "--bf16-mlp-up-output" in forwarded:
+        forwarded.remove("--bf16-mlp-up-output")
+        os.environ["PG_GPU_BF16_MLP_UP_OUTPUT"] = "1"
+    if "--enable-bf16-norm-side-outputs" in forwarded:
+        forwarded.remove("--enable-bf16-norm-side-outputs")
+        os.environ["PG_GPU_BF16_NORM_SIDE_OUTPUTS"] = "1"
+    if "--disable-bf16-norm-side-outputs" in forwarded:
+        forwarded.remove("--disable-bf16-norm-side-outputs")
+        os.environ["PG_GPU_BF16_NORM_SIDE_OUTPUTS"] = "0"
+    if "--enable-bf16-norm-grad-path" in forwarded:
+        forwarded.remove("--enable-bf16-norm-grad-path")
+        os.environ["PG_GPU_BF16_NORM_GRAD_PATH"] = "1"
+    if "--disable-bf16-norm-grad-path" in forwarded:
+        forwarded.remove("--disable-bf16-norm-grad-path")
+        os.environ["PG_GPU_BF16_NORM_GRAD_PATH"] = "0"
+    if "--enable-bf16-residual-proj-output" in forwarded:
+        forwarded.remove("--enable-bf16-residual-proj-output")
+        os.environ["PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT"] = "1"
+    if "--disable-bf16-residual-proj-output" in forwarded:
+        forwarded.remove("--disable-bf16-residual-proj-output")
+        os.environ["PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT"] = "0"
+    if "--enable-bf16-attn-proj-output" in forwarded:
+        forwarded.remove("--enable-bf16-attn-proj-output")
+        os.environ["PG_GPU_BF16_ATTN_PROJ_OUTPUT"] = "1"
+    if "--disable-bf16-attn-proj-output" in forwarded:
+        forwarded.remove("--disable-bf16-attn-proj-output")
+        os.environ["PG_GPU_BF16_ATTN_PROJ_OUTPUT"] = "0"
+    if "--enable-prepacked-bf16-attention" in forwarded:
+        forwarded.remove("--enable-prepacked-bf16-attention")
+        os.environ["PG_GPU_CUDNN_PREPACKED_BF16_ATTN"] = "1"
+    if "--disable-prepacked-bf16-attention" in forwarded:
+        forwarded.remove("--disable-prepacked-bf16-attention")
+        os.environ["PG_GPU_CUDNN_PREPACKED_BF16_ATTN"] = "0"
+    if "--disable-fused-attn-residual-from-base" in forwarded:
+        forwarded.remove("--disable-fused-attn-residual-from-base")
+        os.environ["PG_GPU_FUSED_ATTN_RESIDUAL_FROM_BASE"] = "0"
+    if "--disable-fused-parallel-attn-resid-rms" in forwarded:
+        forwarded.remove("--disable-fused-parallel-attn-resid-rms")
+        os.environ["PG_GPU_FUSED_PARALLEL_ATTN_RESID_RMS"] = "0"
+    if "--disable-batched-muon-ns" in forwarded:
+        forwarded.remove("--disable-batched-muon-ns")
+        os.environ["PG_GPU_MUON_BATCHED_NS"] = "0"
+    if "--disable-cudnn-saved-bf16-attn" in forwarded:
+        forwarded.remove("--disable-cudnn-saved-bf16-attn")
+        os.environ["PG_GPU_CUDNN_SAVED_BF16_ATTN"] = "0"
+    if "--disable-skip-f32-attn-saved-acts" in forwarded:
+        forwarded.remove("--disable-skip-f32-attn-saved-acts")
+        os.environ["PG_GPU_SKIP_F32_ATTN_SAVED_ACTS"] = "0"
+    if "--disable-lean-bf16-saved-acts" in forwarded:
+        forwarded.remove("--disable-lean-bf16-saved-acts")
+        os.environ["PG_GPU_LEAN_BF16_SAVED_ACTS"] = "0"
+    if "--enable-recompute-residual-mix-norm-inputs" in forwarded:
+        forwarded.remove("--enable-recompute-residual-mix-norm-inputs")
+        os.environ["PG_GPU_RECOMPUTE_RESIDUAL_MIX_NORM_INPUTS"] = "1"
+    if "--disable-recompute-residual-mix-norm-inputs" in forwarded:
+        forwarded.remove("--disable-recompute-residual-mix-norm-inputs")
+        os.environ["PG_GPU_RECOMPUTE_RESIDUAL_MIX_NORM_INPUTS"] = "0"
 
 
 def _maybe_seed_data_env():

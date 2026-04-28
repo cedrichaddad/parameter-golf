@@ -7,7 +7,7 @@ use pg_core::error::{PgError, PgResult};
 ///
 /// All kernels operate on f32 data with f32 arithmetic internally.
 /// Grid/block dimensions are set for H100 (132 SMs, 1024 threads/block).
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Compiled GPU kernel module — initialized once, reused for all launches.
 #[repr(transparent)]
@@ -20,15 +20,37 @@ pub struct GpuKernels {
     _module: Arc<CudaModule>,
     // Element-wise kernels
     rms_norm_fwd: CudaFunction,
+    rms_norm_fwd_bf16: CudaFunction,
     rms_norm_bwd: CudaFunction,
+    rms_norm_bwd_go_bf16: CudaFunction,
     rms_norm_bwd_accum: CudaFunction,
+    rms_norm_bwd_accum_residual_mix_input: CudaFunction,
     rms_norm_bwd_residual_mix: CudaFunction,
+    rms_norm_bwd_residual_mix_recompute: CudaFunction,
     leaky_relu_sq_fwd: CudaFunction,
+    leaky_relu_sq_fwd_bf16: CudaFunction,
+    leaky_relu_sq_fwd_x_bf16_only: CudaFunction,
     leaky_relu_sq_bwd: CudaFunction,
+    leaky_relu_sq_bwd_bf16: CudaFunction,
+    leaky_relu_sq_bwd_x_bf16: CudaFunction,
+    leaky_relu_sq_bwd_x_bf16_only: CudaFunction,
     residual_mix: CudaFunction,
+    residual_mix_rms_norm_fwd: CudaFunction,
+    residual_mix_rms_norm_fwd_bf16: CudaFunction,
     residual_mix_bwd: CudaFunction,
     residual_add_scale: CudaFunction,
+    residual_add_scale_bf16_proj: CudaFunction,
+    residual_add_scale_from_base: CudaFunction,
+    residual_add_scale_from_base_bf16_proj: CudaFunction,
+    residual_add_scale_from_base_rms_norm: CudaFunction,
+    residual_add_scale_from_base_rms_norm_bf16: CudaFunction,
+    residual_add_scale_from_base_rms_norm_bf16_proj: CudaFunction,
     residual_add_scale_bwd: CudaFunction,
+    residual_add_scale_bwd_bf16: CudaFunction,
+    residual_add_scale_bwd_from_bf16_only: CudaFunction,
+    residual_add_scale_bwd_bf16_only_atomic: CudaFunction,
+    residual_add_scale_bwd_bf16_only_no_atomic: CudaFunction,
+    residual_add_scale_grad_scale_reduce: CudaFunction,
     smear_gate_fwd: CudaFunction,
     smear_gate_bwd: CudaFunction,
     embedding_gather: CudaFunction,
@@ -39,11 +61,18 @@ pub struct GpuKernels {
     partial_rope_bwd: CudaFunction,
     q_gain_fwd: CudaFunction,
     q_gain_bwd: CudaFunction,
+    q_gain_rope_qk_norm_fwd: CudaFunction,
+    q_gain_rope_qk_norm_fwd_bf16_bhsd: CudaFunction,
+    rope_qk_norm_fwd: CudaFunction,
+    rope_qk_norm_fwd_bf16_bhsd: CudaFunction,
+    q_gain_rope_qk_norm_bwd: CudaFunction,
+    rope_qk_norm_bwd: CudaFunction,
     dot_accumulate: CudaFunction,
     clip_by_global_norm: CudaFunction,
     cross_entropy_fwd: CudaFunction,
     cross_entropy_bwd: CudaFunction,
     cross_entropy_bwd_bf16: CudaFunction,
+    cross_entropy_loss_bwd_bf16: CudaFunction,
     bigram_hash_embed: CudaFunction,
     bigram_hash_embed_bwd: CudaFunction,
     add_scaled: CudaFunction,
@@ -54,14 +83,22 @@ pub struct GpuKernels {
     attn_out_gate_fwd: CudaFunction,
     attn_out_gate_bwd: CudaFunction,
     sparse_attn_gate_fwd: CudaFunction,
+    sparse_attn_gate_xsa_fwd: CudaFunction,
     sparse_attn_gate_bwd: CudaFunction,
+    sparse_attn_gate_bwd_stage1: CudaFunction,
+    sparse_attn_gate_xsa_bwd_bf16_bhsd: CudaFunction,
+    sparse_attn_gate_weight_grad: CudaFunction,
     xsa_fwd: CudaFunction,
     xsa_bwd: CudaFunction,
+    xsa_bwd_bf16_bhsd: CudaFunction,
     copy_fwd: CudaFunction,
+    copy_u16_fwd: CudaFunction,
+    bthd_to_bhsd_bf16: CudaFunction,
     scale_inplace: CudaFunction,
     pack_qkv_weights: CudaFunction,
     unpack_qkv_output: CudaFunction,
     pack_qkv_grads: CudaFunction,
+    pack_qkv_grads_bf16: CudaFunction,
     unpack_qkv_weight_grad: CudaFunction,
     f32_to_bf16: CudaFunction,
     bf16_to_f32: CudaFunction,
@@ -73,12 +110,35 @@ pub struct GpuKernels {
 /// CUDA C source for all element-wise kernels.
 /// f32 data, f32 compute, one thread per element (or per row for reductions).
 const CUDA_SOURCE: &str = r#"
+__device__ __forceinline__ unsigned short pg_f32_to_bf16(float value) {
+    unsigned int bits = __float_as_uint(value);
+    unsigned int lsb = (bits >> 16) & 1u;
+    unsigned int rounding_bias = 0x7fffu + lsb;
+    return static_cast<unsigned short>((bits + rounding_bias) >> 16);
+}
+
+__device__ __forceinline__ float pg_bf16_to_f32(unsigned short value) {
+    unsigned int bits = static_cast<unsigned int>(value) << 16;
+    return __uint_as_float(bits);
+}
+
 // ──────────────────────────────────────────────────────────────
 // Copy forward: dst[idx] = src[idx]
 // ──────────────────────────────────────────────────────────────
 extern "C" __global__ void copy_fwd(
     const float* __restrict__ src,
     float* __restrict__ dst,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = src[idx];
+    }
+}
+
+extern "C" __global__ void copy_u16_fwd(
+    const unsigned short* __restrict__ src,
+    unsigned short* __restrict__ dst,
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -174,6 +234,35 @@ extern "C" __global__ void pack_qkv_grads(
     }
 }
 
+// q/k/v f32 grads -> combined BF16[t, d+2kv]. This removes a
+// separate full-size f32_to_bf16 pass from the fused QKV backward path.
+extern "C" __global__ void pack_qkv_grads_bf16(
+    const float* __restrict__ grad_q,
+    const float* __restrict__ grad_k,
+    const float* __restrict__ grad_v,
+    unsigned short* __restrict__ combined,
+    int tokens,
+    int d,
+    int kv
+) {
+    int qkv = d + 2 * kv;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * qkv;
+    if (idx >= total) return;
+
+    int row = idx / qkv;
+    int col = idx - row * qkv;
+    float value;
+    if (col < d) {
+        value = grad_q[row * d + col];
+    } else if (col < d + kv) {
+        value = grad_k[row * kv + (col - d)];
+    } else {
+        value = grad_v[row * kv + (col - d - kv)];
+    }
+    combined[idx] = pg_f32_to_bf16(value);
+}
+
 // combined grad [d+2kv,d] -> qo_grad[layer], kv_grad[layer], kv_grad[layers+layer]
 extern "C" __global__ void unpack_qkv_weight_grad(
     const float* __restrict__ combined_grad,
@@ -232,10 +321,7 @@ extern "C" __global__ void f32_to_bf16(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        unsigned int bits = __float_as_uint(src[idx]);
-        unsigned int lsb = (bits >> 16) & 1u;
-        unsigned int rounding_bias = 0x7fffu + lsb;
-        dst[idx] = static_cast<unsigned short>((bits + rounding_bias) >> 16);
+        dst[idx] = pg_f32_to_bf16(src[idx]);
     }
 }
 
@@ -246,8 +332,7 @@ extern "C" __global__ void bf16_to_f32(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        unsigned int bits = static_cast<unsigned int>(src[idx]) << 16;
-        dst[idx] = __uint_as_float(bits);
+        dst[idx] = pg_bf16_to_f32(src[idx]);
     }
 }
 
@@ -394,6 +479,59 @@ extern "C" __global__ void rms_norm_forward(
     }
 }
 
+extern "C" __global__ void rms_norm_forward_bf16(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    unsigned short* __restrict__ y_bf16,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x + row * dim;
+    float* y_row = y + row * dim;
+    unsigned short* y_bf16_row = y_bf16 + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = x_row[i];
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        sum_sq = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float out = x_row[i] * inv_rms;
+        y_row[i] = out;
+        y_bf16_row[i] = pg_f32_to_bf16(out);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // RMSNorm backward: dx = s/rms * (dy - x * dot(x,dy)/(rms²*dim))
 // Grid: (num_rows,), Block: (block_dim,)
@@ -465,6 +603,74 @@ extern "C" __global__ void rms_norm_backward(
     }
 }
 
+extern "C" __global__ void rms_norm_backward_go_bf16(
+    const float* __restrict__ x,
+    const unsigned short* __restrict__ grad_output_bf16,
+    float* __restrict__ grad_input,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x + row * dim;
+    const unsigned short* go_row = grad_output_bf16 + row * dim;
+    float* gi_row = grad_input + row * dim;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = x_row[i];
+        float go = pg_bf16_to_f32(go_row[i]);
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float shared_sum[32];
+    __shared__ float shared_dot[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_sum[warp_id] = sum_sq;
+        shared_dot[warp_id] = x_dot_go;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        x_dot_go = (threadIdx.x < warps) ? shared_dot[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+            x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        }
+    }
+
+    __shared__ float inv_rms_shared;
+    __shared__ float coeff_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+        coeff_shared = x_dot_go / (rms * rms * (float)dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_shared;
+    float coeff = coeff_shared;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float go = pg_bf16_to_f32(go_row[i]);
+        gi_row[i] = inv_rms * (go - x_row[i] * coeff);
+    }
+}
+
 // RMSNorm backward with accumulation:
 // grad_input = beta * grad_input + dx_norm
 extern "C" __global__ void rms_norm_backward_accum(
@@ -532,6 +738,83 @@ extern "C" __global__ void rms_norm_backward_accum(
     float coeff = coeff_shared;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float dx = inv_rms * (go_row[i] - x_row[i] * coeff);
+        gi_row[i] = beta * gi_row[i] + dx;
+    }
+}
+
+// RMSNorm backward with accumulation, recomputing the RMSNorm input from the
+// residual-mix sources. This removes the need to save the full mixed activation
+// when the forward input is cheaply reproducible from x, x0, and mix.
+extern "C" __global__ void rms_norm_backward_accum_residual_mix_input(
+    const float* __restrict__ residual_x,
+    const float* __restrict__ residual_x0,
+    const float* __restrict__ mix,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_input,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    float beta,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    int base = row * dim;
+    const float* x_row = residual_x + base;
+    const float* x0_row = residual_x0 + base;
+    const float* go_row = grad_output + base;
+    float* gi_row = grad_input + base;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = mix[i] * x_row[i] + mix[dim + i] * x0_row[i];
+        float go = go_row[i];
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float shared_sum[32];
+    __shared__ float shared_dot[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_sum[warp_id] = sum_sq;
+        shared_dot[warp_id] = x_dot_go;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        x_dot_go = (threadIdx.x < warps) ? shared_dot[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+            x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        }
+    }
+
+    __shared__ float inv_rms_shared;
+    __shared__ float coeff_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+        coeff_shared = x_dot_go / (rms * rms * (float)dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_shared;
+    float coeff = coeff_shared;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = mix[i] * x_row[i] + mix[dim + i] * x0_row[i];
+        float dx = inv_rms * (go_row[i] - xv * coeff);
         gi_row[i] = beta * gi_row[i] + dx;
     }
 }
@@ -624,6 +907,91 @@ extern "C" __global__ void rms_norm_backward_accum_residual_mix_backward(
     }
 }
 
+// Same fused tail as above, but recomputes x_norm from the residual-mix inputs
+// instead of reading a saved mixed activation.
+extern "C" __global__ void rms_norm_backward_accum_residual_mix_backward_recompute(
+    const float* __restrict__ grad_norm,
+    const float* __restrict__ residual_x,
+    const float* __restrict__ residual_x0,
+    const float* __restrict__ mix,
+    const float* __restrict__ base_grad,
+    float* __restrict__ grad_x,
+    float* __restrict__ grad_x0,
+    float* __restrict__ grad_mix,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    float beta,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    int base = row * dim;
+    const float* residual_row = residual_x + base;
+    const float* residual0_row = residual_x0 + base;
+    const float* go_row = grad_norm + base;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = mix[i] * residual_row[i] + mix[dim + i] * residual0_row[i];
+        float go = go_row[i];
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float shared_sum[32];
+    __shared__ float shared_dot[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_sum[warp_id] = sum_sq;
+        shared_dot[warp_id] = x_dot_go;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        x_dot_go = (threadIdx.x < warps) ? shared_dot[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+            x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        }
+    }
+
+    __shared__ float inv_rms_shared;
+    __shared__ float coeff_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+        coeff_shared = x_dot_go / (rms * rms * (float)dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_shared;
+    float coeff = coeff_shared;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        int idx = base + i;
+        float xv = mix[i] * residual_row[i] + mix[dim + i] * residual0_row[i];
+        float norm_dx = inv_rms * (grad_norm[idx] - xv * coeff);
+        float go = beta * base_grad[idx] + norm_dx;
+        float mix_x = mix[i];
+        float mix_x0 = mix[dim + i];
+        grad_x[idx] = go * mix_x;
+        grad_x0[idx] += go * mix_x0;
+        atomicAdd(&grad_mix[i], go * residual_x[idx]);
+        atomicAdd(&grad_mix[dim + i], go * residual_x0[idx]);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // LeakyReLU(0.5)² forward: y = leaky_relu(x, 0.5)²
 // ──────────────────────────────────────────────────────────────
@@ -637,6 +1005,33 @@ extern "C" __global__ void leaky_relu_sq_forward(
     float v = x[idx];
     float lr = (v >= 0.0f) ? v : 0.5f * v;
     y[idx] = lr * lr;
+}
+
+extern "C" __global__ void leaky_relu_sq_forward_bf16(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    unsigned short* __restrict__ y_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = x[idx];
+    float lr = (v >= 0.0f) ? v : 0.5f * v;
+    float out = lr * lr;
+    y[idx] = out;
+    y_bf16[idx] = pg_f32_to_bf16(out);
+}
+
+extern "C" __global__ void leaky_relu_sq_forward_x_bf16_only(
+    const unsigned short* __restrict__ x_bf16,
+    unsigned short* __restrict__ y_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = pg_bf16_to_f32(x_bf16[idx]);
+    float lr = (v >= 0.0f) ? v : 0.5f * v;
+    y_bf16[idx] = pg_f32_to_bf16(lr * lr);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -656,6 +1051,55 @@ extern "C" __global__ void leaky_relu_sq_backward(
     grad_input[idx] = grad_output[idx] * 2.0f * lr * d_lr;
 }
 
+extern "C" __global__ void leaky_relu_sq_backward_bf16(
+    const float* __restrict__ x,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_input,
+    unsigned short* __restrict__ grad_input_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = x[idx];
+    float lr = (v >= 0.0f) ? v : 0.5f * v;
+    float d_lr = (v >= 0.0f) ? 1.0f : 0.5f;
+    float grad = grad_output[idx] * 2.0f * lr * d_lr;
+    grad_input[idx] = grad;
+    grad_input_bf16[idx] = pg_f32_to_bf16(grad);
+}
+
+extern "C" __global__ void leaky_relu_sq_backward_x_bf16(
+    const unsigned short* __restrict__ x_bf16,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_input,
+    unsigned short* __restrict__ grad_input_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = pg_bf16_to_f32(x_bf16[idx]);
+    float lr = (v >= 0.0f) ? v : 0.5f * v;
+    float d_lr = (v >= 0.0f) ? 1.0f : 0.5f;
+    float grad = grad_output[idx] * 2.0f * lr * d_lr;
+    grad_input[idx] = grad;
+    grad_input_bf16[idx] = pg_f32_to_bf16(grad);
+}
+
+extern "C" __global__ void leaky_relu_sq_backward_x_bf16_only(
+    const unsigned short* __restrict__ x_bf16,
+    const float* __restrict__ grad_output,
+    unsigned short* __restrict__ grad_input_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = pg_bf16_to_f32(x_bf16[idx]);
+    float lr = (v >= 0.0f) ? v : 0.5f * v;
+    float d_lr = (v >= 0.0f) ? 1.0f : 0.5f;
+    float grad = grad_output[idx] * 2.0f * lr * d_lr;
+    grad_input_bf16[idx] = pg_f32_to_bf16(grad);
+}
+
 // ──────────────────────────────────────────────────────────────
 // Residual mixing: out[i] = mix0[i%d] * x[i] + mix1[i%d] * x0[i]
 // ──────────────────────────────────────────────────────────────
@@ -671,6 +1115,128 @@ extern "C" __global__ void residual_mix(
     if (idx >= n) return;
     int d = idx % dim;
     out[idx] = mix[d] * x[idx] + mix[dim + d] * x0[idx];
+}
+
+// ──────────────────────────────────────────────────────────────
+// Fused residual mix + RMSNorm.
+// Writes the mixed residual stream and the normalized stream in one row pass:
+//   mixed = mix[:d] * x + mix[d:] * x0
+//   norm  = mixed * ln_scale / sqrt(mean(mixed^2) + eps)
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void residual_mix_rms_norm_forward(
+    const float* __restrict__ x,
+    const float* __restrict__ x0,
+    const float* __restrict__ mix,
+    float* __restrict__ mixed,
+    float* __restrict__ norm,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x + row * dim;
+    const float* x0_row = x0 + row * dim;
+    float* mixed_row = mixed + row * dim;
+    float* norm_row = norm + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = mix[i] * x_row[i] + mix[dim + i] * x0_row[i];
+        mixed_row[i] = v;
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        norm_row[i] = mixed_row[i] * inv_rms;
+    }
+}
+
+extern "C" __global__ void residual_mix_rms_norm_forward_bf16(
+    const float* __restrict__ x,
+    const float* __restrict__ x0,
+    const float* __restrict__ mix,
+    float* __restrict__ mixed,
+    float* __restrict__ norm,
+    unsigned short* __restrict__ norm_bf16,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x + row * dim;
+    const float* x0_row = x0 + row * dim;
+    float* mixed_row = mixed + row * dim;
+    float* norm_row = norm + row * dim;
+    unsigned short* norm_bf16_row = norm_bf16 + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = mix[i] * x_row[i] + mix[dim + i] * x0_row[i];
+        mixed_row[i] = v;
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float out = mixed_row[i] * inv_rms;
+        norm_row[i] = out;
+        norm_bf16_row[i] = pg_f32_to_bf16(out);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -714,6 +1280,229 @@ extern "C" __global__ void residual_add_scale(
     x[idx] += scale[d] * proj[idx];
 }
 
+extern "C" __global__ void residual_add_scale_bf16_proj(
+    float* __restrict__ x,
+    const unsigned short* __restrict__ proj_bf16,
+    const float* __restrict__ scale,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    x[idx] += scale[d] * pg_bf16_to_f32(proj_bf16[idx]);
+}
+
+extern "C" __global__ void residual_add_scale_from_base(
+    const float* __restrict__ base,
+    const float* __restrict__ proj,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    out[idx] = base[idx] + scale[d] * proj[idx];
+}
+
+extern "C" __global__ void residual_add_scale_from_base_bf16_proj(
+    const float* __restrict__ base,
+    const unsigned short* __restrict__ proj_bf16,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    out[idx] = base[idx] + scale[d] * pg_bf16_to_f32(proj_bf16[idx]);
+}
+
+// Parallel-residual forward fusion:
+//   out[row]  = base[row] + scale * proj[row]
+//   norm[row] = rms_norm(base[row])
+// This matches the parallel-residual block where the MLP branch normalizes the
+// pre-attention residual stream while the attention branch is accumulated into
+// the block output.
+extern "C" __global__ void residual_add_scale_from_base_rms_norm_forward(
+    const float* __restrict__ base,
+    const float* __restrict__ proj,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    float* __restrict__ norm,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* base_row = base + row * dim;
+    const float* proj_row = proj + row * dim;
+    float* out_row = out + row * dim;
+    float* norm_row = norm + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = base_row[i];
+        out_row[i] = v + scale[i] * proj_row[i];
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        norm_row[i] = base_row[i] * inv_rms;
+    }
+}
+
+extern "C" __global__ void residual_add_scale_from_base_rms_norm_forward_bf16(
+    const float* __restrict__ base,
+    const float* __restrict__ proj,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    float* __restrict__ norm,
+    unsigned short* __restrict__ norm_bf16,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* base_row = base + row * dim;
+    const float* proj_row = proj + row * dim;
+    float* out_row = out + row * dim;
+    float* norm_row = norm + row * dim;
+    unsigned short* norm_bf16_row = norm_bf16 + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = base_row[i];
+        out_row[i] = v + scale[i] * proj_row[i];
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float out_norm = base_row[i] * inv_rms;
+        norm_row[i] = out_norm;
+        norm_bf16_row[i] = pg_f32_to_bf16(out_norm);
+    }
+}
+
+extern "C" __global__ void residual_add_scale_from_base_rms_norm_forward_bf16_proj(
+    const float* __restrict__ base,
+    const unsigned short* __restrict__ proj_bf16,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    float* __restrict__ norm,
+    unsigned short* __restrict__ norm_bf16,
+    int dim,
+    float ln_scale_factor,
+    float eps,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* base_row = base + row * dim;
+    const unsigned short* proj_row = proj_bf16 + row * dim;
+    float* out_row = out + row * dim;
+    float* norm_row = norm + row * dim;
+    unsigned short* norm_bf16_row = norm_bf16 + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = base_row[i];
+        out_row[i] = v + scale[i] * pg_bf16_to_f32(proj_row[i]);
+        sum_sq += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float inv_rms_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_shared;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float out_norm = base_row[i] * inv_rms;
+        norm_row[i] = out_norm;
+        norm_bf16_row[i] = pg_f32_to_bf16(out_norm);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // Residual add-scale backward.
 // forward: x_out = x_in + scale * proj
@@ -736,6 +1525,112 @@ extern "C" __global__ void residual_add_scale_backward(
     grad_x_in[idx] += go;
     grad_proj[idx] = go * scale[d];
     atomicAdd(&grad_scale[d], go * proj[idx]);
+}
+
+extern "C" __global__ void residual_add_scale_backward_bf16(
+    const float* __restrict__ proj,
+    const float* __restrict__ grad_output,
+    const float* __restrict__ scale,
+    float* __restrict__ grad_x_in,
+    float* __restrict__ grad_proj,
+    unsigned short* __restrict__ grad_proj_bf16,
+    float* __restrict__ grad_scale,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    float go = grad_output[idx];
+    float gp = go * scale[d];
+    grad_x_in[idx] += go;
+    grad_proj[idx] = gp;
+    grad_proj_bf16[idx] = pg_f32_to_bf16(gp);
+    atomicAdd(&grad_scale[d], go * proj[idx]);
+}
+
+extern "C" __global__ void residual_add_scale_backward_bf16_only(
+    const float* __restrict__ proj,
+    const float* __restrict__ grad_output,
+    const float* __restrict__ scale,
+    float* __restrict__ grad_x_in,
+    unsigned short* __restrict__ grad_proj_bf16,
+    float* __restrict__ grad_scale,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    float go = grad_output[idx];
+    grad_x_in[idx] += go;
+    grad_proj_bf16[idx] = pg_f32_to_bf16(go * scale[d]);
+    atomicAdd(&grad_scale[d], go * proj[idx]);
+}
+
+extern "C" __global__ void residual_add_scale_backward_from_bf16_only(
+    const unsigned short* __restrict__ proj_bf16,
+    const float* __restrict__ grad_output,
+    const float* __restrict__ scale,
+    float* __restrict__ grad_x_in,
+    unsigned short* __restrict__ grad_proj_bf16,
+    float* __restrict__ grad_scale,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    float go = grad_output[idx];
+    grad_x_in[idx] += go;
+    grad_proj_bf16[idx] = pg_f32_to_bf16(go * scale[d]);
+    atomicAdd(&grad_scale[d], go * pg_bf16_to_f32(proj_bf16[idx]));
+}
+
+extern "C" __global__ void residual_add_scale_backward_bf16_only_no_atomic(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ scale,
+    float* __restrict__ grad_x_in,
+    unsigned short* __restrict__ grad_proj_bf16,
+    int dim,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int d = idx % dim;
+    float go = grad_output[idx];
+    grad_x_in[idx] += go;
+    grad_proj_bf16[idx] = pg_f32_to_bf16(go * scale[d]);
+}
+
+extern "C" __global__ void residual_add_scale_grad_scale_reduce(
+    const float* __restrict__ proj,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_scale,
+    int dim,
+    int n
+) {
+    int d = blockIdx.x;
+    if (d >= dim) return;
+    int rows = n / dim;
+    float sum = 0.0f;
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        int idx = r * dim + d;
+        sum += grad_output[idx] * proj[idx];
+    }
+
+    __shared__ float scratch[256];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&grad_scale[d], scratch[0]);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1044,6 +1939,455 @@ extern "C" __global__ void q_gain_backward(
     }
 }
 
+extern "C" __global__ void q_gain_rope_qk_norm_forward(
+    float* __restrict__ q,
+    float* __restrict__ q_post_rope,
+    const float* __restrict__ gain,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int h = head_idx % num_heads;
+    int tok = head_idx / num_heads;
+    int pos = tok % seq_len;
+    int half = rope_dims / 2;
+    float* head = q + head_idx * head_dim;
+    float* post_head = q_post_rope ? (q_post_rope + head_idx * head_dim) : nullptr;
+    float g = gain[h];
+
+    float sum_sq = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float v = head[j];
+        sum_sq += v * v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float inv_rms_sh;
+    if (threadIdx.x == 0) {
+        inv_rms_sh = rsqrtf(sum_sq / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_sh;
+
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        if (j < half) {
+            float cos_val = cos_table[pos * half + j];
+            float sin_val = sin_table[pos * half + j];
+            float x1 = head[j] * inv_rms;
+            float x2 = head[half + j] * inv_rms;
+            float r1 = x1 * cos_val + x2 * sin_val;
+            float r2 = -x1 * sin_val + x2 * cos_val;
+            if (post_head) {
+                post_head[j] = r1;
+                post_head[half + j] = r2;
+            }
+            head[j] = r1 * g;
+            head[half + j] = r2 * g;
+        } else if (j >= rope_dims) {
+            float r = head[j] * inv_rms;
+            if (post_head) post_head[j] = r;
+            head[j] = r * g;
+        }
+    }
+}
+
+extern "C" __global__ void q_gain_rope_qk_norm_forward_bf16_bhsd(
+    float* __restrict__ q,
+    float* __restrict__ q_post_rope,
+    unsigned short* __restrict__ q_bhsd_bf16,
+    const float* __restrict__ gain,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int h = head_idx % num_heads;
+    int tok = head_idx / num_heads;
+    int b = tok / seq_len;
+    int pos = tok - b * seq_len;
+    int half = rope_dims / 2;
+    float* head = q + head_idx * head_dim;
+    float* post_head = q_post_rope ? (q_post_rope + head_idx * head_dim) : nullptr;
+    unsigned short* out_head = q_bhsd_bf16
+        ? q_bhsd_bf16 + ((b * num_heads + h) * seq_len + pos) * head_dim
+        : nullptr;
+    float g = gain[h];
+
+    float sum_sq = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float v = head[j];
+        sum_sq += v * v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float inv_rms_sh;
+    if (threadIdx.x == 0) {
+        inv_rms_sh = rsqrtf(sum_sq / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_sh;
+
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float out_value;
+        if (j < half) {
+            float cos_val = cos_table[pos * half + j];
+            float sin_val = sin_table[pos * half + j];
+            float x1 = head[j] * inv_rms;
+            float x2 = head[half + j] * inv_rms;
+            float r1 = x1 * cos_val + x2 * sin_val;
+            float r2 = -x1 * sin_val + x2 * cos_val;
+            if (post_head) {
+                post_head[j] = r1;
+                post_head[half + j] = r2;
+            }
+            out_value = r1 * g;
+            head[j] = out_value;
+            if (out_head) out_head[j] = pg_f32_to_bf16(out_value);
+            float out_peer = r2 * g;
+            head[half + j] = out_peer;
+            if (out_head) out_head[half + j] = pg_f32_to_bf16(out_peer);
+        } else if (j >= rope_dims) {
+            float r = head[j] * inv_rms;
+            if (post_head) post_head[j] = r;
+            out_value = r * g;
+            head[j] = out_value;
+            if (out_head) out_head[j] = pg_f32_to_bf16(out_value);
+        }
+    }
+}
+
+extern "C" __global__ void rope_qk_norm_forward(
+    float* __restrict__ k,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int tok = head_idx / num_heads;
+    int pos = tok % seq_len;
+    int half = rope_dims / 2;
+    float* head = k + head_idx * head_dim;
+
+    float sum_sq = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float v = head[j];
+        sum_sq += v * v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float inv_rms_sh;
+    if (threadIdx.x == 0) {
+        inv_rms_sh = rsqrtf(sum_sq / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_sh;
+
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        if (j < half) {
+            float cos_val = cos_table[pos * half + j];
+            float sin_val = sin_table[pos * half + j];
+            float x1 = head[j] * inv_rms;
+            float x2 = head[half + j] * inv_rms;
+            head[j] = x1 * cos_val + x2 * sin_val;
+            head[half + j] = -x1 * sin_val + x2 * cos_val;
+        } else if (j >= rope_dims) {
+            head[j] *= inv_rms;
+        }
+    }
+}
+
+extern "C" __global__ void rope_qk_norm_forward_bf16_bhsd(
+    float* __restrict__ k,
+    unsigned short* __restrict__ k_bhsd_bf16,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int h = head_idx % num_heads;
+    int tok = head_idx / num_heads;
+    int b = tok / seq_len;
+    int pos = tok - b * seq_len;
+    int half = rope_dims / 2;
+    float* head = k + head_idx * head_dim;
+    unsigned short* out_head = k_bhsd_bf16
+        ? k_bhsd_bf16 + ((b * num_heads + h) * seq_len + pos) * head_dim
+        : nullptr;
+
+    float sum_sq = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float v = head[j];
+        sum_sq += v * v;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float inv_rms_sh;
+    if (threadIdx.x == 0) {
+        inv_rms_sh = rsqrtf(sum_sq / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float inv_rms = inv_rms_sh;
+
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float out_value;
+        if (j < half) {
+            float cos_val = cos_table[pos * half + j];
+            float sin_val = sin_table[pos * half + j];
+            float x1 = head[j] * inv_rms;
+            float x2 = head[half + j] * inv_rms;
+            out_value = x1 * cos_val + x2 * sin_val;
+            head[j] = out_value;
+            if (out_head) out_head[j] = pg_f32_to_bf16(out_value);
+            float out_peer = -x1 * sin_val + x2 * cos_val;
+            head[half + j] = out_peer;
+            if (out_head) out_head[half + j] = pg_f32_to_bf16(out_peer);
+        } else if (j >= rope_dims) {
+            out_value = head[j] * inv_rms;
+            head[j] = out_value;
+            if (out_head) out_head[j] = pg_f32_to_bf16(out_value);
+        }
+    }
+}
+
+extern "C" __global__ void bthd_to_bhsd_bf16(
+    const float* __restrict__ in,
+    unsigned short* __restrict__ out,
+    int batch,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int h = tmp % num_heads;
+    int token = tmp / num_heads;
+    int b = token / seq_len;
+    int s = token - b * seq_len;
+    int out_idx = ((b * num_heads + h) * seq_len + s) * head_dim + d;
+    out[out_idx] = pg_f32_to_bf16(in[idx]);
+}
+
+extern "C" __global__ void q_gain_rope_qk_norm_backward(
+    const float* __restrict__ q_pre_norm,
+    const float* __restrict__ q_post_rope,
+    const float* __restrict__ grad_q_scaled,
+    const float* __restrict__ gain,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    float* __restrict__ grad_q_proj,
+    float* __restrict__ grad_gain,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int h = head_idx % num_heads;
+    int tok = head_idx / num_heads;
+    int pos = tok % seq_len;
+    int half = rope_dims / 2;
+
+    const float* x_head = q_pre_norm + head_idx * head_dim;
+    const float* q_rope_head = q_post_rope + head_idx * head_dim;
+    const float* go_scaled_head = grad_q_scaled + head_idx * head_dim;
+    float* gi_head = grad_q_proj + head_idx * head_dim;
+    float g = gain[h];
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    float gain_dot = 0.0f;
+
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float go_j_scaled = go_scaled_head[j];
+        float go_j = go_j_scaled * g;
+        gain_dot += go_j_scaled * q_rope_head[j];
+
+        float go = go_j;
+        if (j < rope_dims && rope_dims > 0) {
+            if (j < half) {
+                float cos_val = cos_table[pos * half + j];
+                float sin_val = sin_table[pos * half + j];
+                float peer = go_scaled_head[half + j] * g;
+                go = go_j * cos_val - peer * sin_val;
+            } else {
+                int i = j - half;
+                float cos_val = cos_table[pos * half + i];
+                float sin_val = sin_table[pos * half + i];
+                float peer = go_scaled_head[i] * g;
+                go = peer * sin_val + go_j * cos_val;
+            }
+        }
+
+        float xv = x_head[j];
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        gain_dot += __shfl_down_sync(0xffffffff, gain_dot, offset);
+    }
+
+    __shared__ float inv_rms_sh;
+    __shared__ float coeff_sh;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)head_dim + eps);
+        inv_rms_sh = 1.0f / rms;
+        coeff_sh = x_dot_go / (rms * rms * (float)head_dim);
+        atomicAdd(&grad_gain[h], gain_dot);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_sh;
+    float coeff = coeff_sh;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float go_j = go_scaled_head[j] * g;
+        float go = go_j;
+        if (j < rope_dims && rope_dims > 0) {
+            if (j < half) {
+                float cos_val = cos_table[pos * half + j];
+                float sin_val = sin_table[pos * half + j];
+                float peer = go_scaled_head[half + j] * g;
+                go = go_j * cos_val - peer * sin_val;
+            } else {
+                int i = j - half;
+                float cos_val = cos_table[pos * half + i];
+                float sin_val = sin_table[pos * half + i];
+                float peer = go_scaled_head[i] * g;
+                go = peer * sin_val + go_j * cos_val;
+            }
+        }
+        float xv = x_head[j];
+        gi_head[j] = inv_rms * (go - xv * coeff);
+    }
+}
+
+extern "C" __global__ void rope_qk_norm_backward(
+    const float* __restrict__ k_pre_norm,
+    const float* __restrict__ grad_k_attn,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    float* __restrict__ grad_k_proj,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_dims,
+    int total_heads,
+    float eps
+) {
+    int head_idx = blockIdx.x;
+    if (head_idx >= total_heads) return;
+
+    int tok = head_idx / num_heads;
+    int pos = tok % seq_len;
+    int half = rope_dims / 2;
+
+    const float* x_head = k_pre_norm + head_idx * head_dim;
+    const float* go_head = grad_k_attn + head_idx * head_dim;
+    float* gi_head = grad_k_proj + head_idx * head_dim;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float go = go_head[j];
+        if (j < rope_dims && rope_dims > 0) {
+            if (j < half) {
+                float cos_val = cos_table[pos * half + j];
+                float sin_val = sin_table[pos * half + j];
+                float peer = go_head[half + j];
+                go = go * cos_val - peer * sin_val;
+            } else {
+                int i = j - half;
+                float cos_val = cos_table[pos * half + i];
+                float sin_val = sin_table[pos * half + i];
+                float peer = go_head[i];
+                go = peer * sin_val + go * cos_val;
+            }
+        }
+
+        float xv = x_head[j];
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float inv_rms_sh;
+    __shared__ float coeff_sh;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)head_dim + eps);
+        inv_rms_sh = 1.0f / rms;
+        coeff_sh = x_dot_go / (rms * rms * (float)head_dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_sh;
+    float coeff = coeff_sh;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float go = go_head[j];
+        if (j < rope_dims && rope_dims > 0) {
+            if (j < half) {
+                float cos_val = cos_table[pos * half + j];
+                float sin_val = sin_table[pos * half + j];
+                float peer = go_head[half + j];
+                go = go * cos_val - peer * sin_val;
+            } else {
+                int i = j - half;
+                float cos_val = cos_table[pos * half + i];
+                float sin_val = sin_table[pos * half + i];
+                float peer = go_head[i];
+                go = peer * sin_val + go * cos_val;
+            }
+        }
+        float xv = x_head[j];
+        gi_head[j] = inv_rms * (go - xv * coeff);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 // Dot accumulate: out[0] += alpha * sum_i(a[i] * b[i])
 // ──────────────────────────────────────────────────────────────
@@ -1322,6 +2666,92 @@ extern "C" __global__ void cross_entropy_backward_bf16(
         unsigned int lsb = (bits >> 16) & 1u;
         unsigned int rounding_bias = 0x7fffu + lsb;
         grad_row[i] = static_cast<unsigned short>((bits + rounding_bias) >> 16);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Fused softcapped cross-entropy loss + BF16 backward.
+// This matches cross_entropy_forward followed by cross_entropy_backward_bf16
+// while scanning each logits row once for max/sum and once for gradient.
+// ──────────────────────────────────────────────────────────────
+extern "C" __global__ void cross_entropy_loss_backward_bf16(
+    const float* __restrict__ logits,
+    const int* __restrict__ targets,
+    float* __restrict__ losses,
+    unsigned short* __restrict__ grad_logits,
+    int vocab_size,
+    float softcap,
+    float grad_loss,
+    int num_tokens
+) {
+    int t = blockIdx.x;
+    if (t >= num_tokens) return;
+
+    const float* row = logits + t * vocab_size;
+    unsigned short* grad_row = grad_logits + t * vocab_size;
+    int target = targets[t];
+    float inv_cap = 1.0f / softcap;
+
+    float max_val = -1e30f;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float capped = softcap * tanhf(row[i] * inv_cap);
+        if (capped > max_val) max_val = capped;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+
+    __shared__ float shared_max[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) shared_max[warp_id] = max_val;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        max_val = (threadIdx.x < warps) ? shared_max[threadIdx.x] : -1e30f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    }
+    __shared__ float max_broadcast;
+    if (threadIdx.x == 0) max_broadcast = max_val;
+    __syncthreads();
+    max_val = max_broadcast;
+
+    float sum_exp = 0.0f;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float capped = softcap * tanhf(row[i] * inv_cap);
+        sum_exp += expf(capped - max_val);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
+
+    __shared__ float shared_sum[32];
+    if (lane == 0) shared_sum[warp_id] = sum_exp;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_exp = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
+    }
+    __shared__ float sum_broadcast;
+    if (threadIdx.x == 0) sum_broadcast = sum_exp;
+    __syncthreads();
+    sum_exp = sum_broadcast;
+
+    if (threadIdx.x == 0) {
+        float log_sum_exp = max_val + logf(sum_exp);
+        float capped_target = softcap * tanhf(row[target] * inv_cap);
+        losses[t] = log_sum_exp - capped_target;
+    }
+
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        float capped = softcap * tanhf(row[i] * inv_cap);
+        float prob = expf(capped - max_val) / sum_exp;
+        float one_hot = (i == target) ? 1.0f : 0.0f;
+        float tv = tanhf(row[i] * inv_cap);
+        float d_softcap = 1.0f - tv * tv;
+        float grad = grad_loss * (prob - one_hot) * d_softcap;
+        grad_row[i] = pg_f32_to_bf16(grad);
     }
 }
 
@@ -1947,6 +3377,81 @@ extern "C" __global__ void sparse_attn_gate_forward(
     }
 }
 
+extern "C" __global__ void sparse_attn_gate_xsa_forward(
+    const float* __restrict__ y,
+    const float* __restrict__ v,
+    const float* __restrict__ gate_input,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    unsigned short* __restrict__ out_bf16,
+    float* __restrict__ gate_values,
+    int tokens,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int model_dim,
+    int gate_width,
+    float gate_scale
+) {
+    int row = blockIdx.x;
+    if (row >= tokens * num_heads) return;
+    int tok = row / num_heads;
+    int head = row % num_heads;
+    int hkv = head / (num_heads / num_kv_heads);
+    int y_off = row * head_dim;
+    int v_off = (tok * num_kv_heads + hkv) * head_dim;
+    int tid = threadIdx.x;
+
+    __shared__ float reduce_yv[256];
+    __shared__ float reduce_vn[256];
+    __shared__ float reduce_score[256];
+
+    float y_dot_v = 0.0f;
+    float v_norm_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float yv = y[y_off + i];
+        float vv = v[v_off + i];
+        y_dot_v += yv * vv;
+        v_norm_sq += vv * vv;
+    }
+
+    float score_part = 0.0f;
+    const float* w = weight + head * gate_width;
+    const float* x = gate_input + tok * model_dim;
+    for (int j = tid; j < gate_width; j += blockDim.x) {
+        score_part += w[j] * x[j];
+    }
+
+    reduce_yv[tid] = y_dot_v;
+    reduce_vn[tid] = v_norm_sq;
+    reduce_score[tid] = score_part;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_yv[tid] += reduce_yv[tid + stride];
+            reduce_vn[tid] += reduce_vn[tid + stride];
+            reduce_score[tid] += reduce_score[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float coeff_s;
+    __shared__ float gate_s;
+    if (tid == 0) {
+        coeff_s = reduce_yv[0] / (reduce_vn[0] + 1e-8f);
+        float score = gate_scale * reduce_score[0];
+        gate_s = 1.0f / (1.0f + expf(-score));
+        gate_values[row] = gate_s;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float value = (y[y_off + i] - coeff_s * v[v_off + i]) * gate_s;
+        out[y_off + i] = value;
+        out_bf16[y_off + i] = pg_f32_to_bf16(value);
+    }
+}
+
 extern "C" __global__ void sparse_attn_gate_backward(
     const float* __restrict__ attn_in,
     const float* __restrict__ gate_input,
@@ -1996,6 +3501,204 @@ extern "C" __global__ void sparse_attn_gate_backward(
     for (int j = tid; j < gate_width; j += blockDim.x) {
         atomicAdd(&grad_weight[head * gate_width + j], grad_score_s * x[j]);
         atomicAdd(&grad_gate_input[tok * model_dim + j], grad_score_s * w[j]);
+    }
+}
+
+extern "C" __global__ void sparse_attn_gate_backward_stage1(
+    const float* __restrict__ attn_in,
+    const float* __restrict__ gate_input,
+    const float* __restrict__ gate_values,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ weight,
+    float* __restrict__ grad_attn_in,
+    float* __restrict__ grad_gate_input,
+    float* __restrict__ grad_score_out,
+    int tokens,
+    int num_heads,
+    int head_dim,
+    int model_dim,
+    int gate_width,
+    float gate_scale
+) {
+    int row = blockIdx.x;
+    if (row >= tokens * num_heads) return;
+    int tok = row / num_heads;
+    int head = row % num_heads;
+    int tid = threadIdx.x;
+    int base = row * head_dim;
+    float gate = gate_values[row];
+
+    __shared__ float reduce[256];
+    float grad_gate_part = 0.0f;
+    for (int j = tid; j < head_dim; j += blockDim.x) {
+        float go = grad_out[base + j];
+        grad_attn_in[base + j] = go * gate;
+        grad_gate_part += go * attn_in[base + j];
+    }
+    reduce[tid] = grad_gate_part;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+
+    __shared__ float grad_score_s;
+    if (tid == 0) {
+        grad_score_s = reduce[0] * gate_scale * gate * (1.0f - gate);
+        grad_score_out[row] = grad_score_s;
+    }
+    __syncthreads();
+
+    const float* w = weight + head * gate_width;
+    for (int j = tid; j < gate_width; j += blockDim.x) {
+        atomicAdd(&grad_gate_input[tok * model_dim + j], grad_score_s * w[j]);
+    }
+}
+
+extern "C" __global__ void sparse_attn_gate_weight_grad_reduce(
+    const float* __restrict__ gate_input,
+    const float* __restrict__ grad_score,
+    float* __restrict__ grad_weight,
+    int tokens,
+    int num_heads,
+    int model_dim,
+    int gate_width
+) {
+    int head = blockIdx.x;
+    int j = blockIdx.y;
+    int tid = threadIdx.x;
+    if (head >= num_heads || j >= gate_width) return;
+
+    __shared__ float reduce[256];
+    float sum = 0.0f;
+    for (int tok = tid; tok < tokens; tok += blockDim.x) {
+        sum += grad_score[tok * num_heads + head] * gate_input[tok * model_dim + j];
+    }
+    reduce[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        grad_weight[head * gate_width + j] += reduce[0];
+    }
+}
+
+extern "C" __global__ void sparse_attn_gate_xsa_backward_bf16_bhsd(
+    const unsigned short* __restrict__ y_bhsd,
+    const unsigned short* __restrict__ v_bhsd,
+    const float* __restrict__ gate_input,
+    const float* __restrict__ gate_values,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ weight,
+    float* __restrict__ grad_y,
+    float* __restrict__ grad_v,
+    float* __restrict__ grad_gate_input,
+    float* __restrict__ grad_score_out,
+    int batch,
+    int seq_len,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int model_dim,
+    int gate_width,
+    float gate_scale
+) {
+    int head_idx = blockIdx.x;
+    int tokens = batch * seq_len;
+    if (head_idx >= tokens * num_heads) return;
+
+    int token = head_idx / num_heads;
+    int b = token / seq_len;
+    int s = token - b * seq_len;
+    int h = head_idx % num_heads;
+    int hkv = h / (num_heads / num_kv_heads);
+    int y_f32_off = head_idx * head_dim;
+    int v_f32_off = (token * num_kv_heads + hkv) * head_dim;
+    int y_bf16_off = ((b * num_heads + h) * seq_len + s) * head_dim;
+    int v_bf16_off = ((b * num_kv_heads + hkv) * seq_len + s) * head_dim;
+    int tid = threadIdx.x;
+    float gate = gate_values[head_idx];
+
+    __shared__ float reduce_a[256];
+    __shared__ float reduce_b[256];
+
+    float y_dot_v = 0.0f;
+    float v_norm_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float yv = pg_bf16_to_f32(y_bhsd[y_bf16_off + i]);
+        float vv = pg_bf16_to_f32(v_bhsd[v_bf16_off + i]);
+        y_dot_v += yv * vv;
+        v_norm_sq += vv * vv;
+    }
+    reduce_a[tid] = y_dot_v;
+    reduce_b[tid] = v_norm_sq;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_a[tid] += reduce_a[tid + stride];
+            reduce_b[tid] += reduce_b[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float y_dot_v_s;
+    __shared__ float v_norm_sq_s;
+    __shared__ float coeff_s;
+    if (tid == 0) {
+        y_dot_v_s = reduce_a[0];
+        v_norm_sq_s = reduce_b[0] + 1e-8f;
+        coeff_s = y_dot_v_s / v_norm_sq_s;
+    }
+    __syncthreads();
+
+    float grad_gate_part = 0.0f;
+    float go_dot_v = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float yv = pg_bf16_to_f32(y_bhsd[y_bf16_off + i]);
+        float vv = pg_bf16_to_f32(v_bhsd[v_bf16_off + i]);
+        float go = grad_out[y_f32_off + i];
+        float xsa = yv - coeff_s * vv;
+        float gxsa = go * gate;
+        grad_gate_part += go * xsa;
+        go_dot_v += gxsa * vv;
+    }
+    reduce_a[tid] = grad_gate_part;
+    reduce_b[tid] = go_dot_v;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_a[tid] += reduce_a[tid + stride];
+            reduce_b[tid] += reduce_b[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float grad_score_s;
+    __shared__ float go_dot_v_s;
+    if (tid == 0) {
+        grad_score_s = reduce_a[0] * gate_scale * gate * (1.0f - gate);
+        go_dot_v_s = reduce_b[0];
+        grad_score_out[head_idx] = grad_score_s;
+    }
+    __syncthreads();
+
+    float go_coeff = go_dot_v_s / v_norm_sq_s;
+    float v_norm_sq2 = v_norm_sq_s * v_norm_sq_s;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float yv = pg_bf16_to_f32(y_bhsd[y_bf16_off + i]);
+        float vv = pg_bf16_to_f32(v_bhsd[v_bf16_off + i]);
+        float gxsa = grad_out[y_f32_off + i] * gate;
+        grad_y[y_f32_off + i] = gxsa - go_coeff * vv;
+        float gv = -coeff_s * gxsa - go_coeff * yv
+            + (2.0f * y_dot_v_s * go_dot_v_s / v_norm_sq2) * vv;
+        atomicAdd(&grad_v[v_f32_off + i], gv);
+    }
+
+    const float* w = weight + h * gate_width;
+    for (int j = tid; j < gate_width; j += blockDim.x) {
+        atomicAdd(&grad_gate_input[token * model_dim + j], grad_score_s * w[j]);
     }
 }
 
@@ -2166,7 +3869,119 @@ extern "C" __global__ void xsa_backward(
         atomicAdd(&grad_v[v_off + i], gv);
     }
 }
+
+// XSA backward from saved cuDNN BF16 BHSD attention tensors. The public model
+// tensors are logically [B, T, H, D], while cuDNN SDPA stores saved tensors as
+// [B, H, T, D]. This path avoids saving/copying the full F32 attention output
+// and V projection solely for XSA backward.
+extern "C" __global__ void xsa_backward_bf16_bhsd(
+    const unsigned short* __restrict__ y_bhsd,
+    const unsigned short* __restrict__ v_bhsd,
+    const float* __restrict__ grad_output,
+    float* __restrict__ grad_y,
+    float* __restrict__ grad_v,
+    int batch,
+    int seq_len,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    int head_idx = blockIdx.x;
+    int tokens = batch * seq_len;
+    if (head_idx >= tokens * num_heads) return;
+
+    int token = head_idx / num_heads;
+    int b = token / seq_len;
+    int s = token - b * seq_len;
+    int h = head_idx % num_heads;
+    int hkv = h / (num_heads / num_kv_heads);
+    int y_f32_off = head_idx * head_dim;
+    int v_f32_off = (token * num_kv_heads + hkv) * head_dim;
+    int y_bf16_off = ((b * num_heads + h) * seq_len + s) * head_dim;
+    int v_bf16_off = ((b * num_kv_heads + hkv) * seq_len + s) * head_dim;
+
+    float y_dot_v = 0.0f;
+    float v_norm_sq = 0.0f;
+    float go_dot_v = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float yv = pg_bf16_to_f32(y_bhsd[y_bf16_off + i]);
+        float vv = pg_bf16_to_f32(v_bhsd[v_bf16_off + i]);
+        float go = grad_output[y_f32_off + i];
+        y_dot_v += yv * vv;
+        v_norm_sq += vv * vv;
+        go_dot_v += go * vv;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        y_dot_v += __shfl_down_sync(0xffffffff, y_dot_v, offset);
+        v_norm_sq += __shfl_down_sync(0xffffffff, v_norm_sq, offset);
+        go_dot_v += __shfl_down_sync(0xffffffff, go_dot_v, offset);
+    }
+
+    __shared__ float shared_yv[32];
+    __shared__ float shared_vn[32];
+    __shared__ float shared_gv[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_yv[warp_id] = y_dot_v;
+        shared_vn[warp_id] = v_norm_sq;
+        shared_gv[warp_id] = go_dot_v;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        y_dot_v = (threadIdx.x < warps) ? shared_yv[threadIdx.x] : 0.0f;
+        v_norm_sq = (threadIdx.x < warps) ? shared_vn[threadIdx.x] : 0.0f;
+        go_dot_v = (threadIdx.x < warps) ? shared_gv[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            y_dot_v += __shfl_down_sync(0xffffffff, y_dot_v, offset);
+            v_norm_sq += __shfl_down_sync(0xffffffff, v_norm_sq, offset);
+            go_dot_v += __shfl_down_sync(0xffffffff, go_dot_v, offset);
+        }
+    }
+
+    __shared__ float yv_sh;
+    __shared__ float vn_sh;
+    __shared__ float gv_sh;
+    if (threadIdx.x == 0) {
+        yv_sh = y_dot_v;
+        vn_sh = v_norm_sq + 1e-8f;
+        gv_sh = go_dot_v;
+    }
+    __syncthreads();
+    y_dot_v = yv_sh;
+    v_norm_sq = vn_sh;
+    go_dot_v = gv_sh;
+
+    float coeff = y_dot_v / v_norm_sq;
+    float go_coeff = go_dot_v / v_norm_sq;
+    float v_norm_sq2 = v_norm_sq * v_norm_sq;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float yv = pg_bf16_to_f32(y_bhsd[y_bf16_off + i]);
+        float vv = pg_bf16_to_f32(v_bhsd[v_bf16_off + i]);
+        float go = grad_output[y_f32_off + i];
+        grad_y[y_f32_off + i] = go - go_coeff * vv;
+        float gv = -coeff * go - go_coeff * yv + (2.0f * y_dot_v * go_dot_v / v_norm_sq2) * vv;
+        atomicAdd(&grad_v[v_f32_off + i], gv);
+    }
+}
 "#;
+
+fn residual_scale_reduce_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("PG_GPU_RESIDUAL_SCALE_REDUCE")
+                .unwrap_or_else(|_| "0".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
 
 impl GpuKernels {
     /// Initialize GPU kernels by compiling CUDA source to PTX and loading all functions.
@@ -2193,23 +4008,56 @@ impl GpuKernels {
             rms_norm_fwd: module
                 .load_function("rms_norm_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rms_norm_fwd_bf16: module
+                .load_function("rms_norm_forward_bf16")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             rms_norm_bwd: module
                 .load_function("rms_norm_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rms_norm_bwd_go_bf16: module
+                .load_function("rms_norm_backward_go_bf16")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             rms_norm_bwd_accum: module
                 .load_function("rms_norm_backward_accum")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rms_norm_bwd_accum_residual_mix_input: module
+                .load_function("rms_norm_backward_accum_residual_mix_input")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             rms_norm_bwd_residual_mix: module
                 .load_function("rms_norm_backward_accum_residual_mix_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rms_norm_bwd_residual_mix_recompute: module
+                .load_function("rms_norm_backward_accum_residual_mix_backward_recompute")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             leaky_relu_sq_fwd: module
                 .load_function("leaky_relu_sq_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            leaky_relu_sq_fwd_bf16: module
+                .load_function("leaky_relu_sq_forward_bf16")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            leaky_relu_sq_fwd_x_bf16_only: module
+                .load_function("leaky_relu_sq_forward_x_bf16_only")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             leaky_relu_sq_bwd: module
                 .load_function("leaky_relu_sq_backward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            leaky_relu_sq_bwd_bf16: module
+                .load_function("leaky_relu_sq_backward_bf16")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            leaky_relu_sq_bwd_x_bf16: module
+                .load_function("leaky_relu_sq_backward_x_bf16")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            leaky_relu_sq_bwd_x_bf16_only: module
+                .load_function("leaky_relu_sq_backward_x_bf16_only")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             residual_mix: module
                 .load_function("residual_mix")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_mix_rms_norm_fwd: module
+                .load_function("residual_mix_rms_norm_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_mix_rms_norm_fwd_bf16: module
+                .load_function("residual_mix_rms_norm_forward_bf16")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             residual_mix_bwd: module
                 .load_function("residual_mix_backward")
@@ -2217,8 +4065,43 @@ impl GpuKernels {
             residual_add_scale: module
                 .load_function("residual_add_scale")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_bf16_proj: module
+                .load_function("residual_add_scale_bf16_proj")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_from_base: module
+                .load_function("residual_add_scale_from_base")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_from_base_bf16_proj: module
+                .load_function("residual_add_scale_from_base_bf16_proj")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_from_base_rms_norm: module
+                .load_function("residual_add_scale_from_base_rms_norm_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_from_base_rms_norm_bf16: module
+                .load_function("residual_add_scale_from_base_rms_norm_forward_bf16")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_from_base_rms_norm_bf16_proj: module
+                .load_function("residual_add_scale_from_base_rms_norm_forward_bf16_proj")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             residual_add_scale_bwd: module
                 .load_function("residual_add_scale_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_bwd_bf16: module
+                .load_function("residual_add_scale_backward_bf16")
+                .map_err(|e| {
+                PgError::InvalidOp(format!("Failed to load kernel {}", e))
+            })?,
+            residual_add_scale_bwd_from_bf16_only: module
+                .load_function("residual_add_scale_backward_from_bf16_only")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_bwd_bf16_only_atomic: module
+                .load_function("residual_add_scale_backward_bf16_only")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_bwd_bf16_only_no_atomic: module
+                .load_function("residual_add_scale_backward_bf16_only_no_atomic")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_grad_scale_reduce: module
+                .load_function("residual_add_scale_grad_scale_reduce")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             smear_gate_fwd: module
                 .load_function("smear_gate_forward")
@@ -2250,6 +4133,24 @@ impl GpuKernels {
             q_gain_bwd: module
                 .load_function("q_gain_backward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            q_gain_rope_qk_norm_fwd: module
+                .load_function("q_gain_rope_qk_norm_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            q_gain_rope_qk_norm_fwd_bf16_bhsd: module
+                .load_function("q_gain_rope_qk_norm_forward_bf16_bhsd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rope_qk_norm_fwd: module
+                .load_function("rope_qk_norm_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rope_qk_norm_fwd_bf16_bhsd: module
+                .load_function("rope_qk_norm_forward_bf16_bhsd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            q_gain_rope_qk_norm_bwd: module
+                .load_function("q_gain_rope_qk_norm_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            rope_qk_norm_bwd: module
+                .load_function("rope_qk_norm_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             dot_accumulate: module
                 .load_function("dot_accumulate")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -2265,6 +4166,11 @@ impl GpuKernels {
             cross_entropy_bwd_bf16: module
                 .load_function("cross_entropy_backward_bf16")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            cross_entropy_loss_bwd_bf16: module
+                .load_function("cross_entropy_loss_backward_bf16")
+                .map_err(|e| {
+                PgError::InvalidOp(format!("Failed to load kernel {}", e))
+            })?,
             bigram_hash_embed: module
                 .load_function("bigram_hash_embed")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -2297,8 +4203,22 @@ impl GpuKernels {
             sparse_attn_gate_fwd: module
                 .load_function("sparse_attn_gate_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            sparse_attn_gate_xsa_fwd: module
+                .load_function("sparse_attn_gate_xsa_forward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             sparse_attn_gate_bwd: module
                 .load_function("sparse_attn_gate_backward")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            sparse_attn_gate_bwd_stage1: module
+                .load_function("sparse_attn_gate_backward_stage1")
+                .map_err(|e| {
+                PgError::InvalidOp(format!("Failed to load kernel {}", e))
+            })?,
+            sparse_attn_gate_xsa_bwd_bf16_bhsd: module
+                .load_function("sparse_attn_gate_xsa_backward_bf16_bhsd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            sparse_attn_gate_weight_grad: module
+                .load_function("sparse_attn_gate_weight_grad_reduce")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             xsa_fwd: module
                 .load_function("xsa_forward")
@@ -2306,8 +4226,17 @@ impl GpuKernels {
             xsa_bwd: module
                 .load_function("xsa_backward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            xsa_bwd_bf16_bhsd: module
+                .load_function("xsa_backward_bf16_bhsd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             copy_fwd: module
                 .load_function("copy_fwd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            copy_u16_fwd: module
+                .load_function("copy_u16_fwd")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            bthd_to_bhsd_bf16: module
+                .load_function("bthd_to_bhsd_bf16")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             scale_inplace: module
                 .load_function("scale_inplace")
@@ -2320,6 +4249,9 @@ impl GpuKernels {
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             pack_qkv_grads: module
                 .load_function("pack_qkv_grads")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            pack_qkv_grads_bf16: module
+                .load_function("pack_qkv_grads_bf16")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             unpack_qkv_weight_grad: module
                 .load_function("unpack_qkv_weight_grad")
@@ -2379,6 +4311,39 @@ impl GpuKernels {
         Ok(())
     }
 
+    /// RMSNorm forward with an additional BF16 side output for tensor-core consumers.
+    pub fn rms_norm_forward_bf16(
+        &self,
+        x: CudaPtr,
+        y: CudaPtr,
+        y_bf16: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_norm_fwd_bf16)
+                .arg(&x)
+                .arg(&y)
+                .arg(&y_bf16)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("rms_norm_bf16 launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
     /// RMSNorm backward.
     pub fn rms_norm_backward(
         &self,
@@ -2412,6 +4377,41 @@ impl GpuKernels {
         Ok(())
     }
 
+    /// RMSNorm backward where the upstream gradient is BF16. This is used on
+    /// record-shaped BF16 GEMM paths to avoid materializing a full F32
+    /// activation-gradient tensor before the norm boundary.
+    pub fn rms_norm_backward_go_bf16(
+        &self,
+        x: CudaPtr,
+        grad_output_bf16: CudaPtr,
+        grad_input: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_norm_bwd_go_bf16)
+                .arg(&x)
+                .arg(&grad_output_bf16)
+                .arg(&grad_input)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 256,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("rms_norm_bwd_go_bf16 launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
     pub fn copy_fwd(&self, src: CudaPtr, dst: CudaPtr, n: u32) -> PgResult<()> {
         let block = 256u32;
         let grid = (n + block - 1) / block;
@@ -2427,6 +4427,25 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("copy_fwd failed: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn copy_u16_fwd(&self, src: CudaPtr, dst: CudaPtr, n: u32) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.copy_u16_fwd)
+                .arg(&src)
+                .arg(&dst)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("copy_u16_fwd failed: {:?}", e)))?;
         }
         Ok(())
     }
@@ -2543,6 +4562,39 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("pack_qkv_grads failed: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn pack_qkv_grads_bf16(
+        &self,
+        grad_q: CudaPtr,
+        grad_k: CudaPtr,
+        grad_v: CudaPtr,
+        combined: CudaPtr,
+        tokens: u32,
+        d: u32,
+        kv: u32,
+    ) -> PgResult<()> {
+        let n = tokens * (d + 2 * kv);
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.pack_qkv_grads_bf16)
+                .arg(&grad_q)
+                .arg(&grad_k)
+                .arg(&grad_v)
+                .arg(&combined)
+                .arg(&(tokens as i32))
+                .arg(&(d as i32))
+                .arg(&(kv as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("pack_qkv_grads_bf16 failed: {:?}", e)))?;
         }
         Ok(())
     }
@@ -2682,6 +4734,50 @@ impl GpuKernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_backward_accum_residual_mix_input(
+        &self,
+        residual_x: CudaPtr,
+        residual_x0: CudaPtr,
+        mix: CudaPtr,
+        grad_output: CudaPtr,
+        grad_input: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        beta: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_norm_bwd_accum_residual_mix_input)
+                .arg(&residual_x)
+                .arg(&residual_x0)
+                .arg(&mix)
+                .arg(&grad_output)
+                .arg(&grad_input)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&beta)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "rms_norm_bwd_accum_residual_mix_input launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_backward_accum_residual_mix_bwd(
         &self,
         x_norm: CudaPtr,
@@ -2725,6 +4821,56 @@ impl GpuKernels {
                 })
                 .map_err(|e| {
                     PgError::InvalidOp(format!("rms_norm_bwd_residual_mix launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_backward_accum_residual_mix_bwd_recompute(
+        &self,
+        grad_norm: CudaPtr,
+        residual_x: CudaPtr,
+        residual_x0: CudaPtr,
+        mix: CudaPtr,
+        base_grad: CudaPtr,
+        grad_x: CudaPtr,
+        grad_x0: CudaPtr,
+        grad_mix: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        beta: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.rms_norm_bwd_residual_mix_recompute)
+                .arg(&grad_norm)
+                .arg(&residual_x)
+                .arg(&residual_x0)
+                .arg(&mix)
+                .arg(&base_grad)
+                .arg(&grad_x)
+                .arg(&grad_x0)
+                .arg(&grad_mix)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&beta)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "rms_norm_bwd_residual_mix_recompute launch: {:?}",
+                        e
+                    ))
                 })?;
         }
         Ok(())
@@ -2820,6 +4966,58 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn leaky_relu_sq_forward_bf16(
+        &self,
+        x: CudaPtr,
+        y: CudaPtr,
+        y_bf16: CudaPtr,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.leaky_relu_sq_fwd_bf16)
+                .arg(&x)
+                .arg(&y)
+                .arg(&y_bf16)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("leaky_relu_sq_bf16 launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn leaky_relu_sq_forward_x_bf16_only(
+        &self,
+        x_bf16: CudaPtr,
+        y_bf16: CudaPtr,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.leaky_relu_sq_fwd_x_bf16_only)
+                .arg(&x_bf16)
+                .arg(&y_bf16)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("leaky_relu_sq_fwd_x_bf16_only launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
     /// LeakyReLU² backward.
     pub fn leaky_relu_sq_backward(
         &self,
@@ -2843,6 +5041,94 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("leaky_relu_sq_bwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn leaky_relu_sq_backward_bf16(
+        &self,
+        x: CudaPtr,
+        grad_output: CudaPtr,
+        grad_input: CudaPtr,
+        grad_input_bf16: CudaPtr,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.leaky_relu_sq_bwd_bf16)
+                .arg(&x)
+                .arg(&grad_output)
+                .arg(&grad_input)
+                .arg(&grad_input_bf16)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("leaky_relu_sq_bwd_bf16 launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn leaky_relu_sq_backward_x_bf16(
+        &self,
+        x_bf16: CudaPtr,
+        grad_output: CudaPtr,
+        grad_input: CudaPtr,
+        grad_input_bf16: CudaPtr,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.leaky_relu_sq_bwd_x_bf16)
+                .arg(&x_bf16)
+                .arg(&grad_output)
+                .arg(&grad_input)
+                .arg(&grad_input_bf16)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("leaky_relu_sq_bwd_x_bf16 launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn leaky_relu_sq_backward_x_bf16_only(
+        &self,
+        x_bf16: CudaPtr,
+        grad_output: CudaPtr,
+        grad_input_bf16: CudaPtr,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.leaky_relu_sq_bwd_x_bf16_only)
+                .arg(&x_bf16)
+                .arg(&grad_output)
+                .arg(&grad_input_bf16)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("leaky_relu_sq_bwd_x_bf16_only launch: {:?}", e))
+                })?;
         }
         Ok(())
     }
@@ -2874,6 +5160,86 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("residual_mix launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Fused residual mixing and RMSNorm.
+    pub fn residual_mix_rms_norm_fwd(
+        &self,
+        x: CudaPtr,
+        x0: CudaPtr,
+        mix: CudaPtr,
+        mixed: CudaPtr,
+        norm: CudaPtr,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let rows = n / dim.max(1);
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_mix_rms_norm_fwd)
+                .arg(&x)
+                .arg(&x0)
+                .arg(&mix)
+                .arg(&mixed)
+                .arg(&norm)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_mix_rms_norm launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Fused residual mixing and RMSNorm with BF16 norm side output.
+    pub fn residual_mix_rms_norm_fwd_bf16(
+        &self,
+        x: CudaPtr,
+        x0: CudaPtr,
+        mix: CudaPtr,
+        mixed: CudaPtr,
+        norm: CudaPtr,
+        norm_bf16: CudaPtr,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let rows = n / dim.max(1);
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_mix_rms_norm_fwd_bf16)
+                .arg(&x)
+                .arg(&x0)
+                .arg(&mix)
+                .arg(&mixed)
+                .arg(&norm)
+                .arg(&norm_bf16)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_mix_rms_norm_bf16 launch: {:?}", e))
+                })?;
         }
         Ok(())
     }
@@ -2944,6 +5310,233 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn residual_add_scale_bf16_proj_fwd(
+        &self,
+        x: CudaPtr,
+        proj_bf16: CudaPtr,
+        scale: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_bf16_proj)
+                .arg(&x)
+                .arg(&proj_bf16)
+                .arg(&scale)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_add_scale_bf16_proj launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_from_base_fwd(
+        &self,
+        base: CudaPtr,
+        proj: CudaPtr,
+        scale: CudaPtr,
+        out: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_from_base)
+                .arg(&base)
+                .arg(&proj)
+                .arg(&scale)
+                .arg(&out)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_add_scale_from_base launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_from_base_bf16_proj_fwd(
+        &self,
+        base: CudaPtr,
+        proj_bf16: CudaPtr,
+        scale: CudaPtr,
+        out: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_from_base_bf16_proj)
+                .arg(&base)
+                .arg(&proj_bf16)
+                .arg(&scale)
+                .arg(&out)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_from_base_bf16_proj launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn residual_add_scale_from_base_rms_norm_fwd(
+        &self,
+        base: CudaPtr,
+        proj: CudaPtr,
+        scale: CudaPtr,
+        out: CudaPtr,
+        norm: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_from_base_rms_norm)
+                .arg(&base)
+                .arg(&proj)
+                .arg(&scale)
+                .arg(&out)
+                .arg(&norm)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_from_base_rms_norm launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn residual_add_scale_from_base_rms_norm_fwd_bf16(
+        &self,
+        base: CudaPtr,
+        proj: CudaPtr,
+        scale: CudaPtr,
+        out: CudaPtr,
+        norm: CudaPtr,
+        norm_bf16: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_from_base_rms_norm_bf16)
+                .arg(&base)
+                .arg(&proj)
+                .arg(&scale)
+                .arg(&out)
+                .arg(&norm)
+                .arg(&norm_bf16)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_from_base_rms_norm_bf16 launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn residual_add_scale_from_base_rms_norm_fwd_bf16_proj(
+        &self,
+        base: CudaPtr,
+        proj_bf16: CudaPtr,
+        scale: CudaPtr,
+        out: CudaPtr,
+        norm: CudaPtr,
+        norm_bf16: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_from_base_rms_norm_bf16_proj)
+                .arg(&base)
+                .arg(&proj_bf16)
+                .arg(&scale)
+                .arg(&out)
+                .arg(&norm)
+                .arg(&norm_bf16)
+                .arg(&(dim as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 128,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_from_base_rms_norm_bf16_proj launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Residual add-scale backward.
     pub fn residual_add_scale_bwd(
         &self,
@@ -2976,6 +5569,159 @@ impl GpuKernels {
                 })
                 .map_err(|e| {
                     PgError::InvalidOp(format!("residual_add_scale_bwd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_bwd_bf16(
+        &self,
+        proj: CudaPtr,
+        grad_output: CudaPtr,
+        scale: CudaPtr,
+        grad_x_in: CudaPtr,
+        grad_proj: CudaPtr,
+        grad_proj_bf16: CudaPtr,
+        grad_scale: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_bwd_bf16)
+                .arg(&proj)
+                .arg(&grad_output)
+                .arg(&scale)
+                .arg(&grad_x_in)
+                .arg(&grad_proj)
+                .arg(&grad_proj_bf16)
+                .arg(&grad_scale)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_add_scale_bwd_bf16 launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_bwd_bf16_only(
+        &self,
+        proj: CudaPtr,
+        grad_output: CudaPtr,
+        scale: CudaPtr,
+        grad_x_in: CudaPtr,
+        grad_proj_bf16: CudaPtr,
+        grad_scale: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            if !residual_scale_reduce_enabled() {
+                self.stream
+                    .launch_builder(&self.residual_add_scale_bwd_bf16_only_atomic)
+                    .arg(&proj)
+                    .arg(&grad_output)
+                    .arg(&scale)
+                    .arg(&grad_x_in)
+                    .arg(&grad_proj_bf16)
+                    .arg(&grad_scale)
+                    .arg(&(dim as i32))
+                    .arg(&(n as i32))
+                    .launch(cudarc::driver::LaunchConfig {
+                        grid_dim: (grid, 1, 1).into(),
+                        block_dim: (block, 1, 1).into(),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(|e| {
+                        PgError::InvalidOp(format!(
+                            "residual_add_scale_bwd_bf16_only launch: {:?}",
+                            e
+                        ))
+                    })?;
+                return Ok(());
+            }
+            self.stream
+                .launch_builder(&self.residual_add_scale_bwd_bf16_only_no_atomic)
+                .arg(&grad_output)
+                .arg(&scale)
+                .arg(&grad_x_in)
+                .arg(&grad_proj_bf16)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("residual_add_scale_bwd_bf16_only launch: {:?}", e))
+                })?;
+            self.stream
+                .launch_builder(&self.residual_add_scale_grad_scale_reduce)
+                .arg(&proj)
+                .arg(&grad_output)
+                .arg(&grad_scale)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (dim, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_grad_scale_reduce launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_bwd_from_bf16_only(
+        &self,
+        proj_bf16: CudaPtr,
+        grad_output: CudaPtr,
+        scale: CudaPtr,
+        grad_x_in: CudaPtr,
+        grad_proj_bf16: CudaPtr,
+        grad_scale: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        let grid = (n + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_bwd_from_bf16_only)
+                .arg(&proj_bf16)
+                .arg(&grad_output)
+                .arg(&scale)
+                .arg(&grad_x_in)
+                .arg(&grad_proj_bf16)
+                .arg(&grad_scale)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_bwd_from_bf16_only launch: {:?}",
+                        e
+                    ))
                 })?;
         }
         Ok(())
@@ -3298,6 +6044,290 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn q_gain_rope_qk_norm_fwd(
+        &self,
+        q: CudaPtr,
+        q_post_rope: Option<CudaPtr>,
+        gain: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        let q_post_rope = q_post_rope.unwrap_or(CudaPtr(0));
+        unsafe {
+            self.stream
+                .launch_builder(&self.q_gain_rope_qk_norm_fwd)
+                .arg(&q)
+                .arg(&q_post_rope)
+                .arg(&gain)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 4,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("q_gain_rope_qk_norm_fwd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn q_gain_rope_qk_norm_fwd_bf16_bhsd(
+        &self,
+        q: CudaPtr,
+        q_post_rope: Option<CudaPtr>,
+        q_bhsd_bf16: CudaPtr,
+        gain: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        let q_post_rope = q_post_rope.unwrap_or(CudaPtr(0));
+        unsafe {
+            self.stream
+                .launch_builder(&self.q_gain_rope_qk_norm_fwd_bf16_bhsd)
+                .arg(&q)
+                .arg(&q_post_rope)
+                .arg(&q_bhsd_bf16)
+                .arg(&gain)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 4,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("q_gain_rope_qk_norm_fwd_bf16_bhsd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn rope_qk_norm_fwd(
+        &self,
+        k: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_qk_norm_fwd)
+                .arg(&k)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 4,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("rope_qk_norm_fwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_qk_norm_fwd_bf16_bhsd(
+        &self,
+        k: CudaPtr,
+        k_bhsd_bf16: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_qk_norm_fwd_bf16_bhsd)
+                .arg(&k)
+                .arg(&k_bhsd_bf16)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 4,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("rope_qk_norm_fwd_bf16_bhsd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn bthd_to_bhsd_bf16(
+        &self,
+        input: CudaPtr,
+        output: CudaPtr,
+        batch: u32,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+    ) -> PgResult<()> {
+        let total = batch
+            .checked_mul(seq_len)
+            .and_then(|v| v.checked_mul(num_heads))
+            .and_then(|v| v.checked_mul(head_dim))
+            .ok_or_else(|| PgError::InvalidOp("bthd_to_bhsd_bf16 size overflow".into()))?;
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        unsafe {
+            self.stream
+                .launch_builder(&self.bthd_to_bhsd_bf16)
+                .arg(&input)
+                .arg(&output)
+                .arg(&(batch as i32))
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(total as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (grid, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("bthd_to_bhsd_bf16 launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn q_gain_rope_qk_norm_bwd(
+        &self,
+        q_pre_norm: CudaPtr,
+        q_post_rope: CudaPtr,
+        grad_q_scaled: CudaPtr,
+        gain: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        grad_q_proj: CudaPtr,
+        grad_gain: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.q_gain_rope_qk_norm_bwd)
+                .arg(&q_pre_norm)
+                .arg(&q_post_rope)
+                .arg(&grad_q_scaled)
+                .arg(&gain)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&grad_q_proj)
+                .arg(&grad_gain)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 8,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("q_gain_rope_qk_norm_bwd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn rope_qk_norm_bwd(
+        &self,
+        k_pre_norm: CudaPtr,
+        grad_k_attn: CudaPtr,
+        cos_table: CudaPtr,
+        sin_table: CudaPtr,
+        grad_k_proj: CudaPtr,
+        seq_len: u32,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dims: u32,
+        total_heads: u32,
+        eps: f32,
+    ) -> PgResult<()> {
+        let block = 32u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.rope_qk_norm_bwd)
+                .arg(&k_pre_norm)
+                .arg(&grad_k_attn)
+                .arg(&cos_table)
+                .arg(&sin_table)
+                .arg(&grad_k_proj)
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rope_dims as i32))
+                .arg(&(total_heads as i32))
+                .arg(&eps)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 8,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("rope_qk_norm_bwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
     /// out[0] += alpha * dot(a, b)
     pub fn dot_accumulate(
         &self,
@@ -3444,6 +6474,42 @@ impl GpuKernels {
                 })
                 .map_err(|e| {
                     PgError::InvalidOp(format!("cross_entropy_bwd_bf16 launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Fused softcapped cross-entropy loss + backward with BF16 grad logits.
+    pub fn cross_entropy_loss_bwd_bf16(
+        &self,
+        logits: CudaPtr,
+        targets: CudaPtr,
+        losses: CudaPtr,
+        grad_logits: CudaPtr,
+        vocab_size: u32,
+        softcap: f32,
+        grad_loss: f32,
+        num_tokens: u32,
+    ) -> PgResult<()> {
+        let block = 32u32.max(256u32.min(vocab_size.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.cross_entropy_loss_bwd_bf16)
+                .arg(&logits)
+                .arg(&targets)
+                .arg(&losses)
+                .arg(&grad_logits)
+                .arg(&(vocab_size as i32))
+                .arg(&softcap)
+                .arg(&grad_loss)
+                .arg(&(num_tokens as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_tokens, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 256,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("cross_entropy_loss_bwd_bf16 launch: {:?}", e))
                 })?;
         }
         Ok(())
@@ -3857,6 +6923,60 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn sparse_attn_gate_xsa_fwd(
+        &self,
+        y: CudaPtr,
+        v: CudaPtr,
+        gate_input: CudaPtr,
+        weight: CudaPtr,
+        out: CudaPtr,
+        out_bf16: CudaPtr,
+        gate_values: CudaPtr,
+        tokens: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        model_dim: u32,
+        gate_width: u32,
+        gate_scale: f32,
+    ) -> PgResult<()> {
+        if gate_width == 0 || gate_width > model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "invalid SparseAttnGate width {gate_width} for model_dim {model_dim}"
+            )));
+        }
+        let block = 32u32
+            .max(gate_width.max(head_dim).next_power_of_two())
+            .min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.sparse_attn_gate_xsa_fwd)
+                .arg(&y)
+                .arg(&v)
+                .arg(&gate_input)
+                .arg(&weight)
+                .arg(&out)
+                .arg(&out_bf16)
+                .arg(&gate_values)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .arg(&gate_scale)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (tokens * num_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("sparse_attn_gate_xsa_fwd launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn sparse_attn_gate_bwd(
         &self,
         attn_in: CudaPtr,
@@ -3905,6 +7025,168 @@ impl GpuKernels {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("sparse_attn_gate_bwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    pub fn sparse_attn_gate_bwd_two_pass(
+        &self,
+        attn_in: CudaPtr,
+        gate_input: CudaPtr,
+        gate_values_and_grad_score: CudaPtr,
+        grad_out: CudaPtr,
+        weight: CudaPtr,
+        grad_attn_in: CudaPtr,
+        grad_gate_input: CudaPtr,
+        grad_weight: CudaPtr,
+        tokens: u32,
+        num_heads: u32,
+        head_dim: u32,
+        model_dim: u32,
+        gate_width: u32,
+        gate_scale: f32,
+    ) -> PgResult<()> {
+        if gate_width == 0 || gate_width > model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "invalid SparseAttnGate width {gate_width} for model_dim {model_dim}"
+            )));
+        }
+        let block = 32u32
+            .max(gate_width.max(head_dim).next_power_of_two())
+            .min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.sparse_attn_gate_bwd_stage1)
+                .arg(&attn_in)
+                .arg(&gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&grad_out)
+                .arg(&weight)
+                .arg(&grad_attn_in)
+                .arg(&grad_gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .arg(&gate_scale)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (tokens * num_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!("sparse_attn_gate_bwd_stage1 launch: {:?}", e))
+                })?;
+            self.stream
+                .launch_builder(&self.sparse_attn_gate_weight_grad)
+                .arg(&gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&grad_weight)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_heads, gate_width, 1).into(),
+                    block_dim: (256, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "sparse_attn_gate_weight_grad_reduce launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn sparse_attn_gate_xsa_bwd_bf16_bhsd_two_pass(
+        &self,
+        y_bhsd: CudaPtr,
+        v_bhsd: CudaPtr,
+        gate_input: CudaPtr,
+        gate_values_and_grad_score: CudaPtr,
+        grad_out: CudaPtr,
+        weight: CudaPtr,
+        grad_y: CudaPtr,
+        grad_v: CudaPtr,
+        grad_gate_input: CudaPtr,
+        grad_weight: CudaPtr,
+        batch: u32,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        model_dim: u32,
+        gate_width: u32,
+        gate_scale: f32,
+    ) -> PgResult<()> {
+        if gate_width == 0 || gate_width > model_dim {
+            return Err(PgError::InvalidOp(format!(
+                "invalid SparseAttnGate width {gate_width} for model_dim {model_dim}"
+            )));
+        }
+        let tokens = batch
+            .checked_mul(seq_len)
+            .ok_or_else(|| PgError::InvalidOp("SparseAttnGate XSA token count overflow".into()))?;
+        let block = 32u32
+            .max(gate_width.max(head_dim).next_power_of_two())
+            .min(256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.sparse_attn_gate_xsa_bwd_bf16_bhsd)
+                .arg(&y_bhsd)
+                .arg(&v_bhsd)
+                .arg(&gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&grad_out)
+                .arg(&weight)
+                .arg(&grad_y)
+                .arg(&grad_v)
+                .arg(&grad_gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&(batch as i32))
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .arg(&gate_scale)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (tokens * num_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "sparse_attn_gate_xsa_backward_bf16_bhsd launch: {:?}",
+                        e
+                    ))
+                })?;
+            self.stream
+                .launch_builder(&self.sparse_attn_gate_weight_grad)
+                .arg(&gate_input)
+                .arg(&gate_values_and_grad_score)
+                .arg(&grad_weight)
+                .arg(&(tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(model_dim as i32))
+                .arg(&(gate_width as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_heads, gate_width, 1).into(),
+                    block_dim: (256, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "sparse_attn_gate_weight_grad_reduce launch: {:?}",
+                        e
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -3979,6 +7261,45 @@ impl GpuKernels {
                     shared_mem_bytes: 384,
                 })
                 .map_err(|e| PgError::InvalidOp(format!("xsa_bwd launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// XSA backward from saved cuDNN BF16 BHSD tensors.
+    pub fn xsa_bwd_bf16_bhsd(
+        &self,
+        y_bhsd: CudaPtr,
+        v_bhsd: CudaPtr,
+        grad_output: CudaPtr,
+        grad_y: CudaPtr,
+        grad_v: CudaPtr,
+        batch: u32,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> PgResult<()> {
+        let total_heads = batch * seq_len * num_heads;
+        let block = 32u32.max(64u32.min(head_dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.xsa_bwd_bf16_bhsd)
+                .arg(&y_bhsd)
+                .arg(&v_bhsd)
+                .arg(&grad_output)
+                .arg(&grad_y)
+                .arg(&grad_v)
+                .arg(&(batch as i32))
+                .arg(&(seq_len as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (total_heads, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 384,
+                })
+                .map_err(|e| PgError::InvalidOp(format!("xsa_bwd_bf16_bhsd launch: {:?}", e)))?;
         }
         Ok(())
     }
