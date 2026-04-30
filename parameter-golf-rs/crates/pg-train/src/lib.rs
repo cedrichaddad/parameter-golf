@@ -315,10 +315,13 @@ struct CudaSingleFastRuntime {
     backward_state: pg_model::gpu::GpuBackwardState,
     backward_graph: Option<CudaBackwardGraph>,
     backward_graph_seq_len: usize,
+    backward_graph_warmed: bool,
     input_ids: pg_core::GpuTensor,
     targets: pg_core::GpuTensor,
+    token_span_u16: pg_core::GpuTensor,
     host_input_ids: Vec<u32>,
     host_targets: Vec<u32>,
+    host_token_span_u16: Vec<u16>,
     gpu_buf: pg_model::gpu::GpuActivations,
     gpu_grads: pg_model::gpu::GpuGradBuffers,
     gpu_optimizer: GpuOptimizer,
@@ -385,14 +388,21 @@ impl CudaSingleFastRuntime {
             )?,
             backward_graph: None,
             backward_graph_seq_len: 0,
+            backward_graph_warmed: false,
             input_ids: pg_core::GpuTensor::zeros_gpu(
                 stream.clone(),
                 &[tokens],
                 pg_core::DType::U32,
             )?,
             targets: pg_core::GpuTensor::zeros_gpu(stream.clone(), &[tokens], pg_core::DType::U32)?,
+            token_span_u16: pg_core::GpuTensor::zeros_gpu(
+                stream.clone(),
+                &[tokens + 1],
+                pg_core::DType::U16,
+            )?,
             host_input_ids: Vec::with_capacity(tokens),
             host_targets: Vec::with_capacity(tokens),
+            host_token_span_u16: Vec::with_capacity(tokens + 1),
             state_tok_emb: GpuAdamWState::new_like(&gpu_model.weights.tok_emb, stream.clone())?,
             state_bigram_embed: GpuAdamWState::new_like(
                 &gpu_model.weights.bigram_embed,
@@ -516,7 +526,9 @@ struct ShardedBankBuffers {
     shard_grad: pg_core::GpuTensor,
     shard_grad_bf16: pg_core::GpuTensor,
     shard_param: pg_core::GpuTensor,
+    shard_param_bf16: pg_core::GpuTensor,
     padded_param: pg_core::GpuTensor,
+    padded_param_bf16: pg_core::GpuTensor,
     real_batch: usize,
     chunk_batch: usize,
 }
@@ -672,10 +684,20 @@ impl ShardedParallelMuonRuntime {
                             &shard_shape,
                             pg_core::DType::F32,
                         )?,
+                        shard_param_bf16: pg_core::GpuTensor::zeros_gpu(
+                            stream.clone(),
+                            &shard_shape,
+                            pg_core::DType::BF16,
+                        )?,
                         padded_param: pg_core::GpuTensor::zeros_gpu(
                             stream.clone(),
                             &padded_shape,
                             pg_core::DType::F32,
+                        )?,
+                        padded_param_bf16: pg_core::GpuTensor::zeros_gpu(
+                            stream.clone(),
+                            &padded_shape,
+                            pg_core::DType::BF16,
                         )?,
                         real_batch: batch,
                         chunk_batch,
@@ -1041,11 +1063,21 @@ impl VariantRunner {
                             for (loader, replica) in
                                 loaders.iter_mut().zip(runtime.replicas.iter_mut())
                             {
-                                loader.next_batch_u32_into(
-                                    batch_plan.global_batch_tokens,
-                                    &mut replica.host_input_ids,
-                                    &mut replica.host_targets,
-                                )?;
+                                if gpu_shifted_u16_batch_upload_enabled_for_audit() {
+                                    loader.next_batch_shifted_span_u16_into(
+                                        batch_plan.global_batch_tokens,
+                                        &mut replica.host_token_span_u16,
+                                    )?;
+                                    replica.host_input_ids.clear();
+                                    replica.host_targets.clear();
+                                } else {
+                                    loader.next_batch_u32_into(
+                                        batch_plan.global_batch_tokens,
+                                        &mut replica.host_input_ids,
+                                        &mut replica.host_targets,
+                                    )?;
+                                    replica.host_token_span_u16.clear();
+                                }
                             }
                             distributed_batches_preloaded = true;
                             None
@@ -1397,10 +1429,19 @@ impl VariantRunner {
             }
         }
 
+        let export_record_shaped_artifact =
+            mode == RunMode::RecordShapedProxy && record_shaped_artifact_export_enabled();
         let needs_cpu_model_after_training =
-            !matches!(mode, RunMode::Smoke | RunMode::RecordShapedProxy);
+            !matches!(mode, RunMode::Smoke | RunMode::RecordShapedProxy)
+                || export_record_shaped_artifact;
         let sync_t0 = Instant::now();
         if needs_cpu_model_after_training {
+            #[cfg(feature = "cuda")]
+            if let Some(runtime) = cuda_distributed_runtime.as_mut() {
+                if sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit() {
+                    cuda_distributed_sync_f32_banks_from_sharded_muon(runtime)?;
+                }
+            }
             #[cfg(feature = "cuda")]
             if let Some(runtime) = cuda_single_fast_runtime.as_ref() {
                 runtime
@@ -1425,7 +1466,8 @@ impl VariantRunner {
 
         let artifact_t0 = Instant::now();
         let artifact_bytes = match mode {
-            RunMode::Smoke | RunMode::RecordShapedProxy => None,
+            RunMode::Smoke => None,
+            RunMode::RecordShapedProxy if !export_record_shaped_artifact => None,
             _ => {
                 let artifact_path = std::path::Path::new(&self.run_spec.train.artifact_path);
                 let exported = pg_quant::export::export_model_with_spec(
@@ -1442,7 +1484,7 @@ impl VariantRunner {
             }
         };
         timing.artifact_export_ms += artifact_t0.elapsed().as_secs_f64() * 1000.0;
-        let submission_code_bytes = artifact_bytes.map(|_| current_executable_bytes());
+        let submission_code_bytes = artifact_bytes.and_then(|_| current_executable_bytes());
         let submission_total_bytes = artifact_bytes
             .zip(submission_code_bytes)
             .map(|(a, c)| a + c);
@@ -1857,12 +1899,27 @@ fn cuda_fast_accumulate_runtime_grads(
     mut timing: Option<&mut RunTiming>,
 ) -> PgResult<f32> {
     let h2d_t0 = Instant::now();
-    runtime
-        .input_ids
-        .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_input_ids))?;
-    runtime
-        .targets
-        .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_targets))?;
+    if gpu_shifted_u16_batch_upload_enabled_for_audit()
+        && runtime.host_token_span_u16.len() == runtime.input_ids.numel() + 1
+    {
+        runtime
+            .token_span_u16
+            .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_token_span_u16))?;
+        let stream = runtime.gpu_model.kernels.stream();
+        runtime.gpu_model.kernels.shifted_u16_to_u32(
+            pg_kernels::gpu_kernels::CudaPtr(runtime.token_span_u16.cu_ptr(stream)?),
+            pg_kernels::gpu_kernels::CudaPtr(runtime.input_ids.cu_ptr(stream)?),
+            pg_kernels::gpu_kernels::CudaPtr(runtime.targets.cu_ptr(stream)?),
+            runtime.input_ids.numel() as u32,
+        )?;
+    } else {
+        runtime
+            .input_ids
+            .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_input_ids))?;
+        runtime
+            .targets
+            .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_targets))?;
+    }
     if let Some(timing) = timing.as_deref_mut() {
         timing.cuda_h2d_ms += h2d_t0.elapsed().as_secs_f64() * 1000.0;
     }
@@ -1912,6 +1969,19 @@ fn cuda_fast_accumulate_runtime_grads_no_loss_graph(
     if runtime.backward_graph.is_some() {
         runtime.backward_graph = None;
         runtime.backward_graph_seq_len = 0;
+    }
+
+    if !runtime.backward_graph_warmed {
+        runtime.gpu_model.backward_with_state_seq_len_no_loss(
+            &runtime.input_ids,
+            &runtime.targets,
+            &mut runtime.gpu_buf,
+            &mut runtime.backward_state,
+            &mut runtime.gpu_grads,
+            runtime_seq_len,
+        )?;
+        runtime.backward_graph_warmed = true;
+        return Ok(());
     }
 
     stream
@@ -2260,27 +2330,29 @@ fn cuda_fast_apply_updates_inner(
         &mut runtime.state_tok_emb,
         embed_hyper,
     )?;
-    runtime.gpu_optimizer.adamw_step(
-        &runtime.gpu_model.kernels,
-        &runtime.gpu_model.weights.bigram_embed,
-        &runtime.gpu_grads.bigram_embed,
-        &mut runtime.state_bigram_embed,
-        embed_hyper,
-    )?;
-    runtime.gpu_optimizer.adamw_step(
-        &runtime.gpu_model.kernels,
-        &runtime.gpu_model.weights.bigram_proj,
-        &runtime.gpu_grads.bigram_proj,
-        &mut runtime.state_bigram_proj,
-        embed_hyper,
-    )?;
-    runtime.gpu_optimizer.adamw_step(
-        &runtime.gpu_model.kernels,
-        &runtime.gpu_model.weights.bigram_scale_param,
-        &runtime.gpu_grads.bigram_scale,
-        &mut runtime.state_bigram_scale,
-        scalar_hyper,
-    )?;
+    if runtime.gpu_model.config.bigram_vocab_size > 0 && runtime.gpu_model.config.bigram_dim > 0 {
+        runtime.gpu_optimizer.adamw_step(
+            &runtime.gpu_model.kernels,
+            &runtime.gpu_model.weights.bigram_embed,
+            &runtime.gpu_grads.bigram_embed,
+            &mut runtime.state_bigram_embed,
+            embed_hyper,
+        )?;
+        runtime.gpu_optimizer.adamw_step(
+            &runtime.gpu_model.kernels,
+            &runtime.gpu_model.weights.bigram_proj,
+            &runtime.gpu_grads.bigram_proj,
+            &mut runtime.state_bigram_proj,
+            embed_hyper,
+        )?;
+        runtime.gpu_optimizer.adamw_step(
+            &runtime.gpu_model.kernels,
+            &runtime.gpu_model.weights.bigram_scale_param,
+            &runtime.gpu_grads.bigram_scale,
+            &mut runtime.state_bigram_scale,
+            scalar_hyper,
+        )?;
+    }
     runtime.gpu_optimizer.adamw_step(
         &runtime.gpu_model.kernels,
         &runtime.gpu_model.weights.smear_gate,
@@ -2520,10 +2592,13 @@ fn pack_all_gpu_grads(
     macro_rules! pack_one {
         ($tensor:expr) => {{
             let tensor = $tensor;
-            let end = offset + tensor.numel();
-            let dst = packed.slice_range(offset, end)?;
-            copy_gpu_tensor(kernels, tensor, &dst)?;
-            offset = end;
+            let len = tensor.numel();
+            if len > 0 {
+                let end = offset + len;
+                let dst = packed.slice_range(offset, end)?;
+                copy_gpu_tensor(kernels, tensor, &dst)?;
+                offset = end;
+            }
         }};
     }
 
@@ -2582,10 +2657,13 @@ fn unpack_all_gpu_grads(
     macro_rules! unpack_one {
         ($tensor:expr) => {{
             let tensor = $tensor;
-            let end = offset + tensor.numel();
-            let src = packed.slice_range(offset, end)?;
-            copy_gpu_tensor(kernels, &src, tensor)?;
-            offset = end;
+            let len = tensor.numel();
+            if len > 0 {
+                let end = offset + len;
+                let src = packed.slice_range(offset, end)?;
+                copy_gpu_tensor(kernels, &src, tensor)?;
+                offset = end;
+            }
         }};
     }
 
@@ -2644,10 +2722,13 @@ fn pack_non_bank_gpu_grads(
     macro_rules! pack_one {
         ($tensor:expr) => {{
             let tensor = $tensor;
-            let end = offset + tensor.numel();
-            let dst = packed.slice_range(offset, end)?;
-            copy_gpu_tensor(kernels, tensor, &dst)?;
-            offset = end;
+            let len = tensor.numel();
+            if len > 0 {
+                let end = offset + len;
+                let dst = packed.slice_range(offset, end)?;
+                copy_gpu_tensor(kernels, tensor, &dst)?;
+                offset = end;
+            }
         }};
     }
 
@@ -2702,10 +2783,13 @@ fn unpack_non_bank_gpu_grads(
     macro_rules! unpack_one {
         ($tensor:expr) => {{
             let tensor = $tensor;
-            let end = offset + tensor.numel();
-            let src = packed.slice_range(offset, end)?;
-            copy_gpu_tensor(kernels, &src, tensor)?;
-            offset = end;
+            let len = tensor.numel();
+            if len > 0 {
+                let end = offset + len;
+                let src = packed.slice_range(offset, end)?;
+                copy_gpu_tensor(kernels, &src, tensor)?;
+                offset = end;
+            }
         }};
     }
 
@@ -2846,6 +2930,22 @@ fn bank_param(replica: &CudaSingleFastRuntime, bank_idx: usize) -> PgResult<&pg_
 }
 
 #[cfg(feature = "cuda")]
+fn bank_param_bf16(
+    replica: &CudaSingleFastRuntime,
+    bank_idx: usize,
+) -> PgResult<&pg_core::GpuTensor> {
+    match bank_idx {
+        0 => Ok(&replica.gpu_model.weights.qo_bank_bf16),
+        1 => Ok(&replica.gpu_model.weights.kv_bank_bf16),
+        2 => Ok(&replica.gpu_model.weights.mlp_up_bank_bf16),
+        3 => Ok(&replica.gpu_model.weights.mlp_down_bank_bf16),
+        _ => Err(pg_core::PgError::InvalidOp(format!(
+            "invalid bank index {bank_idx}"
+        ))),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn bank_grad(replica: &CudaSingleFastRuntime, bank_idx: usize) -> PgResult<&pg_core::GpuTensor> {
     match bank_idx {
         0 => Ok(&replica.gpu_grads.qo_bank),
@@ -2887,6 +2987,7 @@ fn cuda_distributed_sharded_parallel_muon_step(
         .first()
         .map(|replica| replica.banks.len())
         .unwrap_or(0);
+    let bf16_shadow_all_gather = sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit();
     if runtime
         .parallel_muon
         .as_ref()
@@ -2910,7 +3011,6 @@ fn cuda_distributed_sharded_parallel_muon_step(
             for rank in 0..world_size {
                 let replica = &runtime.replicas[rank];
                 let kernels = &replica.gpu_model.kernels;
-                let param = bank_param(replica, bank_idx)?;
                 let grad = bank_grad(replica, bank_idx)?;
                 let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
                 if buffers.real_batch < buffers.padded_grad.shape()[0] {
@@ -2940,14 +3040,17 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 let shard_start = rank * buffers.chunk_batch;
                 let shard_end = (shard_start + buffers.chunk_batch).min(buffers.real_batch);
                 if shard_start < shard_end {
-                    let real_count = shard_end - shard_start;
-                    let param_src = param.slice_range(shard_start, shard_end)?;
-                    let param_dst = buffers.shard_param.slice_range(0, real_count)?;
-                    kernels.copy_fwd(
-                        pg_kernels::gpu_kernels::CudaPtr(param_src.cu_ptr(kernels.stream())?),
-                        pg_kernels::gpu_kernels::CudaPtr(param_dst.cu_ptr(kernels.stream())?),
-                        param_src.numel() as u32,
-                    )?;
+                    if !bf16_shadow_all_gather || step == 0 {
+                        let real_count = shard_end - shard_start;
+                        let param = bank_param(replica, bank_idx)?;
+                        let param_src = param.slice_range(shard_start, shard_end)?;
+                        let param_dst = buffers.shard_param.slice_range(0, real_count)?;
+                        kernels.copy_fwd(
+                            pg_kernels::gpu_kernels::CudaPtr(param_src.cu_ptr(kernels.stream())?),
+                            pg_kernels::gpu_kernels::CudaPtr(param_dst.cu_ptr(kernels.stream())?),
+                            param_src.numel() as u32,
+                        )?;
+                    }
                 }
             }
         }
@@ -3098,22 +3201,31 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 grad.numel() as u32,
             )?;
         }
+    }
+    if !sharded_parallel_muon_fused_global_clip_enabled_for_audit() {
         let parallel_muon = runtime
             .parallel_muon
             .as_ref()
             .expect("validated sharded Parallel Muon runtime");
-        for buffers in &parallel_muon.replicas[rank].banks {
-            let active_batch = sharded_bank_real_batch(buffers, rank);
-            if active_batch == 0 {
-                continue;
+        for rank in 0..world_size {
+            let replica = &runtime.replicas[rank];
+            let kernels = &replica.gpu_model.kernels;
+            let scratch = pg_kernels::gpu_kernels::CudaPtr(
+                replica.grad_norm_scratch.cu_ptr(kernels.stream())?,
+            );
+            for buffers in &parallel_muon.replicas[rank].banks {
+                let active_batch = sharded_bank_real_batch(buffers, rank);
+                if active_batch == 0 {
+                    continue;
+                }
+                let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
+                kernels.clip_by_global_norm(
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
+                    scratch,
+                    train_config.grad_clip_norm,
+                    shard_grad.numel() as u32,
+                )?;
             }
-            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
-            kernels.clip_by_global_norm(
-                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
-                scratch,
-                train_config.grad_clip_norm,
-                shard_grad.numel() as u32,
-            )?;
         }
     }
 
@@ -3136,34 +3248,82 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 sharded_replica.muon.lr = train_config.matrix_lr * lr_scale;
                 sharded_replica.muon.momentum = train_config.muon_momentum_at(step);
                 sharded_replica.muon.weight_decay = train_config.muon_wd;
-                sharded_replica.muon.step_bank(
-                    &replica.gpu_model.kernels,
-                    bank_idx,
-                    &shard_param,
-                    &shard_grad,
-                )?;
+                if sharded_parallel_muon_fused_global_clip_enabled_for_audit() {
+                    sharded_replica.muon.step_bank_with_global_clip(
+                        &replica.gpu_model.kernels,
+                        bank_idx,
+                        &shard_param,
+                        &shard_grad,
+                        Some(&replica.grad_norm_scratch),
+                        train_config.grad_clip_norm,
+                    )?;
+                } else {
+                    sharded_replica.muon.step_bank(
+                        &replica.gpu_model.kernels,
+                        bank_idx,
+                        &shard_param,
+                        &shard_grad,
+                    )?;
+                }
+                if bf16_shadow_all_gather {
+                    replica.gpu_model.kernels.f32_to_bf16(
+                        pg_kernels::gpu_kernels::CudaPtr(
+                            shard_param.cu_ptr(replica.gpu_model.kernels.stream())?,
+                        ),
+                        pg_kernels::gpu_kernels::CudaPtr(
+                            buffers
+                                .shard_param_bf16
+                                .cu_ptr(replica.gpu_model.kernels.stream())?,
+                        ),
+                        buffers.shard_param.numel() as u32,
+                    )?;
+                }
             }
-            cudarc::nccl::group_start()
-                .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+        }
+
+        cudarc::nccl::group_start()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+        for bank_idx in 0..bank_count {
             for rank in 0..world_size {
                 let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
-                runtime.comms[rank]
-                    .all_gather_tensor_f32(&buffers.shard_param, &mut buffers.padded_param)?;
+                if bf16_shadow_all_gather {
+                    runtime.comms[rank].all_gather_tensor_bf16(
+                        &buffers.shard_param_bf16,
+                        &mut buffers.padded_param_bf16,
+                    )?;
+                } else {
+                    runtime.comms[rank]
+                        .all_gather_tensor_f32(&buffers.shard_param, &mut buffers.padded_param)?;
+                }
             }
-            cudarc::nccl::group_end()
-                .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+        }
+        cudarc::nccl::group_end()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
 
+        for bank_idx in 0..bank_count {
             for rank in 0..world_size {
                 let replica = &runtime.replicas[rank];
                 let kernels = &replica.gpu_model.kernels;
-                let param = bank_param(replica, bank_idx)?;
                 let buffers = &parallel_muon.replicas[rank].banks[bank_idx];
-                let gathered_real = buffers.padded_param.slice_range(0, buffers.real_batch)?;
-                kernels.copy_fwd(
-                    pg_kernels::gpu_kernels::CudaPtr(gathered_real.cu_ptr(kernels.stream())?),
-                    pg_kernels::gpu_kernels::CudaPtr(param.cu_ptr(kernels.stream())?),
-                    param.numel() as u32,
-                )?;
+                if bf16_shadow_all_gather {
+                    let param_bf16 = bank_param_bf16(replica, bank_idx)?;
+                    let gathered_real = buffers
+                        .padded_param_bf16
+                        .slice_range(0, buffers.real_batch)?;
+                    kernels.copy_u16_fwd(
+                        pg_kernels::gpu_kernels::CudaPtr(gathered_real.cu_ptr(kernels.stream())?),
+                        pg_kernels::gpu_kernels::CudaPtr(param_bf16.cu_ptr(kernels.stream())?),
+                        param_bf16.numel() as u32,
+                    )?;
+                } else {
+                    let param = bank_param(replica, bank_idx)?;
+                    let gathered_real = buffers.padded_param.slice_range(0, buffers.real_batch)?;
+                    kernels.copy_fwd(
+                        pg_kernels::gpu_kernels::CudaPtr(gathered_real.cu_ptr(kernels.stream())?),
+                        pg_kernels::gpu_kernels::CudaPtr(param.cu_ptr(kernels.stream())?),
+                        param.numel() as u32,
+                    )?;
+                }
             }
         }
     }
@@ -3183,7 +3343,13 @@ fn cuda_distributed_sharded_parallel_muon_step(
     let non_bank_t0 = Instant::now();
     for replica in runtime.replicas.iter_mut() {
         cuda_fast_apply_non_bank_updates_unclipped(replica, train_config, step, lr_scale)?;
-        replica.gpu_model.refresh_bf16_shadows()?;
+        if bf16_shadow_all_gather {
+            replica
+                .gpu_model
+                .refresh_bf16_non_bank_shadows_after_sharded_bank_update()?;
+        } else {
+            replica.gpu_model.refresh_bf16_shadows()?;
+        }
     }
     let non_bank_host_ms = non_bank_t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(starts) = non_bank_start_events {
@@ -3195,6 +3361,57 @@ fn cuda_distributed_sharded_parallel_muon_step(
         timing.cuda_non_bank_update_ms += non_bank_host_ms;
     }
     runtime.distributed_sync = true;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_distributed_sync_f32_banks_from_sharded_muon(
+    runtime: &mut CudaDistributedRuntime,
+) -> PgResult<()> {
+    let world_size = runtime.replicas.len();
+    let bank_count = runtime
+        .parallel_muon
+        .as_ref()
+        .ok_or_else(|| {
+            pg_core::PgError::InvalidOp("sharded Parallel Muon runtime was not initialized".into())
+        })?
+        .replicas
+        .first()
+        .map(|replica| replica.banks.len())
+        .unwrap_or(0);
+
+    {
+        let parallel_muon = runtime
+            .parallel_muon
+            .as_mut()
+            .expect("validated sharded Parallel Muon runtime");
+        cudarc::nccl::group_start()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+        for bank_idx in 0..bank_count {
+            for rank in 0..world_size {
+                let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
+                runtime.comms[rank]
+                    .all_gather_tensor_f32(&buffers.shard_param, &mut buffers.padded_param)?;
+            }
+        }
+        cudarc::nccl::group_end()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+
+        for bank_idx in 0..bank_count {
+            for rank in 0..world_size {
+                let replica = &runtime.replicas[rank];
+                let kernels = &replica.gpu_model.kernels;
+                let buffers = &parallel_muon.replicas[rank].banks[bank_idx];
+                let param = bank_param(replica, bank_idx)?;
+                let gathered_real = buffers.padded_param.slice_range(0, buffers.real_batch)?;
+                kernels.copy_fwd(
+                    pg_kernels::gpu_kernels::CudaPtr(gathered_real.cu_ptr(kernels.stream())?),
+                    pg_kernels::gpu_kernels::CudaPtr(param.cu_ptr(kernels.stream())?),
+                    param.numel() as u32,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3566,6 +3783,20 @@ fn record_path_audit_json(
         model_compute_dtype_label(run_spec),
     ));
     fields.push(json_str_field(
+        "model_family",
+        &format!("{:?}", run_spec.model.family),
+    ));
+    fields.push(format!("\"num_layers\":{}", run_spec.model.num_layers));
+    fields.push(format!("\"model_dim\":{}", run_spec.model.model_dim));
+    fields.push(format!("\"num_heads\":{}", run_spec.model.num_heads));
+    fields.push(format!("\"num_kv_heads\":{}", run_spec.model.num_kv_heads));
+    fields.push(format!("\"mlp_mult\":{}", run_spec.model.mlp_mult));
+    fields.push(format!("\"qk_gain_init\":{}", run_spec.model.qk_gain_init));
+    fields.push(format!(
+        "\"logit_softcap\":{}",
+        run_spec.model.logit_softcap
+    ));
+    fields.push(json_str_field(
         "model_precision_target",
         model_precision_target_label(run_spec),
     ));
@@ -3612,6 +3843,18 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"sharded_parallel_muon_grouped_grad_collectives\":{}",
         sharded_parallel_muon && sharded_grouped_grad_collectives_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"sharded_parallel_muon_grouped_all_gather\":{}",
+        sharded_parallel_muon
+    ));
+    fields.push(format!(
+        "\"sharded_parallel_muon_fused_global_clip\":{}",
+        sharded_parallel_muon && sharded_parallel_muon_fused_global_clip_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"sharded_parallel_muon_bf16_shadow_all_gather\":{}",
+        sharded_parallel_muon && sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit()
     ));
     fields.push(format!(
         "\"sharded_parallel_muon_host_scalar_sync\":{}",
@@ -3668,6 +3911,75 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"value_embedding_layers\":{}",
         run_spec.model.to_model_config().ve_layers.len()
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar\":{}",
+        run_spec.model.caseops.enabled && run_spec.model.caseops.byte_sidecar
+    ));
+    fields.push(format!(
+        "\"sparse_attn_gate_enabled\":{}",
+        run_spec.model.sparse_attn_gate.enabled
+    ));
+    fields.push(format!(
+        "\"sparse_attn_gate_width\":{}",
+        run_spec.model.sparse_attn_gate.width
+    ));
+    fields.push(format!(
+        "\"sparse_attn_gate_scale\":{}",
+        run_spec.model.sparse_attn_gate.scale
+    ));
+    fields.push(format!("\"matrix_lr\":{}", run_spec.train.matrix_lr));
+    fields.push(format!("\"min_lr_scale\":{}", run_spec.train.min_lr_scale));
+    fields.push(format!("\"warmup_steps\":{}", run_spec.train.warmup_steps));
+    fields.push(format!(
+        "\"warmdown_iters\":{}",
+        run_spec.train.to_train_config().warmdown_iters
+    ));
+    fields.push(format!(
+        "\"warmdown_frac\":{}",
+        run_spec.train.warmdown_frac
+    ));
+    fields.push(format!("\"adam_beta2\":{}", run_spec.train.adam_beta2));
+    fields.push(format!(
+        "\"quant_matrix_bits\":{}",
+        run_spec.quant.matrix_bits
+    ));
+    fields.push(format!(
+        "\"quant_embed_bits\":{}",
+        run_spec.quant.embed_bits
+    ));
+    fields.push(format!(
+        "\"quant_attn_gate_bits\":{}",
+        run_spec.quant.attn_gate_bits
+    ));
+    fields.push(format!(
+        "\"quant_mlp_clip_sigmas\":{}",
+        run_spec.quant.mlp_clip_sigmas
+    ));
+    fields.push(format!(
+        "\"quant_attn_clip_sigmas\":{}",
+        run_spec.quant.attn_clip_sigmas
+    ));
+    fields.push(format!(
+        "\"quant_embed_clip_sigmas\":{}",
+        run_spec.quant.embed_clip_sigmas
+    ));
+    fields.push(format!(
+        "\"quant_gptq_calibration_batches\":{}",
+        run_spec.quant.gptq_calibration_batches
+    ));
+    fields.push(json_str_field(
+        "quant_compression",
+        &format!("{:?}", run_spec.quant.compression),
+    ));
+    fields.push(format!("\"lqer_enabled\":{}", run_spec.quant.lqer.enabled));
+    fields.push(format!("\"lqer_rank\":{}", run_spec.quant.lqer.rank));
+    fields.push(format!("\"lqer_top_k\":{}", run_spec.quant.lqer.top_k));
+    fields.push(format!("\"lqer_a_bits\":{}", run_spec.quant.lqer.a_bits));
+    fields.push(format!("\"lqer_b_bits\":{}", run_spec.quant.lqer.b_bits));
+    fields.push(format!(
+        "\"lqer_group_size\":{}",
+        run_spec.quant.lqer.group_size
     ));
     fields.push(format!(
         "\"bf16_forward_projection_gemm\":{}",
@@ -3746,6 +4058,10 @@ fn record_path_audit_json(
         bf16_attention_projection_output_enabled_for_audit(run_spec)
     ));
     fields.push(format!(
+        "\"bf16_attention_backward_tail\":{}",
+        bf16_attention_backward_tail_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
         "\"final_norm_bf16_side_output\":{}",
         final_norm_bf16_side_output_enabled_for_audit(run_spec)
     ));
@@ -3799,6 +4115,10 @@ fn record_path_audit_json(
             && fused_qk_rope_gain_forward_enabled_for_audit()
     ));
     fields.push(format!(
+        "\"prepacked_bf16_qkv_freshness_checked\":{}",
+        cudnn_prepacked_bf16_attention_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
         "\"cudnn_prepacked_bf16_poison_check\":{}",
         cudnn_prepacked_bf16_poison_check_enabled_for_audit(run_spec)
     ));
@@ -3838,6 +4158,10 @@ fn record_path_audit_json(
         "\"production_fused_output_projection_ce\":{}",
         production_fused_output_projection_ce_enabled_for_audit(run_spec)
     ));
+    fields.push(format!(
+        "\"chunked_bf16_output_ce_cache\":{}",
+        chunked_bf16_output_ce_cache_enabled_for_audit(run_spec)
+    ));
     let tiled_output_ce = tiled_output_cross_entropy_enabled_for_audit(run_spec);
     fields.push(format!(
         "\"tiled_output_cross_entropy\":{}",
@@ -3852,8 +4176,17 @@ fn record_path_audit_json(
         output_ce_tile_vocab_for_audit()
     ));
     fields.push(format!(
+        "\"output_ce_chunk_tokens\":{}",
+        output_ce_chunk_tokens_for_audit()
+    ));
+    fields.push(format!(
         "\"materializes_full_logits\":{}",
         output_path_materializes_full_logits_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"materializes_full_bf16_logits\":{}",
+        chunked_bf16_output_ce_cache_enabled_for_audit(run_spec)
+            && output_path_materializes_full_logits_for_audit(run_spec)
     ));
     fields.push(format!(
         "\"smear_gate_boundary_token_id\":{}",
@@ -3864,6 +4197,10 @@ fn record_path_audit_json(
             .unwrap_or_else(|| "null".to_string())
     ));
     fields.push(format!(
+        "\"smeargate_bos_doc_mask\":{}",
+        run_spec.model.smear_gate_boundary_token_id.is_some()
+    ));
+    fields.push(format!(
         "\"gpu_lora_prefix_doc_ttt_schedule\":{}",
         run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased
             && run_spec.eval.phased_ttt_prefix_docs > 0
@@ -3872,6 +4209,20 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"gpu_lora_prefix_docs\":{}",
         run_spec.eval.phased_ttt_prefix_docs
+    ));
+    fields.push(format!("\"gpu_lora_rank\":{}", run_spec.eval.lora_rank));
+    fields.push(format!("\"gpu_lora_alpha\":{}", run_spec.eval.lora_alpha));
+    fields.push(format!(
+        "\"gpu_lora_phased_ttt_phases\":{}",
+        run_spec.eval.phased_ttt_phases
+    ));
+    fields.push(format!(
+        "\"gpu_lora_phased_ttt_weight_decay\":{}",
+        run_spec.eval.phased_ttt_weight_decay
+    ));
+    fields.push(format!(
+        "\"gpu_lora_ttt_beta2\":{}",
+        run_spec.eval.ttt_beta2
     ));
     fields.push(format!(
         "\"frontier_record_ready\":{}",
@@ -3919,10 +4270,25 @@ fn record_path_audit_json(
     ));
     fields.push(format!(
         "\"record_host_batch_u32_preload\":{}",
-        is_record_shaped_mode(mode) && run_spec.train.backend == TrainBackend::CudaDistributed
+        is_record_shaped_mode(mode)
+            && run_spec.train.backend == TrainBackend::CudaDistributed
+            && !gpu_shifted_u16_batch_upload_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"record_host_shifted_u16_span_upload\":{}",
+        is_record_shaped_mode(mode)
+            && run_spec.train.backend == TrainBackend::CudaDistributed
+            && gpu_shifted_u16_batch_upload_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"gpu_shifted_target_construction\":{}",
+        gpu_shifted_u16_batch_upload_enabled_for_audit()
     ));
     fields.push("\"gpu_resident_data_sampler\":false".to_string());
-    fields.push("\"host_input_copy_per_step\":true".to_string());
+    fields.push(format!(
+        "\"host_input_copy_per_step\":{}",
+        !gpu_shifted_u16_batch_upload_enabled_for_audit()
+    ));
     fields.push(format!(
         "\"tokenizer_vocab_configured\":{}",
         run_spec.eval.tokenizer_vocab_path.is_some()
@@ -4056,6 +4422,29 @@ fn residual_scale_reduce_enabled_for_audit() -> bool {
     )
 }
 
+fn sharded_parallel_muon_fused_global_clip_enabled_for_audit() -> bool {
+    // v72/v73 H100 record-shaped runs showed this saves isolated bank-update time
+    // but regresses total step time. Keep it available for A/Bs, but do not let it
+    // replace the measured-better standalone shard clipping path by default.
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_FUSED_GLOBAL_CLIP")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn bf16_qkv_dx_output_enabled_for_audit(run_spec: &RunSpec) -> bool {
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && bf16_backward_projection_gemm_enabled(run_spec)
@@ -4165,6 +4554,21 @@ fn bf16_attention_projection_output_enabled_for_audit(run_spec: &RunSpec) -> boo
         && bf16_backward_projection_gemm_enabled(run_spec)
         && matches!(
             std::env::var("PG_GPU_BF16_ATTN_PROJ_OUTPUT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
+fn bf16_attention_backward_tail_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && run_spec.model.attention_backend == AttentionBackend::CudnnSdpaBf16
+        && bf16_backward_projection_gemm_enabled(run_spec)
+        && fused_qk_rope_gain_backward_enabled_for_audit()
+        && cudnn_saved_bf16_attention_enabled_for_audit(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_ATTN_BACKWARD_TAIL")
                 .unwrap_or_default()
                 .to_ascii_lowercase()
                 .as_str(),
@@ -4393,6 +4797,7 @@ fn bf16_output_logits_enabled_for_audit(run_spec: &RunSpec) -> bool {
         && bf16_output_projection_gemm_enabled(run_spec)
         && bf16_output_backward_gemm_enabled(run_spec)
         && !tiled_output_cross_entropy_enabled_for_audit(run_spec)
+        && !chunked_bf16_output_ce_cache_enabled_for_audit(run_spec)
         && matches!(
             std::env::var("PG_GPU_BF16_LOGITS")
                 .unwrap_or_else(|_| "0".to_string())
@@ -4400,6 +4805,14 @@ fn bf16_output_logits_enabled_for_audit(run_spec: &RunSpec) -> bool {
                 .as_str(),
             "1" | "true" | "yes" | "on"
         )
+}
+
+fn output_ce_chunk_tokens_for_audit() -> usize {
+    std::env::var("PG_GPU_OUTPUT_CE_CHUNK_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(8192)
 }
 
 fn output_ce_tile_vocab_for_audit() -> usize {
@@ -4410,10 +4823,24 @@ fn output_ce_tile_vocab_for_audit() -> usize {
         .unwrap_or(512)
 }
 
+fn chunked_bf16_output_ce_cache_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+        && bf16_output_projection_gemm_enabled(run_spec)
+        && bf16_output_backward_gemm_enabled(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_CHUNKED_OUTPUT_CE_CACHE")
+                .unwrap_or_else(|_| "0".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
 fn tiled_output_cross_entropy_enabled_for_audit(run_spec: &RunSpec) -> bool {
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && bf16_output_projection_gemm_enabled(run_spec)
         && bf16_output_backward_gemm_enabled(run_spec)
+        && !chunked_bf16_output_ce_cache_enabled_for_audit(run_spec)
         && run_spec.model.vocab_size % output_ce_tile_vocab_for_audit() == 0
         && matches!(
             std::env::var("PG_GPU_TILED_OUTPUT_CE")
@@ -4425,6 +4852,10 @@ fn tiled_output_cross_entropy_enabled_for_audit(run_spec: &RunSpec) -> bool {
 }
 
 fn output_path_materializes_full_logits_for_audit(run_spec: &RunSpec) -> bool {
+    if chunked_bf16_output_ce_cache_enabled_for_audit(run_spec) {
+        let chunk_tokens = output_ce_chunk_tokens_for_audit();
+        return chunk_tokens >= run_spec.train.batch_tokens / run_spec.train.world_size.max(1);
+    }
     if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
         return true;
     }
@@ -4435,7 +4866,13 @@ fn output_path_materializes_full_logits_for_audit(run_spec: &RunSpec) -> bool {
 }
 
 fn output_loss_backend_for_audit(run_spec: &RunSpec) -> &'static str {
-    if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
+    if chunked_bf16_output_ce_cache_enabled_for_audit(run_spec) {
+        if output_path_materializes_full_logits_for_audit(run_spec) {
+            "full_batch_bf16_logits_cache"
+        } else {
+            "chunked_bf16_logits_cache"
+        }
+    } else if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
         if bf16_output_logits_enabled_for_audit(run_spec) {
             "full_logits_bf16_single_gemm"
         } else {
@@ -4462,6 +4899,26 @@ fn gpu_host_scalar_updates_enabled_for_audit() -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "0" | "false" | "no" | "off"
+    )
+}
+
+fn gpu_shifted_u16_batch_upload_enabled_for_audit() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHIFTED_U16_BATCH_UPLOAD")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn record_shaped_artifact_export_enabled() -> bool {
+    matches!(
+        std::env::var("PG_RECORD_SHAPED_EXPORT_ARTIFACT")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -4536,6 +4993,9 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         if bf16_attention_output_bridge_to_f32_for_audit(run_spec) {
             gaps.push("record-grade cuDNN SDPA must keep the attention output on the BF16 projection path; current config still bridges BF16 attention output back to F32");
         }
+        if !bf16_attention_backward_tail_enabled_for_audit(run_spec) {
+            gaps.push("record-grade cuDNN SDPA backward must keep dQ/dK in the BF16 tail through QK/RoPE/gain backward; current config promotes attention gradients back to F32 immediately");
+        }
         if gpu_saved_layer_activations_mode_for_audit().to_ascii_lowercase() != "all"
             || !direct_saved_layer_activations_enabled_for_audit()
             || !skip_f32_attention_saved_activations_enabled_for_audit(run_spec)
@@ -4552,8 +5012,14 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         }
     }
     if !production_fused_output_projection_ce_enabled_for_audit(run_spec) {
-        if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
-            gaps.push("current GPU output path still materializes full [batch_tokens, vocab] logits; the measured tiled-CE workaround is not sufficient, so the remaining record cut is a real fused output projection + softcapped CE/backward kernel");
+        if chunked_bf16_output_ce_cache_enabled_for_audit(run_spec) {
+            if output_path_materializes_full_logits_for_audit(run_spec) {
+                gaps.push("PG_GPU_CHUNKED_OUTPUT_CE_CACHE is enabled, but output_ce_chunk_tokens covers the full local batch, so the output path still materializes a full [batch_tokens, vocab] BF16 scratch tensor");
+            } else {
+                gaps.push("PG_GPU_CHUNKED_OUTPUT_CE_CACHE avoids persistent full logits and avoids tiled-CE GEMM recompute, but it is still a bounded scratch-cache bridge rather than the final no-cache fused output projection + softcapped CE/backward kernel");
+            }
+        } else if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
+            gaps.push("current GPU output path still materializes full [batch_tokens, vocab] logits; the remaining record cut is a real fused output projection + softcapped CE/backward kernel or the chunked BF16 CE cache bridge");
         } else if output_path_materializes_full_logits_for_audit(run_spec) {
             gaps.push("PG_GPU_TILED_OUTPUT_CE is enabled, but output_ce_tile_vocab is >= vocab_size, so the output path still materializes a full [batch_tokens, vocab] scratch tile");
         } else {
@@ -4629,7 +5095,7 @@ fn record_max_ms_per_step_for_submission() -> f64 {
     std::env::var("PG_RECORD_MAX_MS_PER_STEP")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(150.0)
+        .unwrap_or(130.0)
 }
 
 #[cfg(feature = "cuda")]
@@ -4640,7 +5106,14 @@ fn eval_gpu_lora_phased_from_train(
     token_bytes: &[f32],
 ) -> PgResult<(f64, f64)> {
     let cfg = pg_eval::gpu_lora_ttt::GpuLoraPhasedTttConfig::from_plan(plan, tokens.len());
-    pg_eval::gpu_lora_ttt::eval_gpu_lora_phased_ttt(model, plan, tokens, token_bytes, &cfg)
+    pg_eval::gpu_lora_ttt::eval_gpu_lora_phased_ttt_distributed(
+        model,
+        plan,
+        tokens,
+        token_bytes,
+        &cfg,
+        plan.run_spec.train.world_size.max(1),
+    )
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -4963,22 +5436,23 @@ fn scale_cpu_grads(grads: &mut GradBuffers, scale: f32) {
     scale_slice(&mut grads.ve_layer_scales, scale);
 }
 
-fn current_executable_bytes() -> usize {
+fn current_executable_bytes() -> Option<usize> {
     if let Ok(value) = std::env::var("PG_SUBMISSION_CODE_BYTES") {
         if let Ok(bytes) = value.parse::<usize>() {
-            return bytes;
+            return Some(bytes);
         }
+        return None;
     }
     if let Ok(path) = std::env::var("PG_SUBMISSION_CODE_DIR") {
         if let Ok(bytes) = directory_regular_file_bytes(std::path::Path::new(&path)) {
-            return bytes;
+            return Some(bytes);
         }
+        return None;
     }
     std::env::current_exe()
         .ok()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len() as usize)
-        .unwrap_or(0)
 }
 
 fn directory_regular_file_bytes(path: &std::path::Path) -> std::io::Result<usize> {

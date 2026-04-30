@@ -303,6 +303,41 @@ impl NcclComm {
             .map_err(|e| PgError::Nccl(format!("all_gather_tensor_f32 failed: {e:?}")))
     }
 
+    pub fn all_gather_tensor_bf16(&self, send: &GpuTensor, recv: &mut GpuTensor) -> PgResult<()> {
+        if send.dtype() != crate::DType::BF16 || recv.dtype() != crate::DType::BF16 {
+            return Err(PgError::Nccl(format!(
+                "all_gather_tensor_bf16 requires BF16 tensors, got {:?} -> {:?}",
+                send.dtype(),
+                recv.dtype()
+            )));
+        }
+        if recv.numel() != send.numel() * self.world_size {
+            return Err(PgError::Nccl(format!(
+                "all_gather_tensor_bf16 shape mismatch: recv elements {} must equal send elements {} * world_size {}",
+                recv.numel(),
+                send.numel(),
+                self.world_size
+            )));
+        }
+        let stream = self.comm()?.stream();
+        let send_ptr = send.cu_ptr(&stream)?;
+        let recv_ptr = recv.cu_ptr(&stream)?;
+        let raw_send = RawBf16Buffer {
+            ptr: send_ptr,
+            len: send.numel(),
+            stream: stream.clone(),
+        };
+        let mut raw_recv = RawBf16Buffer {
+            ptr: recv_ptr,
+            len: recv.numel(),
+            stream,
+        };
+        self.comm()?
+            .all_gather::<_, _, bf16>(&raw_send, &mut raw_recv)
+            .map(|_| ())
+            .map_err(|e| PgError::Nccl(format!("all_gather_tensor_bf16 failed: {e:?}")))
+    }
+
     fn comm(&self) -> PgResult<&Comm> {
         self.comm.as_ref().ok_or_else(|| {
             PgError::Nccl(

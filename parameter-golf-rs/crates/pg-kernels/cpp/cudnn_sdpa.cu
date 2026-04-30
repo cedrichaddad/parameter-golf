@@ -173,6 +173,30 @@ __global__ void bf16_bhsd_to_bthd_f32_kernel(
     out[out_idx] = __bfloat162float(in[in_idx]);
 }
 
+__global__ void bf16_bhsd_to_bthd_bf16_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int batch,
+    int seq,
+    int heads,
+    int head_dim,
+    size_t n
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= n) {
+        return;
+    }
+    int d = static_cast<int>(out_idx % head_dim);
+    size_t tmp = out_idx / head_dim;
+    int h = static_cast<int>(tmp % heads);
+    tmp /= heads;
+    int t = static_cast<int>(tmp % seq);
+    int b = static_cast<int>(tmp / seq);
+    size_t in_idx =
+        (((static_cast<size_t>(b) * heads + h) * seq + t) * head_dim) + d;
+    out[out_idx] = in[in_idx];
+}
+
 int convert_f32_to_bf16(cudaStream_t stream, const float* in, void* out, size_t n) {
     if (n == 0) {
         return 0;
@@ -240,6 +264,33 @@ int convert_bf16_bhsd_to_bthd_f32(
     bf16_bhsd_to_bthd_f32_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(in),
         out,
+        batch,
+        seq,
+        heads,
+        head_dim,
+        n);
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : static_cast<int>(err);
+}
+
+int convert_bf16_bhsd_to_bthd_bf16(
+    cudaStream_t stream,
+    const void* in,
+    void* out,
+    int batch,
+    int seq,
+    int heads,
+    int head_dim
+) {
+    const size_t n = static_cast<size_t>(batch) * seq * heads * head_dim;
+    if (n == 0) {
+        return 0;
+    }
+    int threads = 256;
+    int blocks = static_cast<int>((n + threads - 1) / threads);
+    bf16_bhsd_to_bthd_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(in),
+        reinterpret_cast<__nv_bfloat16*>(out),
         batch,
         seq,
         heads,
@@ -1047,6 +1098,113 @@ int run_cudnn_sdpa_bf16_f32_backward_with_saved_bf16_stats(
         stream,
         cache->dv_bf16.ptr,
         reinterpret_cast<float*>(grad_v_ptr),
+        batch,
+        seq_len,
+        num_kv_heads,
+        head_dim);
+    if (rc != 0) return 4800 + rc;
+    return 0;
+}
+
+int run_cudnn_sdpa_bf16_f32_backward_with_saved_bf16_stats_bf16_grads(
+    void* stream_ptr,
+    uint64_t q_bf16_ptr,
+    uint64_t k_bf16_ptr,
+    uint64_t v_bf16_ptr,
+    uint64_t out_bf16_ptr,
+    uint64_t grad_out_ptr,
+    uint64_t grad_q_bf16_ptr,
+    uint64_t grad_k_bf16_ptr,
+    uint64_t grad_v_bf16_ptr,
+    uint64_t stats_ptr,
+    int tokens,
+    int seq_len,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim
+) {
+    if (!valid_shape(tokens, seq_len, num_heads, num_kv_heads, head_dim)) {
+        return 1;
+    }
+    if (q_bf16_ptr == 0 || k_bf16_ptr == 0 || v_bf16_ptr == 0 || out_bf16_ptr == 0) {
+        return 3;
+    }
+    if (grad_q_bf16_ptr == 0 || grad_k_bf16_ptr == 0 || grad_v_bf16_ptr == 0) {
+        return 4;
+    }
+    int device = 0;
+    cudaError_t dev_err = cudaGetDevice(&device);
+    if (dev_err != cudaSuccess) {
+        return 1200 + static_cast<int>(dev_err);
+    }
+    Key key{device, tokens / seq_len, seq_len, num_heads, num_kv_heads, head_dim};
+    auto cache = get_cache(key);
+    std::lock_guard<std::mutex> cache_lock(cache->mutex);
+    int status = ensure_cache(*cache, key);
+    if (status != 0) {
+        return status;
+    }
+    if (stats_ptr == 0 && !cache->has_forward_stats) {
+        return 2;
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudnnStatus_t stream_status = cudnnSetStream(cache->handle, stream);
+    if (stream_status != CUDNN_STATUS_SUCCESS) {
+        return 2500 + static_cast<int>(stream_status);
+    }
+
+    const int batch = tokens / seq_len;
+    int rc = convert_f32_bthd_to_bhsd_bf16(
+        stream,
+        reinterpret_cast<const float*>(grad_out_ptr),
+        cache->do_bf16.ptr,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim);
+    if (rc != 0) return 4400 + rc;
+
+    void* stats_storage =
+        stats_ptr == 0 ? cache->stats.ptr : reinterpret_cast<void*>(stats_ptr);
+
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
+        {Q_UID, reinterpret_cast<void*>(q_bf16_ptr)},
+        {K_UID, reinterpret_cast<void*>(k_bf16_ptr)},
+        {V_UID, reinterpret_cast<void*>(v_bf16_ptr)},
+        {O_UID, reinterpret_cast<void*>(out_bf16_ptr)},
+        {DO_UID, cache->do_bf16.ptr},
+        {STATS_UID, stats_storage},
+        {DQ_UID, cache->dq_bf16.ptr},
+        {DK_UID, cache->dk_bf16.ptr},
+        {DV_UID, cache->dv_bf16.ptr},
+    };
+    auto exec_status = cache->bwd_graph->execute(cache->handle, pack, cache->workspace.ptr);
+    if (!exec_status.is_good()) {
+        return 4500;
+    }
+    rc = convert_bf16_bhsd_to_bthd_bf16(
+        stream,
+        cache->dq_bf16.ptr,
+        reinterpret_cast<void*>(grad_q_bf16_ptr),
+        batch,
+        seq_len,
+        num_heads,
+        head_dim);
+    if (rc != 0) return 4600 + rc;
+    rc = convert_bf16_bhsd_to_bthd_bf16(
+        stream,
+        cache->dk_bf16.ptr,
+        reinterpret_cast<void*>(grad_k_bf16_ptr),
+        batch,
+        seq_len,
+        num_kv_heads,
+        head_dim);
+    if (rc != 0) return 4700 + rc;
+    rc = convert_bf16_bhsd_to_bthd_bf16(
+        stream,
+        cache->dv_bf16.ptr,
+        reinterpret_cast<void*>(grad_v_bf16_ptr),
         batch,
         seq_len,
         num_kv_heads,

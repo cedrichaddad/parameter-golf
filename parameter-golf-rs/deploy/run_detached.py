@@ -101,39 +101,72 @@ def _add_per_step_timing_metrics(metrics: dict[str, object]) -> None:
         metrics[f"{key}_per_step"] = float(value) / float(steps)
 
 
+def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bool):
+    # Matches the best measured record-shaped profile line. Keep this as an
+    # explicit opt-in so slow correctness baselines remain easy to run.
+    os.environ["PG_CUDA_EVENT_TIMING"] = "1"
+    os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1" if stage_timing else "0"
+    os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "all"
+    os.environ["PG_GPU_DIRECT_SAVED_ACTS"] = "1"
+    os.environ["PG_GPU_BF16_PRIMARY_FORWARD_GEMM"] = "1"
+    os.environ["PG_GPU_BF16_LOGITS"] = "1"
+    os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
+    os.environ["PG_GPU_FUSED_QKV_PROJ"] = "1"
+    os.environ["PG_GPU_FUSED_QKV_PROJ_RECORD_OK"] = "1"
+    os.environ["PG_GPU_BF16_MLP_UP_OUTPUT"] = "1"
+    os.environ["PG_GPU_BF16_NORM_SIDE_OUTPUTS"] = "1"
+    os.environ["PG_GPU_BF16_NORM_GRAD_PATH"] = "1"
+    os.environ["PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT"] = "1"
+    os.environ["PG_GPU_BF16_ATTN_PROJ_OUTPUT"] = "1"
+    os.environ["PG_GPU_FINAL_NORM_BF16_OUTPUT"] = "1"
+    os.environ["PG_GPU_CUDNN_PREPACKED_BF16_ATTN"] = "1"
+    os.environ["PG_GPU_CUDNN_PREPACKED_BF16_POISON"] = "1" if poison_prepacked_qkv else "0"
+    os.environ["PG_GPU_BF16_SPARSE_XSA_FWD"] = "1"
+    os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_BWD"] = "1"
+    os.environ["PG_GPU_HOST_SCALAR_UPDATES"] = "0"
+    os.environ["PG_GPU_MUON_NS_PROFILE"] = "polar_express"
+    os.environ.setdefault("PG_NCCL_BF16_BANK_GRAD_WIRE", "1")
+    os.environ.setdefault("PG_NCCL_GROUP_SHARDED_GRAD_COLLECTIVES", "1")
+    os.environ.setdefault("PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER", "1")
+    os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "1"
+    os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
+    # v82 H100 A/B regressed this path (278.9 ms/step vs v76 251.7 ms).
+    # Keep it as an explicit A/B flag until the downstream BF16 QKV gradient
+    # pack path is complete enough to offset the cuDNN BF16-gradient overhead.
+    os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "0"
+    os.environ["PG_GPU_BF16_QKV_DX_OUTPUT"] = "1"
+    os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
+    os.environ["PG_GPU_CHUNKED_OUTPUT_CE_CACHE"] = "1"
+    os.environ.setdefault("PG_GPU_OUTPUT_CE_CHUNK_TOKENS", "8192")
+    # v87 H100 A/B regressed this path (267.3 ms/step vs v86 256.8 ms).
+    # Keep compact U16 upload as an explicit A/B flag, but do not ship it in
+    # the fastest record-shaped profile until the sampler is fully GPU-resident.
+    os.environ["PG_GPU_SHIFTED_U16_BATCH_UPLOAD"] = "0"
+    os.environ["PG_GPU_SPLIT_RESIDUAL_MIX_GRAD"] = "0"
+    os.environ.setdefault("PG_RECORD_TIMING_SKIP_STEPS", "2")
+
+
 def _apply_gpu_env_flags(forwarded: list[str]):
     if "--frontier-fast-record-profile" in forwarded:
         forwarded.remove("--frontier-fast-record-profile")
-        # Matches the best measured record-shaped profile line. Keep this as an
-        # explicit opt-in so slow correctness baselines remain easy to run.
-        os.environ["PG_CUDA_EVENT_TIMING"] = "1"
-        os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1"
-        os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "all"
-        os.environ["PG_GPU_DIRECT_SAVED_ACTS"] = "1"
-        os.environ["PG_GPU_BF16_PRIMARY_FORWARD_GEMM"] = "1"
-        os.environ["PG_GPU_BF16_LOGITS"] = "1"
-        os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
-        os.environ["PG_GPU_FUSED_QKV_PROJ"] = "1"
-        os.environ["PG_GPU_FUSED_QKV_PROJ_RECORD_OK"] = "1"
-        os.environ["PG_GPU_BF16_MLP_UP_OUTPUT"] = "1"
-        os.environ["PG_GPU_BF16_NORM_SIDE_OUTPUTS"] = "1"
-        os.environ["PG_GPU_BF16_NORM_GRAD_PATH"] = "1"
-        os.environ["PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT"] = "1"
-        os.environ["PG_GPU_BF16_ATTN_PROJ_OUTPUT"] = "1"
-        os.environ["PG_GPU_FINAL_NORM_BF16_OUTPUT"] = "1"
-        os.environ["PG_GPU_CUDNN_PREPACKED_BF16_ATTN"] = "1"
-        os.environ["PG_GPU_CUDNN_PREPACKED_BF16_POISON"] = "1"
-        os.environ["PG_GPU_BF16_SPARSE_XSA_FWD"] = "1"
-        os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_BWD"] = "1"
-        os.environ["PG_GPU_HOST_SCALAR_UPDATES"] = "0"
-        os.environ["PG_GPU_MUON_NS_PROFILE"] = "polar_express"
-        os.environ.setdefault("PG_NCCL_BF16_BANK_GRAD_WIRE", "0")
-        os.environ.setdefault("PG_NCCL_GROUP_SHARDED_GRAD_COLLECTIVES", "0")
-        os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "1"
-        os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
-        os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
-        os.environ["PG_GPU_SPLIT_RESIDUAL_MIX_GRAD"] = "0"
-        os.environ.setdefault("PG_RECORD_TIMING_SKIP_STEPS", "2")
+        _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=True)
+    if "--frontier-throughput-record-profile" in forwarded:
+        forwarded.remove("--frontier-throughput-record-profile")
+        _apply_frontier_fast_record_env(stage_timing=False, poison_prepacked_qkv=False)
+    if "--frontier-graph-record-profile" in forwarded:
+        forwarded.remove("--frontier-graph-record-profile")
+        _apply_frontier_fast_record_env(stage_timing=False, poison_prepacked_qkv=False)
+        os.environ["PG_CUDA_BACKWARD_GRAPH"] = "1"
+        os.environ["PG_CUDA_BACKWARD_GRAPH_STRICT"] = "1"
+    if "--chunked-residual-mix-bwd" in forwarded:
+        forwarded.remove("--chunked-residual-mix-bwd")
+        os.environ["PG_GPU_CHUNKED_RESIDUAL_MIX_BWD"] = "1"
+    if "--recompute-residual-mix-norm-inputs" in forwarded:
+        forwarded.remove("--recompute-residual-mix-norm-inputs")
+        os.environ["PG_GPU_RECOMPUTE_RESIDUAL_MIX_NORM_INPUTS"] = "1"
+    if "--bf16-qkv-dx-output" in forwarded:
+        forwarded.remove("--bf16-qkv-dx-output")
+        os.environ["PG_GPU_BF16_QKV_DX_OUTPUT"] = "1"
     if "--cuda-event-timing" in forwarded:
         forwarded.remove("--cuda-event-timing")
         os.environ["PG_CUDA_EVENT_TIMING"] = "1"
@@ -176,6 +209,18 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         if idx + 1 >= len(forwarded):
             raise RuntimeError("--eval-gpu-world-size requires a positive integer")
         os.environ["PG_EVAL_GPU_WORLD_SIZE"] = forwarded[idx + 1]
+        del forwarded[idx : idx + 2]
+    if "--submission-code-bytes" in forwarded:
+        idx = forwarded.index("--submission-code-bytes")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--submission-code-bytes requires a byte count")
+        os.environ["PG_SUBMISSION_CODE_BYTES"] = forwarded[idx + 1]
+        del forwarded[idx : idx + 2]
+    if "--submission-code-dir" in forwarded:
+        idx = forwarded.index("--submission-code-dir")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--submission-code-dir requires a path")
+        os.environ["PG_SUBMISSION_CODE_DIR"] = forwarded[idx + 1]
         del forwarded[idx : idx + 2]
     if "--skip-first-step-timing" in forwarded:
         forwarded.remove("--skip-first-step-timing")
@@ -229,6 +274,19 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-tiled-output-ce" in forwarded:
         forwarded.remove("--disable-tiled-output-ce")
         os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
+    if "--enable-chunked-output-ce-cache" in forwarded:
+        forwarded.remove("--enable-chunked-output-ce-cache")
+        os.environ["PG_GPU_CHUNKED_OUTPUT_CE_CACHE"] = "1"
+        os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
+    if "--disable-chunked-output-ce-cache" in forwarded:
+        forwarded.remove("--disable-chunked-output-ce-cache")
+        os.environ["PG_GPU_CHUNKED_OUTPUT_CE_CACHE"] = "0"
+    if "--output-ce-chunk-tokens" in forwarded:
+        idx = forwarded.index("--output-ce-chunk-tokens")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--output-ce-chunk-tokens requires a token count")
+        os.environ["PG_GPU_OUTPUT_CE_CHUNK_TOKENS"] = forwarded[idx + 1]
+        del forwarded[idx : idx + 2]
     if "--output-ce-tile-vocab" in forwarded:
         idx = forwarded.index("--output-ce-tile-vocab")
         if idx + 1 >= len(forwarded):
@@ -379,12 +437,33 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-residual-scale-reduce" in forwarded:
         forwarded.remove("--disable-residual-scale-reduce")
         os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "0"
+    if "--bf16-shadow-all-gather" in forwarded:
+        forwarded.remove("--bf16-shadow-all-gather")
+        os.environ["PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER"] = "1"
+    if "--disable-bf16-shadow-all-gather" in forwarded:
+        forwarded.remove("--disable-bf16-shadow-all-gather")
+        os.environ["PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER"] = "0"
     if "--enable-chunked-q-gain-bwd" in forwarded:
         forwarded.remove("--enable-chunked-q-gain-bwd")
         os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
     if "--disable-chunked-q-gain-bwd" in forwarded:
         forwarded.remove("--disable-chunked-q-gain-bwd")
         os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "0"
+    if "--enable-bf16-attn-backward-tail" in forwarded:
+        forwarded.remove("--enable-bf16-attn-backward-tail")
+        os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "1"
+    if "--disable-bf16-attn-backward-tail" in forwarded:
+        forwarded.remove("--disable-bf16-attn-backward-tail")
+        os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "0"
+    if "--enable-shifted-u16-batch-upload" in forwarded:
+        forwarded.remove("--enable-shifted-u16-batch-upload")
+        os.environ["PG_GPU_SHIFTED_U16_BATCH_UPLOAD"] = "1"
+    if "--disable-shifted-u16-batch-upload" in forwarded:
+        forwarded.remove("--disable-shifted-u16-batch-upload")
+        os.environ["PG_GPU_SHIFTED_U16_BATCH_UPLOAD"] = "0"
+    if "--export-record-shaped-artifact" in forwarded:
+        forwarded.remove("--export-record-shaped-artifact")
+        os.environ["PG_RECORD_SHAPED_EXPORT_ARTIFACT"] = "1"
     if "--enable-chunked-residual-mix-bwd" in forwarded:
         forwarded.remove("--enable-chunked-residual-mix-bwd")
         os.environ["PG_GPU_CHUNKED_RESIDUAL_MIX_BWD"] = "1"
@@ -467,6 +546,8 @@ def _run_pg_train(args: list[str], label: str):
         forwarded.extend(["--caseops-byte-sidecar", os.environ["PG_CASEOPS_BYTE_SIDECAR"]])
     if mode != "record" and "--eval-max-tokens" not in forwarded:
         forwarded.extend(["--eval-max-tokens", os.environ.get("PG_EVAL_MAX_TOKENS", "16384")])
+    if not forwarded or forwarded[0] not in {"run", "sweep"}:
+        forwarded.insert(0, "run")
     cmd = ["pg-train"] + forwarded
     print(f"Running {label} command:", " ".join(cmd), flush=True)
     print(

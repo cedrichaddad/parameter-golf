@@ -84,6 +84,8 @@ pub enum VariantFamily {
     RecurrenceMidSp8192,
     ParallelResidSp8192,
     HybridCompetitiveSp8192,
+    #[serde(rename = "frontier_1855_like")]
+    Frontier1855Like,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -129,6 +131,7 @@ pub enum CompressionMode {
     #[default]
     Zstd22,
     Lzma9,
+    Pergroup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -370,6 +373,27 @@ impl ModelSpec {
                 spec.bigram.vocab_size = 3072;
                 spec.bigram.dim = 112;
             }
+            VariantFamily::Frontier1855Like => {
+                spec.attention_backend = AttentionBackend::CudnnSdpaBf16;
+                spec.compute_precision = ModelComputePrecision::Bf16TensorCore;
+                spec.mlp_mult = 4.0;
+                spec.xsa_last_n = spec.num_layers;
+                spec.qk_gain_init = 5.0;
+                spec.value_embedding.enabled = false;
+                spec.value_embedding.layers.clear();
+                spec.recurrence.enabled = true;
+                spec.recurrence.start_layer = 4;
+                spec.recurrence.repeat_layers = 2;
+                spec.parallel_residual.enabled = true;
+                spec.parallel_residual.split_attention_mlp = true;
+                spec.caseops.enabled = true;
+                spec.caseops.byte_sidecar = true;
+                spec.sparse_attn_gate.enabled = true;
+                spec.sparse_attn_gate.width = 12;
+                spec.sparse_attn_gate.scale = 0.5;
+                spec.bigram.enabled = false;
+                spec.smear_gate_boundary_token_id = Some(1);
+            }
         }
         spec
     }
@@ -445,6 +469,7 @@ pub struct TrainSpec {
     pub warmup_steps: usize,
     pub total_iterations: usize,
     pub warmdown_iters: usize,
+    pub warmdown_frac: f32,
     pub min_lr_scale: f32,
     pub max_wallclock_seconds: f32,
     pub matrix_lr: f32,
@@ -457,6 +482,7 @@ pub struct TrainSpec {
     pub muon_momentum_warmup_steps: usize,
     pub muon_wd: f32,
     pub adam_wd: f32,
+    pub adam_beta2: f32,
     pub ema_decay: f32,
     pub late_qat_threshold: f32,
 }
@@ -477,6 +503,7 @@ impl Default for TrainSpec {
             warmup_steps: 20,
             total_iterations: 9_000,
             warmdown_iters: 3_500,
+            warmdown_frac: 0.0,
             min_lr_scale: 0.0,
             max_wallclock_seconds: 600.0,
             matrix_lr: 0.025,
@@ -489,6 +516,7 @@ impl Default for TrainSpec {
             muon_momentum_warmup_steps: 1_500,
             muon_wd: 0.04,
             adam_wd: 0.04,
+            adam_beta2: 0.95,
             ema_decay: 0.997,
             late_qat_threshold: 0.15,
         }
@@ -497,6 +525,11 @@ impl Default for TrainSpec {
 
 impl TrainSpec {
     pub fn to_train_config(&self) -> TrainConfig {
+        let warmdown_iters = if self.warmdown_frac > 0.0 {
+            ((self.total_iterations as f32) * self.warmdown_frac).round() as usize
+        } else {
+            self.warmdown_iters
+        };
         TrainConfig {
             matrix_lr: self.matrix_lr,
             scalar_lr: self.scalar_lr,
@@ -509,11 +542,11 @@ impl TrainSpec {
             muon_wd: self.muon_wd,
             newton_schulz_steps: 5,
             adam_beta1: 0.9,
-            adam_beta2: 0.95,
+            adam_beta2: self.adam_beta2,
             adam_eps: 1e-8,
             adam_wd: self.adam_wd,
             warmup_steps: self.warmup_steps,
-            warmdown_iters: self.warmdown_iters,
+            warmdown_iters,
             total_iterations: self.total_iterations,
             min_lr_scale: self.min_lr_scale,
             max_wallclock_seconds: self.max_wallclock_seconds,
@@ -544,6 +577,13 @@ pub struct QuantSpec {
     pub prune_keep_ratio: Option<f32>,
     pub lqer: LqerSpec,
     pub compression: CompressionMode,
+    pub matrix_bits: u8,
+    pub embed_bits: u8,
+    pub attn_gate_bits: u8,
+    pub mlp_clip_sigmas: f32,
+    pub attn_clip_sigmas: f32,
+    pub embed_clip_sigmas: f32,
+    pub gptq_calibration_batches: usize,
     pub target_artifact_bytes: usize,
 }
 
@@ -552,6 +592,7 @@ pub struct QuantSpec {
 pub struct LqerSpec {
     pub enabled: bool,
     pub rank: usize,
+    pub top_k: usize,
     pub a_bits: u8,
     pub b_bits: u8,
     pub group_size: usize,
@@ -563,6 +604,7 @@ impl Default for LqerSpec {
         Self {
             enabled: false,
             rank: 4,
+            top_k: 3,
             a_bits: 2,
             b_bits: 4,
             group_size: 64,
@@ -579,6 +621,13 @@ impl Default for QuantSpec {
             prune_keep_ratio: None,
             lqer: LqerSpec::default(),
             compression: CompressionMode::Zstd22,
+            matrix_bits: 6,
+            embed_bits: 8,
+            attn_gate_bits: 8,
+            mlp_clip_sigmas: 12.0,
+            attn_clip_sigmas: 13.0,
+            embed_clip_sigmas: 14.0,
+            gptq_calibration_batches: 0,
             target_artifact_bytes: 16_000_000,
         }
     }
@@ -596,6 +645,7 @@ pub struct EvalSpec {
     pub phased_ttt_prefix_docs: usize,
     pub phased_ttt_phases: usize,
     pub phased_ttt_weight_decay: f32,
+    pub ttt_beta2: f32,
     pub chunk_tokens: usize,
     pub tokenizer_vocab_path: Option<String>,
     pub caseops_byte_sidecar_pattern: Option<String>,
@@ -614,6 +664,7 @@ impl Default for EvalSpec {
             phased_ttt_prefix_docs: 2_000,
             phased_ttt_phases: 3,
             phased_ttt_weight_decay: 1.0,
+            ttt_beta2: 0.99,
             chunk_tokens: 32_768,
             tokenizer_vocab_path: None,
             caseops_byte_sidecar_pattern: None,

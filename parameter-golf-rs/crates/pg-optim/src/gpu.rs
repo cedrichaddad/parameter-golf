@@ -212,6 +212,18 @@ impl GpuMuon {
         param: &GpuTensor,
         grad: &GpuTensor,
     ) -> PgResult<()> {
+        self.step_bank_with_global_clip(kernels, bank_idx, param, grad, None, 0.0)
+    }
+
+    pub fn step_bank_with_global_clip(
+        &mut self,
+        kernels: &GpuKernels,
+        bank_idx: usize,
+        param: &GpuTensor,
+        grad: &GpuTensor,
+        global_norm_sum_sq: Option<&GpuTensor>,
+        max_norm: f32,
+    ) -> PgResult<()> {
         let state = self
             .bank_states
             .get_mut(bank_idx)
@@ -239,27 +251,32 @@ impl GpuMuon {
         let ns_b = state.ns_b.slice_range(0, active_batch)?;
         let ns_tmp = state.ns_tmp.slice_range(0, active_batch)?;
         let bank_numel = param.numel() as u32;
-        kernels.scale_inplace(
-            CudaPtr(momentum.cu_ptr(kernels.stream())?),
-            self.momentum,
-            bank_numel,
-        )?;
-        kernels.add_scaled_fwd(
-            CudaPtr(momentum.cu_ptr(kernels.stream())?),
-            CudaPtr(grad.cu_ptr(kernels.stream())?),
-            1.0,
-            bank_numel,
-        )?;
-
-        if self.nesterov {
-            kernels.copy_fwd(
+        if let Some(sum_sq) = global_norm_sum_sq {
+            kernels.scale_add_inplace_global_norm_fwd(
+                CudaPtr(momentum.cu_ptr(kernels.stream())?),
                 CudaPtr(grad.cu_ptr(kernels.stream())?),
-                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+                CudaPtr(sum_sq.cu_ptr(kernels.stream())?),
+                max_norm,
+                self.momentum,
+                1.0,
                 bank_numel,
             )?;
-            kernels.add_scaled_fwd(
-                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+        } else {
+            kernels.scale_add_inplace_fwd(
                 CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                CudaPtr(grad.cu_ptr(kernels.stream())?),
+                self.momentum,
+                1.0,
+                bank_numel,
+            )?;
+        }
+
+        if self.nesterov {
+            kernels.linear_comb2_fwd(
+                CudaPtr(grad.cu_ptr(kernels.stream())?),
+                CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+                1.0,
                 self.momentum,
                 bank_numel,
             )?;
@@ -307,19 +324,11 @@ impl GpuMuon {
                             0.0,
                         )?;
                     }
-                    kernels.copy_fwd(
+                    kernels.linear_comb2_fwd(
                         CudaPtr(ns_a.cu_ptr(kernels.stream())?),
-                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
-                        ns_a.numel() as u32,
-                    )?;
-                    kernels.scale_inplace(
+                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         CudaPtr(ns_b.cu_ptr(kernels.stream())?),
                         ns_b_coeff,
-                        ns_b.numel() as u32,
-                    )?;
-                    kernels.add_scaled_fwd(
-                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
-                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         ns_c_coeff,
                         ns_b.numel() as u32,
                     )?;
@@ -361,19 +370,11 @@ impl GpuMuon {
                             0.0,
                         )?;
                     }
-                    kernels.copy_fwd(
+                    kernels.linear_comb2_fwd(
                         CudaPtr(ns_a.cu_ptr(kernels.stream())?),
-                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
-                        ns_a.numel() as u32,
-                    )?;
-                    kernels.scale_inplace(
+                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         CudaPtr(ns_b.cu_ptr(kernels.stream())?),
                         ns_b_coeff,
-                        ns_b.numel() as u32,
-                    )?;
-                    kernels.add_scaled_fwd(
-                        CudaPtr(ns_b.cu_ptr(kernels.stream())?),
-                        CudaPtr(ns_aa.cu_ptr(kernels.stream())?),
                         ns_c_coeff,
                         ns_b.numel() as u32,
                     )?;
@@ -391,14 +392,10 @@ impl GpuMuon {
                         )?;
                     }
                 }
-                kernels.scale_inplace(
-                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
-                    ns_a_coeff,
-                    ns_x.numel() as u32,
-                )?;
-                kernels.add_scaled_fwd(
+                kernels.scale_add_inplace_fwd(
                     CudaPtr(ns_x.cu_ptr(kernels.stream())?),
                     CudaPtr(ns_tmp.cu_ptr(kernels.stream())?),
+                    ns_a_coeff,
                     1.0,
                     ns_x.numel() as u32,
                 )?;
@@ -436,19 +433,11 @@ impl GpuMuon {
                                 0.0,
                             )?;
                         }
-                        kernels.copy_fwd(
+                        kernels.linear_comb2_fwd(
                             CudaPtr(a_i.cu_ptr(kernels.stream())?),
-                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                            a_i.numel() as u32,
-                        )?;
-                        kernels.scale_inplace(
+                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
                             CudaPtr(b_i.cu_ptr(kernels.stream())?),
                             ns_b_coeff,
-                            b_i.numel() as u32,
-                        )?;
-                        kernels.add_scaled_fwd(
-                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
                             ns_c_coeff,
                             b_i.numel() as u32,
                         )?;
@@ -487,19 +476,11 @@ impl GpuMuon {
                                 0.0,
                             )?;
                         }
-                        kernels.copy_fwd(
+                        kernels.linear_comb2_fwd(
                             CudaPtr(a_i.cu_ptr(kernels.stream())?),
-                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                            a_i.numel() as u32,
-                        )?;
-                        kernels.scale_inplace(
+                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
                             CudaPtr(b_i.cu_ptr(kernels.stream())?),
                             ns_b_coeff,
-                            b_i.numel() as u32,
-                        )?;
-                        kernels.add_scaled_fwd(
-                            CudaPtr(b_i.cu_ptr(kernels.stream())?),
-                            CudaPtr(aa_i.cu_ptr(kernels.stream())?),
                             ns_c_coeff,
                             b_i.numel() as u32,
                         )?;
@@ -517,14 +498,10 @@ impl GpuMuon {
                         }
                     }
 
-                    kernels.scale_inplace(
-                        CudaPtr(x_i.cu_ptr(kernels.stream())?),
-                        ns_a_coeff,
-                        x_i.numel() as u32,
-                    )?;
-                    kernels.add_scaled_fwd(
+                    kernels.scale_add_inplace_fwd(
                         CudaPtr(x_i.cu_ptr(kernels.stream())?),
                         CudaPtr(tmp_i.cu_ptr(kernels.stream())?),
+                        ns_a_coeff,
                         1.0,
                         x_i.numel() as u32,
                     )?;
@@ -608,9 +585,13 @@ impl GpuOptimizer {
             || param.shape() != state.m.shape()
             || param.shape() != state.v.shape()
         {
-            return Err(PgError::InvalidOp(
-                "adamw_step param / grad / state shape mismatch".into(),
-            ));
+            return Err(PgError::InvalidOp(format!(
+                "adamw_step param / grad / state shape mismatch: param={:?} grad={:?} m={:?} v={:?}",
+                param.shape(),
+                grad.shape(),
+                state.m.shape(),
+                state.v.shape()
+            )));
         }
         state.step += 1;
         let bc1 = 1.0 - hyper.beta1.powi(state.step as i32);

@@ -17,7 +17,7 @@ use pg_model::model::GptModel;
 use pg_model::spec::LqerSpec;
 use pg_model::{CompressionMode, QuantScheme, QuantSpec};
 
-use crate::compress::compress_zstd;
+use crate::compress::{compress_pergroup, compress_zstd, decompress_artifact_payload};
 use crate::prune::{PruneConfig, PruneStrategy, prune_then_quantize};
 use crate::scheme::{Bits, Block, GroupConfig, PackedWeight, Scheme, quantize_with};
 use crate::serialize::{SerializedTensor, write_artifact};
@@ -36,12 +36,6 @@ pub fn export_model_with_spec(
     variant_fingerprint: &str,
     path: &Path,
 ) -> PgResult<usize> {
-    if quant_spec.compression != CompressionMode::Zstd22 {
-        return Err(PgError::InvalidOp(format!(
-            "artifact export currently supports zstd22 only, got {:?}",
-            quant_spec.compression
-        )));
-    }
     let scheme = scheme_from_quant_spec(quant_spec)?;
     let c = &model.config;
     let n = c.num_layers;
@@ -194,8 +188,16 @@ pub fn export_model_with_spec(
     let mut raw_buf = Vec::new();
     write_artifact(&mut raw_buf, &tensors, &metadata)?;
 
-    // Compress with zstd-22
-    let compressed = compress_zstd(&raw_buf, 22)?;
+    let compressed = match quant_spec.compression {
+        CompressionMode::None => raw_buf.clone(),
+        CompressionMode::Zstd22 => compress_zstd(&raw_buf, 22)?,
+        CompressionMode::Pergroup => compress_pergroup(&raw_buf, 22)?,
+        CompressionMode::Lzma9 => {
+            return Err(PgError::InvalidOp(
+                "artifact export does not support lzma9 in the Rust record path".into(),
+            ));
+        }
+    };
 
     let artifact_size = compressed.len();
     eprintln!(
@@ -221,23 +223,38 @@ pub fn export_model_with_spec(
 
 fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
     let int4 = GroupConfig::new(Bits::B4, Block::PerRow);
-    let int6 = GroupConfig::new(Bits::B6, Block::PerRow);
     let int7 = GroupConfig::new(Bits::B7, Block::PerRow);
     let int8 = GroupConfig::new(Bits::B8, Block::PerRow);
+    let matrix = GroupConfig::new(
+        bits_from_quant_spec_nbits(quant_spec.matrix_bits, "matrix_bits")?,
+        Block::PerRow,
+    );
+    let embed = GroupConfig::new(
+        bits_from_quant_spec_nbits(quant_spec.embed_bits, "embed_bits")?,
+        Block::PerRow,
+    );
     match quant_spec.scheme {
         QuantScheme::None => Err(PgError::InvalidOp(
             "QuantScheme::None is not a submission artifact format; choose gptq_lite_int6, mixed_int5_int6, or aggressive".into(),
         )),
         QuantScheme::GptqLiteInt6 => Ok(Scheme {
-            attn_q: int6.clone(),
-            attn_k: int6.clone(),
-            attn_v: int6.clone(),
-            attn_o: int6.clone(),
-            mlp_up: int6.clone(),
-            mlp_down: int6,
-            embed: int8,
+            attn_q: matrix.clone(),
+            attn_k: matrix.clone(),
+            attn_v: matrix.clone(),
+            attn_o: matrix.clone(),
+            mlp_up: matrix.clone(),
+            mlp_down: matrix,
+            embed,
         }),
-        QuantScheme::MixedInt5Int6 => Ok(Scheme::sota_baseline()),
+        QuantScheme::MixedInt5Int6 => Ok(Scheme {
+            attn_q: matrix.clone(),
+            attn_k: matrix.clone(),
+            attn_v: matrix.clone(),
+            attn_o: matrix.clone(),
+            mlp_up: matrix.clone(),
+            mlp_down: matrix,
+            embed,
+        }),
         QuantScheme::Aggressive => Ok(Scheme {
             attn_q: int8.clone(),
             attn_k: int8.clone(),
@@ -256,6 +273,19 @@ fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
             mlp_down: int4,
             embed: int8,
         }),
+    }
+}
+
+fn bits_from_quant_spec_nbits(nbits: u8, field: &str) -> PgResult<Bits> {
+    match nbits {
+        4 => Ok(Bits::B4),
+        5 => Ok(Bits::B5),
+        6 => Ok(Bits::B6),
+        7 => Ok(Bits::B7),
+        8 => Ok(Bits::B8),
+        _ => Err(PgError::InvalidOp(format!(
+            "unsupported {field}={nbits}; expected 4, 5, 6, 7, or 8"
+        ))),
     }
 }
 
@@ -607,13 +637,21 @@ fn metadata_json(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","scheme":"{:?}","compression":"{:?}","prune_keep_ratio":{},"lqer_enabled":{},"lqer_rank":{},"lqer_a_bits":{},"lqer_b_bits":{},"lqer_group_size":{},"lqer_asymmetric":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"sparse_attn_gate_enabled":{},"sparse_attn_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
+        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","scheme":"{:?}","compression":"{:?}","matrix_bits":{},"embed_bits":{},"attn_gate_bits":{},"mlp_clip_sigmas":{},"attn_clip_sigmas":{},"embed_clip_sigmas":{},"gptq_calibration_batches":{},"prune_keep_ratio":{},"lqer_enabled":{},"lqer_rank":{},"lqer_top_k":{},"lqer_a_bits":{},"lqer_b_bits":{},"lqer_group_size":{},"lqer_asymmetric":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"sparse_attn_gate_enabled":{},"sparse_attn_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
         variant_fingerprint,
         quant_spec.scheme,
         quant_spec.compression,
+        quant_spec.matrix_bits,
+        quant_spec.embed_bits,
+        quant_spec.attn_gate_bits,
+        quant_spec.mlp_clip_sigmas,
+        quant_spec.attn_clip_sigmas,
+        quant_spec.embed_clip_sigmas,
+        quant_spec.gptq_calibration_batches,
         prune,
         if quant_spec.lqer.enabled { 1 } else { 0 },
         quant_spec.lqer.rank,
+        quant_spec.lqer.top_k,
         quant_spec.lqer.a_bits,
         quant_spec.lqer.b_bits,
         quant_spec.lqer.group_size,
@@ -642,7 +680,7 @@ fn metadata_json(
 /// Load a compressed artifact back into a GptModel.
 pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
     let compressed = std::fs::read(path)?;
-    let raw = crate::compress::decompress_zstd(&compressed)?;
+    let raw = decompress_artifact_payload(&compressed)?;
 
     let mut cursor = std::io::Cursor::new(raw);
     let (tensors, metadata) = crate::serialize::read_artifact(&mut cursor)?;
@@ -1184,6 +1222,7 @@ mod tests {
             lqer: LqerSpec {
                 enabled: true,
                 rank: 2,
+                top_k: 3,
                 a_bits: 2,
                 b_bits: 4,
                 group_size: 64,

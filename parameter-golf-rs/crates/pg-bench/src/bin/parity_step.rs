@@ -81,6 +81,7 @@ fn main() {
                         "recurrence_mid_sp8192" => VariantFamily::RecurrenceMidSp8192,
                         "parallel_resid_sp8192" => VariantFamily::ParallelResidSp8192,
                         "hybrid_competitive_sp8192" => VariantFamily::HybridCompetitiveSp8192,
+                        "frontier_1855_like" => VariantFamily::Frontier1855Like,
                         _ => VariantFamily::BaselineSp8192,
                     };
                 }

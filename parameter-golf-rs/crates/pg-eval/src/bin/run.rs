@@ -31,6 +31,7 @@ fn main() {
                         "recurrence_mid_sp8192" => VariantFamily::RecurrenceMidSp8192,
                         "parallel_resid_sp8192" => VariantFamily::ParallelResidSp8192,
                         "hybrid_competitive_sp8192" => VariantFamily::HybridCompetitiveSp8192,
+                        "frontier_1855_like" => VariantFamily::Frontier1855Like,
                         _ => VariantFamily::BaselineSp8192,
                     };
                 }
@@ -56,6 +57,16 @@ fn main() {
         run_spec.eval.caseops_byte_sidecar_pattern = Some(pattern);
     }
     validate_leaderboard_eval_request(&run_spec, artifact.as_ref(), max_tokens, leaderboard_mode);
+    if leaderboard_mode {
+        if let Some(path) = artifact.as_ref() {
+            if !path.is_file() {
+                fail(&format!(
+                    "leaderboard eval artifact does not exist or is not a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
     let plan = ExecutionPlan::from_run_spec(&run_spec).expect("failed to build execution plan");
 
     let artifact_bytes = artifact

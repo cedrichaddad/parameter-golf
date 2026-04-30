@@ -11,6 +11,9 @@ use pg_model::{ExecutionPlan, GptModel};
 use crate::sliding::build_ttt_chunks;
 
 #[cfg(feature = "cuda")]
+use std::time::Instant;
+
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct GpuLoraPhasedTttConfig {
     pub stride: usize,
@@ -22,6 +25,7 @@ pub struct GpuLoraPhasedTttConfig {
     pub boundary_token_id: Option<u32>,
     pub phases: usize,
     pub weight_decay: f32,
+    pub beta2: f32,
     pub lr: f32,
 }
 
@@ -44,6 +48,7 @@ impl GpuLoraPhasedTttConfig {
             boundary_token_id: plan.run_spec.model.smear_gate_boundary_token_id,
             phases: plan.eval_plan.phased_ttt_phases.max(1),
             weight_decay: plan.eval_plan.phased_ttt_weight_decay,
+            beta2: plan.eval_plan.ttt_beta2,
             // The frontier LoRA-TTT recipes tune this with the matrix-update
             // learning rate. Keeping it spec-driven prevents eval-time
             // adaptation from silently diverging from the record config.
@@ -106,9 +111,10 @@ pub fn eval_gpu_lora_phased_ttt(
         count_document_starts_until(val_tokens, cfg.boundary_token_id, prefix_token_end)?
     };
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
+    let deadline = TttEvalDeadline::from_env();
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"tiled_output_cross_entropy\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_ttt_chunk\"}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_ttt_chunk\"}}",
             mutation_guard,
             total_tokens,
             seq_len,
@@ -125,9 +131,11 @@ pub fn eval_gpu_lora_phased_ttt(
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             cfg.weight_decay,
+            cfg.beta2,
             model.uses_tiled_output_ce(),
-            !model.uses_tiled_output_ce(),
-            model.uses_tiled_output_ce(),
+            model.uses_chunked_bf16_output_ce_cache(),
+            !model.uses_tiled_output_ce() && !model.uses_chunked_bf16_output_ce_cache(),
+            model.uses_tiled_output_ce() || model.uses_chunked_bf16_output_ce_cache(),
         );
     }
     let mut total_loss = 0.0f64;
@@ -136,6 +144,7 @@ pub fn eval_gpu_lora_phased_ttt(
     let mut current_phase = 0usize;
 
     for (ci, scheduled) in chunks.iter().enumerate() {
+        deadline.check(ci)?;
         let chunk = &scheduled.chunk;
         let phase = scheduled.phase.min(cfg.phases - 1);
         if phase != current_phase {
@@ -219,6 +228,7 @@ pub fn eval_gpu_lora_phased_ttt(
                 &mut host_workspace,
             )?;
         }
+        deadline.check(ci)?;
     }
 
     let val_loss = if total_scored > 0 {
@@ -306,9 +316,10 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
         count_document_starts_until(val_tokens, cfg.boundary_token_id, prefix_token_end)?
     };
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
+    let deadline = TttEvalDeadline::from_env();
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"data_parallel_lora_gradient_allreduce\",\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"tiled_output_cross_entropy\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_rank_per_ttt_chunk\"}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_rank_per_ttt_chunk\"}}",
             world_size,
             mutation_guard,
             total_tokens,
@@ -326,9 +337,13 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             cfg.weight_decay,
+            cfg.beta2,
             replicas[0].model.uses_tiled_output_ce(),
-            !replicas[0].model.uses_tiled_output_ce(),
-            replicas[0].model.uses_tiled_output_ce(),
+            replicas[0].model.uses_chunked_bf16_output_ce_cache(),
+            !replicas[0].model.uses_tiled_output_ce()
+                && !replicas[0].model.uses_chunked_bf16_output_ce_cache(),
+            replicas[0].model.uses_tiled_output_ce()
+                || replicas[0].model.uses_chunked_bf16_output_ce_cache(),
         );
     }
 
@@ -338,6 +353,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
     let mut current_phase = 0usize;
 
     for (ci, scheduled) in chunks.iter().enumerate() {
+        deadline.check(ci)?;
         let chunk = &scheduled.chunk;
         let phase = scheduled.phase.min(cfg.phases - 1);
         if phase != current_phase {
@@ -414,7 +430,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
         };
         if audit {
             println!(
-                "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_chunk\",\"distributed_eval\":true,\"world_size\":{},\"ttt_update_parallelism\":\"data_parallel_lora_gradient_allreduce\",\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"chunk_id\":{},\"chunk_start\":{},\"chunk_end\":{},\"phase\":{},\"prefix_warmup\":{},\"loss_sum\":{:.9},\"tokens_scored_before_update\":{},\"cumulative_tokens_scored\":{},\"ttt_update_after_score\":{},\"update_start\":{},\"update_end\":{},\"update_tokens\":{},\"future_token_access\":false}}",
+                "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_chunk\",\"distributed_eval\":true,\"world_size\":{},\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"chunk_id\":{},\"chunk_start\":{},\"chunk_end\":{},\"phase\":{},\"prefix_warmup\":{},\"loss_sum\":{:.9},\"tokens_scored_before_update\":{},\"cumulative_tokens_scored\":{},\"ttt_update_after_score\":{},\"update_start\":{},\"update_end\":{},\"update_tokens\":{},\"future_token_access\":false}}",
                 world_size,
                 ci,
                 chunk.chunk_start,
@@ -444,6 +460,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
             )?;
             debug_verify_q_lora_replicas_synced(&mut replicas)?;
         }
+        deadline.check(ci)?;
     }
 
     let val_loss = if total_scored > 0 {
@@ -535,14 +552,16 @@ fn all_reduce_q_lora_grads(
     replicas: &mut [GpuLoraEvalReplica],
     comms: &[pg_core::nccl::NcclComm],
 ) -> PgResult<()> {
+    for replica in replicas.iter_mut() {
+        replica.model.pack_q_lora_grads(&replica.lora_grad_pack)?;
+    }
+    cudarc::nccl::group_start().map_err(|e| PgError::Nccl(format!("group_start failed: {e:?}")))?;
     for (rank, replica) in replicas.iter_mut().enumerate() {
-        let lora = replica.model.q_lora.as_mut().ok_or_else(|| {
-            PgError::InvalidOp("distributed LoRA all-reduce requires enabled LoRA".into())
-        })?;
-        for layer in 0..replica.model.config.num_layers {
-            comms[rank].all_reduce_sum_tensor_f32_in_place(&mut lora.grad_a[layer])?;
-            comms[rank].all_reduce_sum_tensor_f32_in_place(&mut lora.grad_b[layer])?;
-        }
+        comms[rank].all_reduce_sum_tensor_f32_in_place(&mut replica.lora_grad_pack)?;
+    }
+    cudarc::nccl::group_end().map_err(|e| PgError::Nccl(format!("group_end failed: {e:?}")))?;
+    for replica in replicas.iter_mut() {
+        replica.model.unpack_q_lora_grads(&replica.lora_grad_pack)?;
     }
     Ok(())
 }
@@ -618,6 +637,44 @@ fn debug_distributed_ttt_sync_enabled() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+#[cfg(feature = "cuda")]
+struct TttEvalDeadline {
+    start: Instant,
+    max_seconds: f64,
+}
+
+#[cfg(feature = "cuda")]
+impl TttEvalDeadline {
+    fn from_env() -> Self {
+        let max_seconds = std::env::var("PG_EVAL_MAX_WALLCLOCK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(600.0);
+        let guard_seconds = std::env::var("PG_EVAL_DEADLINE_GUARD_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(2.0);
+        Self {
+            start: Instant::now(),
+            max_seconds: (max_seconds - guard_seconds).max(0.0),
+        }
+    }
+
+    fn check(&self, chunk_id: usize) -> PgResult<()> {
+        if self.max_seconds <= 0.0 {
+            return Ok(());
+        }
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if elapsed > self.max_seconds {
+            return Err(PgError::InvalidOp(format!(
+                "gpu_lora_phased_ttt exceeded eval wallclock deadline before/after chunk {chunk_id}: elapsed_seconds={elapsed:.3} deadline_seconds={:.3}",
+                self.max_seconds
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -821,6 +878,7 @@ struct GpuLoraEvalReplica {
     activations: GpuActivations,
     backward_state: GpuBackwardState,
     grads: GpuGradBuffers,
+    lora_grad_pack: GpuTensor,
     host_workspace: GpuLoraHostWorkspace,
     seq_len: usize,
 }
@@ -842,6 +900,7 @@ impl GpuLoraEvalReplica {
         let stream = ctx.default_stream();
         let mut model = GpuModel::from_cpu_reference(cpu_model, plan, ctx, stream.clone())?;
         model.enable_q_lora(cfg.lora_rank, cfg.lora_alpha)?;
+        let lora_grad_numel = model.q_lora_grad_numel()?;
         Ok(Self {
             model,
             input_gpu: GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::U32)?,
@@ -850,7 +909,8 @@ impl GpuLoraEvalReplica {
             loss_sum_gpu: GpuTensor::zeros_gpu(stream.clone(), &[1], DType::F32)?,
             activations: GpuActivations::new_for_plan(plan, seq_len, stream.clone())?,
             backward_state: GpuBackwardState::new_for_plan(plan, seq_len, stream.clone())?,
-            grads: GpuGradBuffers::new(&cpu_model.config, stream)?,
+            grads: GpuGradBuffers::new(&cpu_model.config, stream.clone())?,
+            lora_grad_pack: GpuTensor::zeros_gpu(stream.clone(), &[lora_grad_numel], DType::F32)?,
             host_workspace: GpuLoraHostWorkspace::new(seq_len),
             seq_len,
         })
@@ -1048,6 +1108,7 @@ mod tests {
             boundary_token_id: Some(1),
             phases: 3,
             weight_decay: 1.0,
+            beta2: 0.99,
             lr: 0.01,
         }
     }

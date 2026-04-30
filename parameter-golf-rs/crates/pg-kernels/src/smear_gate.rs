@@ -235,4 +235,43 @@ mod tests {
         );
         assert_ne!(&out_a[2 * dim..3 * dim], &out_b[2 * dim..3 * dim]);
     }
+
+    #[test]
+    fn test_smear_gate_boundary_blocks_bos_gradient_to_previous_doc() {
+        let dim = 2;
+        let tokens = 5;
+        let boundary = 1u32;
+        let ids = vec![boundary, 7, 8, boundary, 9];
+        let gate = vec![20.0, 20.0];
+        let x = vec![
+            1.0, 2.0, //
+            3.0, 4.0, //
+            5.0, 6.0, //
+            7.0, 8.0, //
+            9.0, 10.0,
+        ];
+        let mut grad_output = vec![0.0; tokens * dim];
+        let doc_b_bos = 3 * dim;
+        grad_output[doc_b_bos] = 1.0;
+        grad_output[doc_b_bos + 1] = 1.0;
+
+        let mut grad_x = vec![0.0; tokens * dim];
+        let mut grad_x_prev = vec![0.0; tokens * dim];
+        let mut grad_gate = vec![0.0; dim];
+        smear_gate_backward_boundary(
+            &x,
+            &ids,
+            &gate,
+            &grad_output,
+            &mut grad_x,
+            &mut grad_x_prev,
+            &mut grad_gate,
+            tokens,
+            dim,
+            boundary,
+        );
+
+        assert_eq!(&grad_x_prev[doc_b_bos..doc_b_bos + dim], &[0.0, 0.0]);
+        assert_eq!(&grad_gate, &[0.0, 0.0]);
+    }
 }

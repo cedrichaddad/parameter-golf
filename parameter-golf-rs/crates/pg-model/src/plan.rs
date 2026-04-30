@@ -43,6 +43,10 @@ pub struct ActivationLayout {
 pub struct QuantLayout {
     pub scheme: QuantScheme,
     pub compression: CompressionMode,
+    pub matrix_bits: u8,
+    pub embed_bits: u8,
+    pub attn_gate_bits: u8,
+    pub gptq_calibration_batches: usize,
     pub target_artifact_bytes: usize,
 }
 
@@ -57,6 +61,7 @@ pub struct EvalPlan {
     pub phased_ttt_prefix_docs: usize,
     pub phased_ttt_phases: usize,
     pub phased_ttt_weight_decay: f32,
+    pub ttt_beta2: f32,
     pub chunk_tokens: usize,
 }
 
@@ -139,6 +144,10 @@ impl ExecutionPlan {
         let quant_layout = QuantLayout {
             scheme: run_spec.quant.scheme,
             compression: run_spec.quant.compression,
+            matrix_bits: run_spec.quant.matrix_bits,
+            embed_bits: run_spec.quant.embed_bits,
+            attn_gate_bits: run_spec.quant.attn_gate_bits,
+            gptq_calibration_batches: run_spec.quant.gptq_calibration_batches,
             target_artifact_bytes: run_spec.quant.target_artifact_bytes,
         };
         let eval_plan = EvalPlan {
@@ -151,6 +160,7 @@ impl ExecutionPlan {
             phased_ttt_prefix_docs: run_spec.eval.phased_ttt_prefix_docs,
             phased_ttt_phases: run_spec.eval.phased_ttt_phases,
             phased_ttt_weight_decay: run_spec.eval.phased_ttt_weight_decay,
+            ttt_beta2: run_spec.eval.ttt_beta2,
             chunk_tokens: run_spec.eval.chunk_tokens,
         };
 
@@ -200,6 +210,16 @@ impl ExecutionPlan {
 
     pub fn validate_model_config(&self, config: &ModelConfig) -> PgResult<()> {
         let spec = &self.run_spec.model;
+        let expected_bigram_vocab = if spec.bigram.enabled {
+            spec.bigram.vocab_size
+        } else {
+            0
+        };
+        let expected_bigram_dim = if spec.bigram.enabled {
+            spec.bigram.dim
+        } else {
+            0
+        };
         let mismatches = [
             ("vocab_size", spec.vocab_size, config.vocab_size),
             ("num_layers", spec.num_layers, config.num_layers),
@@ -210,10 +230,10 @@ impl ExecutionPlan {
             ("eval_seq_len", spec.eval_seq_len, config.eval_seq_len),
             (
                 "bigram_vocab_size",
-                spec.bigram.vocab_size,
+                expected_bigram_vocab,
                 config.bigram_vocab_size,
             ),
-            ("bigram_dim", spec.bigram.dim, config.bigram_dim),
+            ("bigram_dim", expected_bigram_dim, config.bigram_dim),
             ("ve_dim", spec.value_embedding.dim, config.ve_dim),
             ("xsa_last_n", spec.xsa_last_n, config.xsa_last_n),
             (
@@ -432,6 +452,36 @@ fn validate_run_spec(run_spec: &RunSpec) -> PgResult<()> {
             )));
         }
     }
+    for (field, bits) in [
+        ("quant.matrix_bits", run_spec.quant.matrix_bits),
+        ("quant.embed_bits", run_spec.quant.embed_bits),
+        ("quant.attn_gate_bits", run_spec.quant.attn_gate_bits),
+        ("quant.lqer.a_bits", run_spec.quant.lqer.a_bits),
+        ("quant.lqer.b_bits", run_spec.quant.lqer.b_bits),
+    ] {
+        if !(4..=8).contains(&bits) && !field.starts_with("quant.lqer.") {
+            return Err(PgError::InvalidOp(format!(
+                "{field}={bits} is unsupported; expected 4..=8"
+            )));
+        }
+        if field.starts_with("quant.lqer.") && !(2..=8).contains(&bits) {
+            return Err(PgError::InvalidOp(format!(
+                "{field}={bits} is unsupported; expected 2..=8"
+            )));
+        }
+    }
+    if run_spec.quant.lqer.enabled && run_spec.quant.lqer.top_k == 0 {
+        return Err(PgError::InvalidOp(
+            "quant.lqer.top_k must be non-zero when LQER is enabled".into(),
+        ));
+    }
+    if run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased
+        && !run_spec.eval.legal_score_first
+    {
+        return Err(PgError::InvalidOp(
+            "GPU phased LoRA TTT requires legal_score_first=true".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -448,6 +498,7 @@ fn fingerprint(run_spec: &RunSpec) -> String {
     run_spec.train.warmup_steps.hash(&mut hasher);
     run_spec.train.total_iterations.hash(&mut hasher);
     run_spec.train.warmdown_iters.hash(&mut hasher);
+    run_spec.train.warmdown_frac.to_bits().hash(&mut hasher);
     run_spec
         .train
         .max_wallclock_seconds
@@ -467,6 +518,7 @@ fn fingerprint(run_spec: &RunSpec) -> String {
     run_spec.train.muon_momentum_warmup_steps.hash(&mut hasher);
     run_spec.train.muon_wd.to_bits().hash(&mut hasher);
     run_spec.train.adam_wd.to_bits().hash(&mut hasher);
+    run_spec.train.adam_beta2.to_bits().hash(&mut hasher);
     run_spec.train.ema_decay.to_bits().hash(&mut hasher);
     run_spec
         .train
@@ -479,7 +531,7 @@ fn fingerprint(run_spec: &RunSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RunSpec, VariantFamily};
+    use crate::{CompressionMode, EvalAdaptationBackend, RunSpec, VariantFamily};
 
     #[test]
     fn hybrid_competitive_plan_accepts_sparse_attn_gate() {
@@ -541,5 +593,49 @@ mod tests {
         let budget = plan.submission_budget(4_000_000, 11_999_999);
         assert_eq!(budget.total_bytes, 15_999_999);
         assert!(budget.ok());
+    }
+
+    #[test]
+    fn frontier_1855_spec_loads_critical_hyperparameters() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../specs/frontier_1855_merged_target.toml");
+        let spec = RunSpec::load(&path).unwrap();
+        assert_eq!(spec.name, "frontier_1855_merged_target");
+        assert_eq!(spec.model.family, VariantFamily::Frontier1855Like);
+        assert_eq!(spec.model.mlp_mult, 4.0);
+        assert_eq!(spec.model.qk_gain_init, 5.0);
+        assert!(spec.model.caseops.byte_sidecar);
+        assert_eq!(spec.model.sparse_attn_gate.scale, 0.5);
+        assert_eq!(spec.train.batch_tokens, 786_432);
+        assert_eq!(spec.train.world_size, 8);
+        assert_eq!(spec.train.warmdown_frac, 0.85);
+        assert_eq!(spec.train.to_train_config().warmdown_iters, 7_650);
+        assert_eq!(spec.train.adam_beta2, 0.99);
+        assert_eq!(spec.quant.compression, CompressionMode::Pergroup);
+        assert_eq!(spec.quant.matrix_bits, 6);
+        assert_eq!(spec.quant.embed_bits, 7);
+        assert_eq!(spec.quant.attn_gate_bits, 8);
+        assert_eq!(spec.quant.gptq_calibration_batches, 16);
+        assert_eq!(spec.quant.lqer.top_k, 3);
+        assert_eq!(
+            spec.eval.adaptation_backend,
+            EvalAdaptationBackend::GpuLoraPhased
+        );
+        assert_eq!(spec.eval.lora_rank, 80);
+        assert_eq!(spec.eval.ttt_beta2, 0.99);
+    }
+
+    #[test]
+    fn fingerprint_changes_for_frontier_critical_train_knobs() {
+        let spec = RunSpec::for_family(VariantFamily::Frontier1855Like);
+        let base = fingerprint(&spec);
+
+        let mut changed = spec.clone();
+        changed.train.warmdown_frac += 0.01;
+        assert_ne!(base, fingerprint(&changed));
+
+        let mut changed = spec.clone();
+        changed.train.adam_beta2 = 0.98;
+        assert_ne!(base, fingerprint(&changed));
     }
 }
