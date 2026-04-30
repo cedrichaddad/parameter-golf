@@ -112,6 +112,7 @@ The useful contribution is the systems work: a measured Rust/CUDA record-shaped 
 ```text
 README.md                     - submission summary
 TECHNICAL_REPORT.md           - detailed engineering report and roadmap
+ARCHITECTURE_BLOG.md          - long-form architecture writeup
 submission.json               - machine-readable metadata
 specs/frontier_1855_merged_target.toml
 scripts/exact_modal_commands.sh
@@ -127,4 +128,3 @@ artifacts/artifact_budget.json
 See `scripts/exact_modal_commands.sh` for the exact commands used for the record-shaped proxy measurements and local validation.
 
 The implementation lives in `parameter-golf-rs/` in this PR. This record folder intentionally does not claim to be a minimal leaderboard package.
-

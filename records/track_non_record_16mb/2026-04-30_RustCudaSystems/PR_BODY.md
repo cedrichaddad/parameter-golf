@@ -40,6 +40,8 @@ pg-eval     legal score-first GPU LoRA/phased TTT eval path
 
 The current record-shaped path uses true batched `[B=48, T=2048]` execution per H100, cuDNN frontend BF16 SDPA, prepacked BF16 Q/K/V freshness checks, BOS-safe SmearGate, chunked BF16 output CE cache, and sharded Parallel Muon scaffolding. The remaining gap is primarily the backward/communication tail, not basic record semantics.
 
+For a longer architectural walkthrough, I added `ARCHITECTURE_BLOG.md` in the submission folder. It covers the runtime design, measurement ledger, negative results, and remaining production cuts in more detail than the PR body.
+
 ## What this contributes
 
 I am submitting this because the Rust stack reached the real record-shaped 8xH100 workload and the measurements are now specific enough to be useful, even though it is not ready to claim a record.
@@ -57,6 +59,7 @@ The main result is the systems delta: the first valid record-shaped run took abo
 records/track_non_record_16mb/2026-04-30_RustCudaSystems/
   README.md
   TECHNICAL_REPORT.md
+  ARCHITECTURE_BLOG.md
   PR_BODY.md
   submission.json
   specs/frontier_1855_merged_target.toml
