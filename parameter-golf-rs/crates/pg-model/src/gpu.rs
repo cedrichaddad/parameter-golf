@@ -515,6 +515,16 @@ pub struct GpuGradBuffers {
 }
 
 #[cfg(feature = "cuda")]
+pub trait GpuBackwardLayerObserver {
+    fn after_layer(
+        &mut self,
+        model: &GpuModel,
+        layer: usize,
+        grads: &GpuGradBuffers,
+    ) -> PgResult<()>;
+}
+
+#[cfg(feature = "cuda")]
 impl GpuGradBuffers {
     pub fn new(config: &ModelConfig, stream: Arc<CudaStream>) -> PgResult<Self> {
         let n = config.num_layers;
@@ -1357,6 +1367,8 @@ struct GpuBlockBackwardCache {
     grad_q_post_rope: GpuTensor,
     grad_q_proj: GpuTensor,
     grad_k_proj: GpuTensor,
+    grad_q_proj_bf16: GpuTensor,
+    grad_k_proj_bf16: GpuTensor,
     q_gain_reduce_scratch: GpuTensor,
     residual_mix_reduce_scratch: GpuTensor,
     residual_mix_norm_stats: GpuTensor,
@@ -1422,6 +1434,12 @@ impl GpuBlockBackwardCache {
             grad_q_post_rope: zeros(&[tokens, h, hd])?,
             grad_q_proj: zeros(&[tokens, h, hd])?,
             grad_k_proj: zeros(&[tokens, hkv, hd])?,
+            grad_q_proj_bf16: GpuTensor::zeros_gpu(stream.clone(), &[tokens, h, hd], DType::BF16)?,
+            grad_k_proj_bf16: GpuTensor::zeros_gpu(
+                stream.clone(),
+                &[tokens, hkv, hd],
+                DType::BF16,
+            )?,
             q_gain_reduce_scratch: zeros(&[h, tokens.div_ceil(256)])?,
             residual_mix_reduce_scratch: zeros(&[2 * d, tokens.div_ceil(256)])?,
             residual_mix_norm_stats: zeros(&[tokens, 2])?,
@@ -1901,6 +1919,117 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn bf16_qkv_freshness_rejects_never_marked_buffer() {
+        // This is the exact failure mode the consumer-side `require()` is meant
+        // to catch: a misconfigured run with prepacked attention enabled but the
+        // fused producer skipped (or producer was never actually run for this
+        // layer this step). Without the consumer-side gate, cuDNN would silently
+        // read uninitialized scratch as Q/K/V.
+        let freshness = Bf16QkvFreshness::new();
+        let result = freshness.require(
+            Bf16QkvProducer::FusedNormQkvRopeGain,
+            1,
+            0,
+            98_304,
+            2_048,
+            8,
+            4,
+            64,
+        );
+        assert!(result.is_err(), "require on un-marked freshness must fail");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("stale prepacked BF16 QKV"),
+            "error message should describe stale BF16 QKV; got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn bf16_qkv_freshness_rejects_shape_change_mid_step() {
+        // If shape (tokens / heads / kv heads / head_dim) changes between mark
+        // and require within the same step, the buffers are no longer valid
+        // for the new shape. This catches cases like a runtime config change
+        // or a dynamic-batch path producing different shapes per call.
+        let freshness = Bf16QkvFreshness::new();
+        freshness.mark(
+            Bf16QkvProducer::FusedNormQkvRopeGain,
+            5,
+            2,
+            65_536,
+            1_024,
+            16,
+            4,
+            64,
+        );
+        // Same step, same layer, same producer, but different head count.
+        assert!(
+            freshness
+                .require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    5,
+                    2,
+                    65_536,
+                    1_024,
+                    32,
+                    4,
+                    64,
+                )
+                .is_err(),
+            "different num_heads must reject"
+        );
+        // Different head_dim.
+        assert!(
+            freshness
+                .require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    5,
+                    2,
+                    65_536,
+                    1_024,
+                    16,
+                    4,
+                    128,
+                )
+                .is_err(),
+            "different head_dim must reject"
+        );
+        // Different num_kv_heads.
+        assert!(
+            freshness
+                .require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    5,
+                    2,
+                    65_536,
+                    1_024,
+                    16,
+                    8,
+                    64,
+                )
+                .is_err(),
+            "different num_kv_heads must reject"
+        );
+        // Different seq_len.
+        assert!(
+            freshness
+                .require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    5,
+                    2,
+                    65_536,
+                    2_048,
+                    16,
+                    4,
+                    64,
+                )
+                .is_err(),
+            "different seq_len must reject"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -2352,6 +2481,21 @@ impl GpuModel {
             && self.use_fused_qk_rope_gain_backward()
             && matches!(
                 std::env::var("PG_GPU_BF16_ATTN_BACKWARD_TAIL")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+    }
+
+    fn use_bf16_attention_tail_qkv_pack(&self) -> bool {
+        self.use_bf16_attention_backward_tail()
+            && self.use_fused_qkv_projection()
+            && self.use_bf16_qkv_dx_output()
+            && self.q_lora.is_none()
+            && self.config.ve_layers.is_empty()
+            && matches!(
+                std::env::var("PG_GPU_BF16_ATTN_TAIL_QKV_PACK")
                     .unwrap_or_default()
                     .to_ascii_lowercase()
                     .as_str(),
@@ -3087,6 +3231,81 @@ impl GpuModel {
             kv as u32,
         )?;
         self.backward_q_lora(layer, grad_q_proj, grad_attn_norm, buf)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_projection_backward_from_tail_bf16(
+        &self,
+        layer: usize,
+        buf: &mut GpuActivations,
+        block_cache: &GpuBlockBackwardCache,
+        grads: &mut GpuGradBuffers,
+        grad_q_proj_bf16: &GpuTensor,
+        grad_k_proj_bf16: &GpuTensor,
+        grad_v_projection_bf16: &GpuTensor,
+        grad_v_xsa: &GpuTensor,
+        add_v_xsa: bool,
+        attn_norm_override: Option<&GpuTensor>,
+        attn_norm_bf16_override: Option<&GpuTensor>,
+        tokens: usize,
+    ) -> PgResult<bool> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        if !self.use_bf16_attention_tail_qkv_pack() {
+            return Ok(false);
+        }
+
+        let stream = self.gemm.stream();
+        let d = self.config.model_dim;
+        let kv = self.config.kv_dim();
+        let n = self.config.num_layers;
+        let attn_norm = attn_norm_override.unwrap_or(&buf.attn_norm);
+        let attn_norm_bf16 = if let Some(attn_norm_bf16) = attn_norm_bf16_override {
+            attn_norm_bf16
+        } else {
+            self.kernels.f32_to_bf16(
+                CudaPtr(attn_norm.cu_ptr(stream)?),
+                CudaPtr(buf.x_in_bf16.cu_ptr(stream)?),
+                (tokens * d) as u32,
+            )?;
+            &buf.x_in_bf16
+        };
+
+        self.kernels.pack_qkv_grads_tail_bf16(
+            CudaPtr(grad_q_proj_bf16.cu_ptr(stream)?),
+            CudaPtr(grad_k_proj_bf16.cu_ptr(stream)?),
+            CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
+            CudaPtr(grad_v_xsa.cu_ptr(stream)?),
+            CudaPtr(buf.qkv_aux_bf16.cu_ptr(stream)?),
+            tokens as u32,
+            d as u32,
+            kv as u32,
+            add_v_xsa,
+        )?;
+
+        let qkv_w_bf16 = self.weights.qkv_bank_bf16.slice_first(layer)?;
+        self.linear_backward_input_bf16_and_weight_dy_x_bf16_ready(
+            &buf.qkv_aux_bf16,
+            attn_norm_bf16,
+            &qkv_w_bf16,
+            &block_cache.grad_attn_norm_bf16,
+            &block_cache.grad_qkv_weight,
+            tokens,
+            d + 2 * kv,
+            d,
+            0.0,
+            0.0,
+        )?;
+        self.kernels.unpack_qkv_weight_grad(
+            CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
+            CudaPtr(grads.qo_bank.cu_ptr(stream)?),
+            CudaPtr(grads.kv_bank.cu_ptr(stream)?),
+            layer as u32,
+            n as u32,
+            d as u32,
+            kv as u32,
+        )?;
         Ok(true)
     }
 
@@ -4350,6 +4569,7 @@ impl GpuModel {
         grads: &mut GpuGradBuffers,
         runtime_seq_len: usize,
         saved: Option<&GpuLayerForwardCache>,
+        forward_generation: u64,
         mut stage_timing: Option<&mut GpuBackwardStageTiming>,
     ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
@@ -4802,6 +5022,25 @@ impl GpuModel {
 
         let grad_attn_out = &block_cache.grad_attn_out;
         let grad_v_xsa = &block_cache.grad_v_xsa;
+        // Consumer-side freshness gate (backward): if forward used the prepacked
+        // BF16 producer for this layer, the saved BF16 Q/K/V buffers must still
+        // belong to THIS step and layer. Catches stale-cache reuse if backward
+        // is somehow invoked without a fresh forward, or if the backward layer
+        // order desyncs from the forward layer order.
+        if self.use_cudnn_prepacked_bf16_attention() {
+            if let Some(saved) = saved_direct {
+                saved.bf16_qkv_freshness.require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    forward_generation,
+                    layer,
+                    t,
+                    runtime_seq_len,
+                    h,
+                    hkv,
+                    hd,
+                )?;
+            }
+        }
         let saved_attention_bf16 = if self.use_cudnn_saved_bf16_attention() {
             if let Some(saved) = saved_direct {
                 Some((
@@ -5046,6 +5285,9 @@ impl GpuModel {
         let use_bf16_attention_backward_tail = self.use_bf16_attention_backward_tail()
             && saved_attention_bf16.is_some()
             && attn_stats.is_some();
+        let use_bf16_attention_tail_qkv_pack =
+            use_bf16_attention_backward_tail && self.use_bf16_attention_tail_qkv_pack();
+        let add_v_xsa = layer >= n.saturating_sub(self.config.xsa_last_n);
         let attention_sdpa_start = record_stage_event_if(stream, stage_timing.is_some())?;
         if use_bf16_attention_backward_tail {
             let (q_bf16, k_bf16, v_bf16, out_bf16) =
@@ -5066,11 +5308,13 @@ impl GpuModel {
                 runtime_seq_len,
                 attn_stats.expect("checked by use_bf16_attention_backward_tail"),
             )?;
-            self.kernels.bf16_to_f32(
-                CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
-                CudaPtr(grad_v_projection.cu_ptr(stream)?),
-                (t * kv) as u32,
-            )?;
+            if !use_bf16_attention_tail_qkv_pack {
+                self.kernels.bf16_to_f32(
+                    CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_v_projection.cu_ptr(stream)?),
+                    (t * kv) as u32,
+                )?;
+            }
         } else {
             self.run_attention_backward(
                 act!(q).cu_ptr(stream)?,
@@ -5097,7 +5341,7 @@ impl GpuModel {
                 .as_deref_mut()
                 .map(|timing| &mut timing.backward_block_attention_sdpa_ms),
         )?;
-        if layer >= n.saturating_sub(self.config.xsa_last_n) {
+        if add_v_xsa && !use_bf16_attention_tail_qkv_pack {
             let attention_xsa_accum_start = record_stage_event_if(stream, stage_timing.is_some())?;
             self.add_inplace(&grad_v_projection, &grad_v_xsa, 1.0)?;
             finish_stage_event_optional(
@@ -5120,8 +5364,46 @@ impl GpuModel {
 
         let grad_q_proj = &block_cache.grad_q_proj;
         let grad_k_proj = &block_cache.grad_k_proj;
+        let grad_q_proj_bf16 = &block_cache.grad_q_proj_bf16;
+        let grad_k_proj_bf16 = &block_cache.grad_k_proj_bf16;
         let qkv_rope_start = record_stage_event_if(stream, stage_timing.is_some())?;
-        if use_bf16_attention_backward_tail {
+        if use_bf16_attention_tail_qkv_pack {
+            let q_gain_chunks = t.div_ceil(256).max(1);
+            self.zero_tensor(&block_cache.q_gain_reduce_scratch)?;
+            self.kernels
+                .q_gain_rope_qk_norm_bwd_chunked_go_bf16_out_bf16(
+                    CudaPtr(block_act!(q_pre_norm).cu_ptr(stream)?),
+                    CudaPtr(block_act!(q_post_rope).cu_ptr(stream)?),
+                    CudaPtr(grad_q_post_gain_bf16.cu_ptr(stream)?),
+                    CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                    CudaPtr(grad_q_proj_bf16.cu_ptr(stream)?),
+                    CudaPtr(block_cache.q_gain_reduce_scratch.cu_ptr(stream)?),
+                    CudaPtr(grads.block_q_gain[layer].cu_ptr(stream)?),
+                    runtime_seq_len as u32,
+                    h as u32,
+                    hd as u32,
+                    self.config.rope_dims as u32,
+                    (t * h) as u32,
+                    256,
+                    q_gain_chunks as u32,
+                    1e-6,
+                )?;
+            self.kernels.rope_qk_norm_bwd_go_bf16_out_bf16(
+                CudaPtr(block_act!(k_pre_norm).cu_ptr(stream)?),
+                CudaPtr(grad_k_attn_bf16.cu_ptr(stream)?),
+                CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                CudaPtr(grad_k_proj_bf16.cu_ptr(stream)?),
+                runtime_seq_len as u32,
+                hkv as u32,
+                hd as u32,
+                self.config.rope_dims as u32,
+                (t * hkv) as u32,
+                1e-6,
+            )?;
+        } else if use_bf16_attention_backward_tail {
             let q_gain_chunks = t.div_ceil(256).max(1);
             self.zero_tensor(&block_cache.q_gain_reduce_scratch)?;
             self.kernels.q_gain_rope_qk_norm_bwd_chunked_go_bf16(
@@ -5271,19 +5553,41 @@ impl GpuModel {
 
         let grad_attn_norm = &block_cache.grad_attn_norm;
         let qkv_proj_start = record_stage_event_if(stream, stage_timing.is_some())?;
-        let qkv_fused = self.qkv_projection_backward(
-            layer,
-            buf,
-            block_cache,
-            grads,
-            grad_q_proj,
-            grad_k_proj,
-            grad_v_projection,
-            grad_attn_norm,
-            saved_direct.map(|saved| &saved.attn_norm),
-            saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
-            t,
-        )?;
+        let qkv_fused = if use_bf16_attention_tail_qkv_pack {
+            self.qkv_projection_backward_from_tail_bf16(
+                layer,
+                buf,
+                block_cache,
+                grads,
+                grad_q_proj_bf16,
+                grad_k_proj_bf16,
+                grad_v_projection_bf16,
+                grad_v_xsa,
+                add_v_xsa,
+                saved_direct.map(|saved| &saved.attn_norm),
+                saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
+                t,
+            )?
+        } else {
+            self.qkv_projection_backward(
+                layer,
+                buf,
+                block_cache,
+                grads,
+                grad_q_proj,
+                grad_k_proj,
+                grad_v_projection,
+                grad_attn_norm,
+                saved_direct.map(|saved| &saved.attn_norm),
+                saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
+                t,
+            )?
+        };
+        if use_bf16_attention_tail_qkv_pack && !qkv_fused {
+            return Err(pg_core::PgError::InvalidOp(
+                "BF16 attention tail QKV pack requires fused QKV projection backward".into(),
+            ));
+        }
         if !qkv_fused {
             let q_w = self.weights.qo_bank.slice_first(layer)?;
             let q_w_bf16 = self.weights.qo_bank_bf16.slice_first(layer)?;
@@ -5629,6 +5933,7 @@ impl GpuModel {
         saved: Option<&GpuLayerForwardCache>,
         recurrent_pass1_saved: Option<&GpuLayerForwardCache>,
         recurrent_mid_x: Option<&GpuTensor>,
+        forward_generation: u64,
         mut stage_timing: Option<&mut GpuBackwardStageTiming>,
     ) -> PgResult<()> {
         if self.is_recurrent_layer(layer) {
@@ -5649,6 +5954,7 @@ impl GpuModel {
                     grads,
                     runtime_seq_len,
                     Some(pass2_saved),
+                    forward_generation,
                     stage_timing.as_deref_mut(),
                 )?;
                 return self.block_backward_single_into(
@@ -5664,6 +5970,7 @@ impl GpuModel {
                     grads,
                     runtime_seq_len,
                     Some(pass1_saved),
+                    forward_generation,
                     stage_timing.as_deref_mut(),
                 );
             }
@@ -5692,6 +5999,7 @@ impl GpuModel {
                 grads,
                 runtime_seq_len,
                 None,
+                forward_generation,
                 stage_timing.as_deref_mut(),
             )?;
             return self.block_backward_single_into(
@@ -5707,6 +6015,7 @@ impl GpuModel {
                 grads,
                 runtime_seq_len,
                 None,
+                forward_generation,
                 stage_timing.as_deref_mut(),
             );
         }
@@ -5724,6 +6033,7 @@ impl GpuModel {
             grads,
             runtime_seq_len,
             saved,
+            forward_generation,
             stage_timing,
         )
     }
@@ -6001,16 +6311,11 @@ impl GpuModel {
                 hkv,
                 hd,
             );
-            save.bf16_qkv_freshness.require(
-                Bf16QkvProducer::FusedNormQkvRopeGain,
-                forward_generation,
-                layer,
-                t,
-                runtime_seq_len,
-                h,
-                hkv,
-                hd,
-            )?;
+            // Consumer-side `require()` runs at the cuDNN prepacked-attention call site
+            // (forward) and at the backward attention consumer. This is the canonical
+            // freshness check; an immediate `require()` here would be a tautological
+            // self-test of `mark()` rather than a stale-buffer guard. See test
+            // `bf16_qkv_freshness_rejects_stale_step_and_layer` for the contract.
         }
         if let Some(save) = save.filter(|_| !skip_f32_attention_saved) {
             self.copy_tensor(&buf.q, &save.q)?;
@@ -6045,6 +6350,26 @@ impl GpuModel {
         } else {
             None
         };
+        // Consumer-side freshness gate: when the prepacked BF16 attention path is in
+        // effect, the BF16 Q/K/V buffers must have been just produced by the fused
+        // norm+QKV+RoPE+gain forward for THIS layer/step/shape. If the producer was
+        // skipped (e.g., a misconfigured gate combination), this fires before cuDNN
+        // can read garbage. The non-prepacked saved-BF16 path uses the buffers as
+        // cuDNN write sinks, so freshness is not required there.
+        if prepack_bf16_attention {
+            if let Some(save) = save {
+                save.bf16_qkv_freshness.require(
+                    Bf16QkvProducer::FusedNormQkvRopeGain,
+                    forward_generation,
+                    layer,
+                    t,
+                    runtime_seq_len,
+                    h,
+                    hkv,
+                    hd,
+                )?;
+            }
+        }
         let is_xsa_layer = layer >= n.saturating_sub(self.config.xsa_last_n);
         let bf16_sparse_xsa_forward = is_xsa_layer
             && self.config.sparse_attn_gate_enabled
@@ -7763,6 +8088,29 @@ impl GpuModel {
         .map(|_| ())
     }
 
+    pub fn backward_with_state_seq_len_no_loss_observed(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+        runtime_seq_len: usize,
+        observer: &mut dyn GpuBackwardLayerObserver,
+    ) -> PgResult<()> {
+        self.backward_with_state_seq_len_loss_mode_observed(
+            input_ids,
+            targets,
+            buf,
+            state,
+            grads,
+            false,
+            runtime_seq_len,
+            Some(observer),
+        )
+        .map(|_| ())
+    }
+
     fn backward_with_state_seq_len_loss_mode(
         &self,
         input_ids: &GpuTensor,
@@ -7772,6 +8120,29 @@ impl GpuModel {
         grads: &mut GpuGradBuffers,
         compute_loss: bool,
         runtime_seq_len: usize,
+    ) -> PgResult<f32> {
+        self.backward_with_state_seq_len_loss_mode_observed(
+            input_ids,
+            targets,
+            buf,
+            state,
+            grads,
+            compute_loss,
+            runtime_seq_len,
+            None,
+        )
+    }
+
+    fn backward_with_state_seq_len_loss_mode_observed(
+        &self,
+        input_ids: &GpuTensor,
+        targets: &GpuTensor,
+        buf: &mut GpuActivations,
+        state: &mut GpuBackwardState,
+        grads: &mut GpuGradBuffers,
+        compute_loss: bool,
+        runtime_seq_len: usize,
+        mut observer: Option<&mut dyn GpuBackwardLayerObserver>,
     ) -> PgResult<f32> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -7794,6 +8165,10 @@ impl GpuModel {
             runtime_seq_len,
             Some(stage_timing),
         )?;
+        // Capture the forward_generation that the just-completed forward stamped
+        // into the saved BF16 freshness state. Backward consumer-side `require()`
+        // calls verify the saved BF16 buffers belong to this exact step.
+        let forward_generation = state.cache.forward_generation.get();
         finish_stage_event(stream, stage_start, &mut state.stage_timing.forward_ms)?;
 
         let stage_start = record_stage_event(stream)?;
@@ -7883,8 +8258,12 @@ impl GpuModel {
                 saved,
                 recurrent_pass1_saved,
                 recurrent_mid_x,
+                forward_generation,
                 Some(&mut state.stage_timing),
             )?;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.after_layer(self, bi, grads)?;
+            }
             std::mem::swap(&mut grad_x, &mut next_grad_x);
 
             if i < n_skip {
@@ -7950,8 +8329,12 @@ impl GpuModel {
                 saved,
                 recurrent_pass1_saved,
                 recurrent_mid_x,
+                forward_generation,
                 Some(&mut state.stage_timing),
             )?;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.after_layer(self, i, grads)?;
+            }
             std::mem::swap(&mut grad_x, &mut next_grad_x);
         }
         finish_stage_event(stream, stage_start, &mut state.stage_timing.encoder_ms)?;

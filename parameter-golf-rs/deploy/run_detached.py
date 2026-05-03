@@ -134,6 +134,7 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     # Keep it as an explicit A/B flag until the downstream BF16 QKV gradient
     # pack path is complete enough to offset the cuDNN BF16-gradient overhead.
     os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "0"
+    os.environ["PG_GPU_BF16_ATTN_TAIL_QKV_PACK"] = "0"
     os.environ["PG_GPU_BF16_QKV_DX_OUTPUT"] = "1"
     os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
     os.environ["PG_GPU_CHUNKED_OUTPUT_CE_CACHE"] = "1"
@@ -395,6 +396,25 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-grouped-sharded-grad-collectives" in forwarded:
         forwarded.remove("--disable-grouped-sharded-grad-collectives")
         os.environ["PG_NCCL_GROUP_SHARDED_GRAD_COLLECTIVES"] = "0"
+    if "--enable-nccl-bucket-overlap" in forwarded:
+        forwarded.remove("--enable-nccl-bucket-overlap")
+        os.environ["PG_NCCL_BUCKET_OVERLAP"] = "1"
+    if "--disable-nccl-bucket-overlap" in forwarded:
+        forwarded.remove("--disable-nccl-bucket-overlap")
+        os.environ["PG_NCCL_BUCKET_OVERLAP"] = "0"
+    if "--enable-nccl-side-stream-collectives" in forwarded:
+        forwarded.remove("--enable-nccl-side-stream-collectives")
+        os.environ["PG_NCCL_SIDE_STREAM_COLLECTIVES"] = "1"
+    if "--disable-nccl-side-stream-collectives" in forwarded:
+        forwarded.remove("--disable-nccl-side-stream-collectives")
+        os.environ["PG_NCCL_SIDE_STREAM_COLLECTIVES"] = "0"
+    if "--enable-backward-nccl-bucket-overlap" in forwarded:
+        forwarded.remove("--enable-backward-nccl-bucket-overlap")
+        os.environ["PG_NCCL_BACKWARD_BUCKET_OVERLAP"] = "1"
+        os.environ["PG_NCCL_SIDE_STREAM_COLLECTIVES"] = "1"
+    if "--disable-backward-nccl-bucket-overlap" in forwarded:
+        forwarded.remove("--disable-backward-nccl-bucket-overlap")
+        os.environ["PG_NCCL_BACKWARD_BUCKET_OVERLAP"] = "0"
     if "--disable-fused-attn-residual-from-base" in forwarded:
         forwarded.remove("--disable-fused-attn-residual-from-base")
         os.environ["PG_GPU_FUSED_ATTN_RESIDUAL_FROM_BASE"] = "0"
@@ -455,6 +475,13 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-bf16-attn-backward-tail" in forwarded:
         forwarded.remove("--disable-bf16-attn-backward-tail")
         os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "0"
+    if "--enable-bf16-attn-tail-qkv-pack" in forwarded:
+        forwarded.remove("--enable-bf16-attn-tail-qkv-pack")
+        os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "1"
+        os.environ["PG_GPU_BF16_ATTN_TAIL_QKV_PACK"] = "1"
+    if "--disable-bf16-attn-tail-qkv-pack" in forwarded:
+        forwarded.remove("--disable-bf16-attn-tail-qkv-pack")
+        os.environ["PG_GPU_BF16_ATTN_TAIL_QKV_PACK"] = "0"
     if "--enable-shifted-u16-batch-upload" in forwarded:
         forwarded.remove("--enable-shifted-u16-batch-upload")
         os.environ["PG_GPU_SHIFTED_U16_BATCH_UPLOAD"] = "1"

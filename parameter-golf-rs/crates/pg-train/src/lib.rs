@@ -502,10 +502,33 @@ impl CudaSingleFastRuntime {
 struct CudaDistributedRuntime {
     replicas: Vec<CudaSingleFastRuntime>,
     comms: Vec<pg_core::nccl::NcclComm>,
+    /// One side stream per replica, used to issue post-backward NCCL
+    /// collectives away from the main GEMM stream when side-stream collectives
+    /// are enabled. Always allocated so future bucket-fire-during-backward
+    /// callers can record events on these streams without per-step setup.
+    comm_side_streams: Vec<std::sync::Arc<cudarc::driver::CudaStream>>,
+    /// Reusable cross-stream events for main↔side NCCL handoffs. These are
+    /// created once with timing disabled; recording them per boundary avoids
+    /// allocating CUDA events inside the training step.
+    comm_side_events: Vec<NcclSideStreamEvents>,
+    /// Second NCCL communicator pool, one per replica, bound to `comm_side_streams`.
+    /// Populated only when side-stream collectives are enabled. Built via a
+    /// second `Comm::from_devices(...)` call — NCCL supports multiple
+    /// concurrent communicators per device, so the main-stream comms in
+    /// `comms` and these side-stream comms operate as independent channels on
+    /// the same NVLink
+    /// fabric.
+    comm_side_comms: Option<Vec<pg_core::nccl::NcclComm>>,
     parallel_muon: Option<ShardedParallelMuonRuntime>,
     all_grad_sync: Vec<AllGradSyncBuffers>,
     non_bank_sync: Vec<NonBankSyncBuffers>,
     distributed_sync: bool,
+}
+
+#[cfg(feature = "cuda")]
+struct NcclSideStreamEvents {
+    main_to_side: cudarc::driver::CudaEvent,
+    side_to_main: cudarc::driver::CudaEvent,
 }
 
 #[cfg(feature = "cuda")]
@@ -551,6 +574,23 @@ fn sharded_bank_real_batch(buffers: &ShardedBankBuffers, rank: usize) -> usize {
 }
 
 #[cfg(feature = "cuda")]
+fn sharded_bank_owner(
+    buffers: &ShardedBankBuffers,
+    matrix_index: usize,
+) -> PgResult<(usize, usize)> {
+    if matrix_index >= buffers.real_batch {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "bank matrix index {matrix_index} >= real batch {}",
+            buffers.real_batch
+        )));
+    }
+    Ok((
+        matrix_index / buffers.chunk_batch.max(1),
+        matrix_index % buffers.chunk_batch.max(1),
+    ))
+}
+
+#[cfg(feature = "cuda")]
 impl CudaDistributedRuntime {
     fn new(
         model: &GptModel,
@@ -583,6 +623,54 @@ impl CudaDistributedRuntime {
             .map(|runtime| runtime.gpu_model.gemm.stream().clone())
             .collect::<Vec<_>>();
         let comms = pg_core::nccl::NcclComm::from_local_devices(streams)?;
+
+        // Allocate one side stream per replica. Cheap (a side stream is just a
+        // CUDA stream handle); used for cross-stream sync once side-stream
+        // collectives are enabled. We allocate unconditionally so the field is always available
+        // for future per-bucket scheduling without per-step setup overhead.
+        let comm_side_streams = replicas
+            .iter()
+            .map(|runtime| {
+                runtime
+                    .gpu_model
+                    .gemm
+                    .stream()
+                    .context()
+                    .new_stream()
+                    .map_err(|e| {
+                        pg_core::PgError::InvalidOp(format!("comm side stream init failed: {e:?}"))
+                    })
+            })
+            .collect::<PgResult<Vec<_>>>()?;
+        let comm_side_events = comm_side_streams
+            .iter()
+            .map(|stream| {
+                let context = stream.context();
+                Ok(NcclSideStreamEvents {
+                    main_to_side: context.new_event(None).map_err(|e| {
+                        pg_core::PgError::InvalidOp(format!(
+                            "comm side main->side event init failed: {e:?}"
+                        ))
+                    })?,
+                    side_to_main: context.new_event(None).map_err(|e| {
+                        pg_core::PgError::InvalidOp(format!(
+                            "comm side side->main event init failed: {e:?}"
+                        ))
+                    })?,
+                })
+            })
+            .collect::<PgResult<Vec<_>>>()?;
+        // Only build the side NCCL comm pool when side-stream collectives are
+        // requested.
+        // Building two NCCL pools per device costs initialization time and a
+        // second set of NCCL channel buffers; we don't pay that unless enabled.
+        let comm_side_comms = if nccl_side_stream_collectives_enabled() {
+            Some(pg_core::nccl::NcclComm::from_local_devices(
+                comm_side_streams.clone(),
+            )?)
+        } else {
+            None
+        };
         let all_grad_sync = if plan.run_spec.train.distributed_optimizer_backend
             == DistributedOptimizerBackend::AllReduceReplicatedMuon
         {
@@ -630,6 +718,9 @@ impl CudaDistributedRuntime {
         Ok(Self {
             replicas,
             comms,
+            comm_side_streams,
+            comm_side_events,
+            comm_side_comms,
             parallel_muon,
             all_grad_sync,
             non_bank_sync,
@@ -1886,7 +1977,7 @@ fn cuda_single_fast_step(
         &mut runtime.host_input_ids,
         &mut runtime.host_targets,
     );
-    let loss_sum = cuda_fast_accumulate_runtime_grads(runtime, true, seq_len, None)?;
+    let loss_sum = cuda_fast_accumulate_runtime_grads(runtime, true, seq_len, None, None)?;
     cuda_fast_apply_updates(runtime, train_config, step, lr_scale)?;
     Ok(loss_sum)
 }
@@ -1897,6 +1988,7 @@ fn cuda_fast_accumulate_runtime_grads(
     compute_loss: bool,
     runtime_seq_len: usize,
     mut timing: Option<&mut RunTiming>,
+    observer: Option<&mut dyn pg_model::gpu::GpuBackwardLayerObserver>,
 ) -> PgResult<f32> {
     let h2d_t0 = Instant::now();
     if gpu_shifted_u16_batch_upload_enabled_for_audit()
@@ -1924,7 +2016,25 @@ fn cuda_fast_accumulate_runtime_grads(
         timing.cuda_h2d_ms += h2d_t0.elapsed().as_secs_f64() * 1000.0;
     }
 
-    if compute_loss {
+    if let Some(observer) = observer {
+        if compute_loss {
+            return Err(pg_core::PgError::InvalidOp(
+                "observed CUDA backward does not support loss-return mode".into(),
+            ));
+        }
+        runtime
+            .gpu_model
+            .backward_with_state_seq_len_no_loss_observed(
+                &runtime.input_ids,
+                &runtime.targets,
+                &mut runtime.gpu_buf,
+                &mut runtime.backward_state,
+                &mut runtime.gpu_grads,
+                runtime_seq_len,
+                observer,
+            )?;
+        Ok(0.0)
+    } else if compute_loss {
         runtime.gpu_model.backward_with_state_seq_len(
             &runtime.input_ids,
             &runtime.targets,
@@ -2859,13 +2969,45 @@ fn cuda_distributed_all_reduce_average(
         pack_all_gpu_grads(&replica.gpu_model.kernels, &replica.gpu_grads, packed)?;
     }
 
+    // Same side-stream pattern as the sharded-parallel-muon path: when
+    // side-stream collectives are enabled, route the all-reduce through the
+    // side comm pool and bracket it with reusable cross-stream events.
+    let use_side_comms_all = runtime.comm_side_comms.is_some();
+    if use_side_comms_all {
+        nccl_side_stream_main_to_side(
+            &runtime.replicas,
+            &runtime.comm_side_streams,
+            &runtime.comm_side_events,
+            "all-grad all-reduce",
+        )?;
+    }
+    let active_comms_all = if use_side_comms_all {
+        runtime
+            .comm_side_comms
+            .as_ref()
+            .expect("checked use_side_comms_all")
+    } else {
+        &runtime.comms
+    };
     cudarc::nccl::group_start()
         .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
-    for (buffers, comm) in runtime.all_grad_sync.iter_mut().zip(runtime.comms.iter()) {
+    for (buffers, comm) in runtime
+        .all_grad_sync
+        .iter_mut()
+        .zip(active_comms_all.iter())
+    {
         comm.all_reduce_sum_tensor_f32_in_place(&mut buffers.packed_grad)?;
     }
     cudarc::nccl::group_end()
         .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+    if use_side_comms_all {
+        nccl_side_stream_side_to_main(
+            &runtime.replicas,
+            &runtime.comm_side_streams,
+            &runtime.comm_side_events,
+            "all-grad all-reduce",
+        )?;
+    }
 
     let inv_world = 1.0f32 / (runtime.replicas.len() * local_microbatches.max(1)) as f32;
     for rank in 0..runtime.replicas.len() {
@@ -2946,6 +3088,161 @@ fn bank_param_bf16(
 }
 
 #[cfg(feature = "cuda")]
+fn nccl_side_stream_main_to_side(
+    replicas: &[CudaSingleFastRuntime],
+    side_streams: &[std::sync::Arc<cudarc::driver::CudaStream>],
+    side_events: &[NcclSideStreamEvents],
+    label: &str,
+) -> PgResult<()> {
+    if side_streams.len() != replicas.len() || side_events.len() != replicas.len() {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "nccl side-stream handoff {label}: replica/stream/event count mismatch (replicas={}, side_streams={}, events={})",
+            replicas.len(),
+            side_streams.len(),
+            side_events.len()
+        )));
+    }
+    for rank in 0..replicas.len() {
+        let main_stream = replicas[rank].gpu_model.gemm.stream();
+        let event = &side_events[rank].main_to_side;
+        event.record(main_stream).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "nccl side-stream collectives: {label} rank {rank} main->side event record failed: {e:?}"
+            ))
+        })?;
+        side_streams[rank].wait(event).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "nccl side-stream collectives: {label} rank {rank} side wait failed: {e:?}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn nccl_side_stream_side_to_main(
+    replicas: &[CudaSingleFastRuntime],
+    side_streams: &[std::sync::Arc<cudarc::driver::CudaStream>],
+    side_events: &[NcclSideStreamEvents],
+    label: &str,
+) -> PgResult<()> {
+    if side_streams.len() != replicas.len() || side_events.len() != replicas.len() {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "nccl side-stream handoff {label}: replica/stream/event count mismatch (replicas={}, side_streams={}, events={})",
+            replicas.len(),
+            side_streams.len(),
+            side_events.len()
+        )));
+    }
+    for rank in 0..replicas.len() {
+        let main_stream = replicas[rank].gpu_model.gemm.stream();
+        let event = &side_events[rank].side_to_main;
+        event.record(&side_streams[rank]).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "nccl side-stream collectives: {label} rank {rank} side->main event record failed: {e:?}"
+            ))
+        })?;
+        main_stream.wait(event).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "nccl side-stream collectives: {label} rank {rank} main wait failed: {e:?}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+struct BackwardBucketOverlapObserver<'a> {
+    rank: usize,
+    world_size: usize,
+    num_layers: usize,
+    comm: &'a pg_core::nccl::NcclComm,
+    side_stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    side_events: &'a NcclSideStreamEvents,
+    sharded: &'a mut ShardedParallelMuonReplica,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> BackwardBucketOverlapObserver<'a> {
+    fn reduce_bank_matrix(
+        &mut self,
+        model: &pg_model::gpu::GpuModel,
+        bank_idx: usize,
+        matrix_index: usize,
+        grad_bank: &pg_core::GpuTensor,
+        label: &str,
+    ) -> PgResult<()> {
+        let kernels = &model.kernels;
+        let buffers = &mut self.sharded.banks[bank_idx];
+        let (owner_rank, local_idx) = sharded_bank_owner(buffers, matrix_index)?;
+        if owner_rank >= self.world_size {
+            return Ok(());
+        }
+
+        let grad_matrix = grad_bank.slice_first(matrix_index)?;
+
+        let event = &self.side_events.main_to_side;
+        event.record(kernels.stream()).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "backward NCCL bucket overlap: {label} rank {} main->side record failed: {e:?}",
+                self.rank
+            ))
+        })?;
+        self.side_stream.wait(event).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "backward NCCL bucket overlap: {label} rank {} side wait failed: {e:?}",
+                self.rank
+            ))
+        })?;
+
+        // Fire a per-matrix reduce directly from the stable gradient bank slice
+        // into the owner rank's shard slot. This avoids the unsafe staging
+        // buffer pattern where the main stream could overwrite a send bucket
+        // while the side stream was still reading it. The first production
+        // bucket scheduler prioritizes correct overlap over BF16-on-wire; the
+        // existing post-backward reduce-scatter path still owns the BF16 wire
+        // optimization for non-overlapped runs.
+        if owner_rank == self.rank {
+            let mut recv = buffers.shard_grad.slice_first(local_idx)?;
+            self.comm
+                .reduce_sum_tensor_f32_to_rank(&grad_matrix, Some(&mut recv), owner_rank)?;
+        } else {
+            self.comm
+                .reduce_sum_tensor_f32_to_rank(&grad_matrix, None, owner_rank)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl pg_model::gpu::GpuBackwardLayerObserver for BackwardBucketOverlapObserver<'_> {
+    fn after_layer(
+        &mut self,
+        model: &pg_model::gpu::GpuModel,
+        layer: usize,
+        grads: &pg_model::gpu::GpuGradBuffers,
+    ) -> PgResult<()> {
+        let n = self.num_layers;
+        cudarc::nccl::group_start()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+        let result = (|| -> PgResult<()> {
+            self.reduce_bank_matrix(model, 0, layer, &grads.qo_bank, "qo/q")?;
+            self.reduce_bank_matrix(model, 0, n + layer, &grads.qo_bank, "qo/o")?;
+            self.reduce_bank_matrix(model, 1, layer, &grads.kv_bank, "kv/k")?;
+            self.reduce_bank_matrix(model, 1, n + layer, &grads.kv_bank, "kv/v")?;
+            self.reduce_bank_matrix(model, 2, layer, &grads.mlp_up_bank, "mlp/up")?;
+            self.reduce_bank_matrix(model, 3, layer, &grads.mlp_down_bank, "mlp/down")?;
+            Ok(())
+        })();
+        let group_result = cudarc::nccl::group_end()
+            .map(|_| ())
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")));
+        result?;
+        group_result
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn bank_grad(replica: &CudaSingleFastRuntime, bank_idx: usize) -> PgResult<&pg_core::GpuTensor> {
     match bank_idx {
         0 => Ok(&replica.gpu_grads.qo_bank),
@@ -2988,6 +3285,8 @@ fn cuda_distributed_sharded_parallel_muon_step(
         .map(|replica| replica.banks.len())
         .unwrap_or(0);
     let bf16_shadow_all_gather = sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit();
+    let bank_grads_bucketed_during_backward =
+        backward_nccl_bucket_overlap_enabled() && runtime.comm_side_comms.is_some();
     if runtime
         .parallel_muon
         .as_ref()
@@ -3011,30 +3310,32 @@ fn cuda_distributed_sharded_parallel_muon_step(
             for rank in 0..world_size {
                 let replica = &runtime.replicas[rank];
                 let kernels = &replica.gpu_model.kernels;
-                let grad = bank_grad(replica, bank_idx)?;
                 let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
-                if buffers.real_batch < buffers.padded_grad.shape()[0] {
-                    let tail = buffers
-                        .padded_grad
-                        .slice_range(buffers.real_batch, buffers.padded_grad.shape()[0])?;
-                    scale_gpu_tensor(kernels, &tail, 0.0)?;
-                }
-                let grad_dst = buffers.padded_grad.slice_range(0, buffers.real_batch)?;
-                kernels.copy_fwd(
-                    pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
-                    pg_kernels::gpu_kernels::CudaPtr(grad_dst.cu_ptr(kernels.stream())?),
-                    grad.numel() as u32,
-                )?;
-                if sharded_bank_grad_bf16_wire_enabled_for_audit() {
-                    kernels.f32_to_bf16(
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            buffers.padded_grad.cu_ptr(kernels.stream())?,
-                        ),
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            buffers.padded_grad_bf16.cu_ptr(kernels.stream())?,
-                        ),
-                        buffers.padded_grad.numel() as u32,
+                if !bank_grads_bucketed_during_backward {
+                    let grad = bank_grad(replica, bank_idx)?;
+                    if buffers.real_batch < buffers.padded_grad.shape()[0] {
+                        let tail = buffers
+                            .padded_grad
+                            .slice_range(buffers.real_batch, buffers.padded_grad.shape()[0])?;
+                        scale_gpu_tensor(kernels, &tail, 0.0)?;
+                    }
+                    let grad_dst = buffers.padded_grad.slice_range(0, buffers.real_batch)?;
+                    kernels.copy_fwd(
+                        pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
+                        pg_kernels::gpu_kernels::CudaPtr(grad_dst.cu_ptr(kernels.stream())?),
+                        grad.numel() as u32,
                     )?;
+                    if sharded_bank_grad_bf16_wire_enabled_for_audit() {
+                        kernels.f32_to_bf16(
+                            pg_kernels::gpu_kernels::CudaPtr(
+                                buffers.padded_grad.cu_ptr(kernels.stream())?,
+                            ),
+                            pg_kernels::gpu_kernels::CudaPtr(
+                                buffers.padded_grad_bf16.cu_ptr(kernels.stream())?,
+                            ),
+                            buffers.padded_grad.numel() as u32,
+                        )?;
+                    }
                 }
 
                 let shard_start = rank * buffers.chunk_batch;
@@ -3055,22 +3356,57 @@ fn cuda_distributed_sharded_parallel_muon_step(
             }
         }
 
-        if sharded_grouped_grad_collectives_enabled_for_audit() {
+        // Choose which NCCL communicator pool to use. Side-stream collectives
+        // run on `comm_side_streams[rank]`. In bucketed mode the side stream
+        // already contains per-layer bank reductions issued by the backward
+        // observer, so the non-bank all-reduce is queued after those buckets
+        // and a single side→main wait below makes every reduced shard visible
+        // before clipping and Muon consume it.
+        let use_side_comms = runtime.comm_side_comms.is_some();
+        if use_side_comms {
+            nccl_side_stream_main_to_side(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                if bank_grads_bucketed_during_backward {
+                    "non-bank all-reduce after backward bank buckets"
+                } else {
+                    "bank grad reduce-scatter"
+                },
+            )?;
+        }
+        let active_comms = if use_side_comms {
+            runtime
+                .comm_side_comms
+                .as_ref()
+                .expect("checked use_side_comms")
+        } else {
+            &runtime.comms
+        };
+        if bank_grads_bucketed_during_backward {
             cudarc::nccl::group_start()
                 .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
-            for (buffers, comm) in runtime.non_bank_sync.iter_mut().zip(runtime.comms.iter()) {
+            for (buffers, comm) in runtime.non_bank_sync.iter_mut().zip(active_comms.iter()) {
+                comm.all_reduce_sum_tensor_f32_in_place(&mut buffers.packed_grad)?;
+            }
+            cudarc::nccl::group_end()
+                .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+        } else if sharded_grouped_grad_collectives_enabled_for_audit() {
+            cudarc::nccl::group_start()
+                .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+            for (buffers, comm) in runtime.non_bank_sync.iter_mut().zip(active_comms.iter()) {
                 comm.all_reduce_sum_tensor_f32_in_place(&mut buffers.packed_grad)?;
             }
             for bank_idx in 0..bank_count {
                 for rank in 0..world_size {
                     let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
                     if sharded_bank_grad_bf16_wire_enabled_for_audit() {
-                        runtime.comms[rank].reduce_scatter_sum_tensor_bf16(
+                        active_comms[rank].reduce_scatter_sum_tensor_bf16(
                             &buffers.padded_grad_bf16,
                             &mut buffers.shard_grad_bf16,
                         )?;
                     } else {
-                        runtime.comms[rank].reduce_scatter_sum_tensor_f32(
+                        active_comms[rank].reduce_scatter_sum_tensor_f32(
                             &buffers.padded_grad,
                             &mut buffers.shard_grad,
                         )?;
@@ -3082,7 +3418,7 @@ fn cuda_distributed_sharded_parallel_muon_step(
         } else {
             cudarc::nccl::group_start()
                 .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
-            for (buffers, comm) in runtime.non_bank_sync.iter_mut().zip(runtime.comms.iter()) {
+            for (buffers, comm) in runtime.non_bank_sync.iter_mut().zip(active_comms.iter()) {
                 comm.all_reduce_sum_tensor_f32_in_place(&mut buffers.packed_grad)?;
             }
             cudarc::nccl::group_end()
@@ -3094,12 +3430,12 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 for rank in 0..world_size {
                     let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
                     if sharded_bank_grad_bf16_wire_enabled_for_audit() {
-                        runtime.comms[rank].reduce_scatter_sum_tensor_bf16(
+                        active_comms[rank].reduce_scatter_sum_tensor_bf16(
                             &buffers.padded_grad_bf16,
                             &mut buffers.shard_grad_bf16,
                         )?;
                     } else {
-                        runtime.comms[rank].reduce_scatter_sum_tensor_f32(
+                        active_comms[rank].reduce_scatter_sum_tensor_f32(
                             &buffers.padded_grad,
                             &mut buffers.shard_grad,
                         )?;
@@ -3108,6 +3444,18 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 cudarc::nccl::group_end()
                     .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
             }
+        }
+        if use_side_comms {
+            nccl_side_stream_side_to_main(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                if bank_grads_bucketed_during_backward {
+                    "backward bank buckets and non-bank all-reduce"
+                } else {
+                    "bank grad reduce-scatter"
+                },
+            )?;
         }
     }
 
@@ -3179,14 +3527,44 @@ fn cuda_distributed_sharded_parallel_muon_step(
             )?;
         }
     }
+    // Grad-norm scalar all-reduce. Same side-stream collective pattern as the
+    // non-bank packed reduce above: main stream records "norm scratch ready"
+    // after the dot_accumulate kernels, side stream waits + issues the
+    // all-reduce, then main stream waits before clip kernels read the reduced
+    // scalar.
+    let use_side_comms_norm = runtime.comm_side_comms.is_some();
+    if use_side_comms_norm {
+        nccl_side_stream_main_to_side(
+            &runtime.replicas,
+            &runtime.comm_side_streams,
+            &runtime.comm_side_events,
+            "grad-norm all-reduce",
+        )?;
+    }
+    let active_comms_norm = if use_side_comms_norm {
+        runtime
+            .comm_side_comms
+            .as_ref()
+            .expect("checked use_side_comms_norm")
+    } else {
+        &runtime.comms
+    };
     cudarc::nccl::group_start()
         .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
     for rank in 0..world_size {
-        runtime.comms[rank]
+        active_comms_norm[rank]
             .all_reduce_sum_tensor_f32_in_place(&mut runtime.replicas[rank].grad_norm_scratch)?;
     }
     cudarc::nccl::group_end()
         .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+    if use_side_comms_norm {
+        nccl_side_stream_side_to_main(
+            &runtime.replicas,
+            &runtime.comm_side_streams,
+            &runtime.comm_side_events,
+            "grad-norm all-reduce",
+        )?;
+    }
 
     for rank in 0..world_size {
         let replica = &runtime.replicas[rank];
@@ -3281,24 +3659,53 @@ fn cuda_distributed_sharded_parallel_muon_step(
             }
         }
 
+        // Param all-gather. Same side-stream collective pattern: side stream waits on the
+        // main-stream Muon-step event before reading shard_param; main stream
+        // waits on the all-gather completion event before the copy_fwd kernel
+        // that writes the gathered param back into the model bank.
+        let use_side_comms_gather = runtime.comm_side_comms.is_some();
+        if use_side_comms_gather {
+            nccl_side_stream_main_to_side(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                "bank param all-gather",
+            )?;
+        }
+        let active_comms_gather = if use_side_comms_gather {
+            runtime
+                .comm_side_comms
+                .as_ref()
+                .expect("checked use_side_comms_gather")
+        } else {
+            &runtime.comms
+        };
         cudarc::nccl::group_start()
             .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
         for bank_idx in 0..bank_count {
             for rank in 0..world_size {
                 let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
                 if bf16_shadow_all_gather {
-                    runtime.comms[rank].all_gather_tensor_bf16(
+                    active_comms_gather[rank].all_gather_tensor_bf16(
                         &buffers.shard_param_bf16,
                         &mut buffers.padded_param_bf16,
                     )?;
                 } else {
-                    runtime.comms[rank]
+                    active_comms_gather[rank]
                         .all_gather_tensor_f32(&buffers.shard_param, &mut buffers.padded_param)?;
                 }
             }
         }
         cudarc::nccl::group_end()
             .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+        if use_side_comms_gather {
+            nccl_side_stream_side_to_main(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                "bank param all-gather",
+            )?;
+        }
 
         for bank_idx in 0..bank_count {
             for rank in 0..world_size {
@@ -3416,6 +3823,94 @@ fn cuda_distributed_sync_f32_banks_from_sharded_muon(
 }
 
 #[cfg(feature = "cuda")]
+fn cuda_distributed_launch_replica_backward(
+    replica: &mut CudaSingleFastRuntime,
+    rank_idx: usize,
+    rank_batches: Option<&Vec<(Vec<u32>, Vec<u32>)>>,
+    compute_step_loss: bool,
+    runtime_seq_len: usize,
+    event_timing: bool,
+    observer: Option<&mut dyn pg_model::gpu::GpuBackwardLayerObserver>,
+) -> PgResult<ReplicaBackwardLaunchResult> {
+    let stream = replica.gpu_model.gemm.stream().clone();
+    let backward_host_t0 = Instant::now();
+    let backward_start_event = if event_timing {
+        Some(
+            stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|e| {
+                    pg_core::PgError::InvalidOp(format!("cuda backward event record failed: {e:?}"))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let zero_host_t0 = Instant::now();
+    let zero_start_event = if event_timing {
+        Some(
+            stream
+                .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|e| {
+                    pg_core::PgError::InvalidOp(format!(
+                        "cuda zero-grads event record failed: {e:?}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+    zero_gpu_grads(&replica.gpu_model.kernels, &mut replica.gpu_grads)?;
+
+    let mut result = ReplicaBackwardLaunchResult::default();
+    if let Some(start) = zero_start_event {
+        let end = stream
+            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| {
+                pg_core::PgError::InvalidOp(format!("cuda zero-grads event record failed: {e:?}"))
+            })?;
+        result.cuda_zero_grads_ms = start.elapsed_ms(&end).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda zero-grads event elapsed failed: {e:?}"))
+        })? as f64;
+    } else {
+        result.cuda_zero_grads_ms = zero_host_t0.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    let compute_loss = compute_step_loss && rank_idx == 0;
+    if let Some(rank_batches) = rank_batches {
+        flatten_microbatches_into(
+            rank_batches,
+            &mut replica.host_input_ids,
+            &mut replica.host_targets,
+        );
+    }
+    let mut local_timing = RunTiming::default();
+    result.loss = cuda_fast_accumulate_runtime_grads(
+        replica,
+        compute_loss,
+        runtime_seq_len.max(1),
+        Some(&mut local_timing),
+        observer,
+    )?;
+    result.cuda_h2d_ms = local_timing.cuda_h2d_ms;
+    result.loss_count = usize::from(compute_loss);
+
+    if let Some(start) = backward_start_event {
+        let end = stream
+            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| {
+                pg_core::PgError::InvalidOp(format!("cuda backward event record failed: {e:?}"))
+            })?;
+        result.cuda_backward_ms = start.elapsed_ms(&end).map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda backward event elapsed failed: {e:?}"))
+        })? as f64;
+    } else {
+        result.cuda_backward_ms = backward_host_t0.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_distributed_step(
     runtime: &mut CudaDistributedRuntime,
     batches: Option<&Vec<Vec<(Vec<u32>, Vec<u32>)>>>,
@@ -3440,118 +3935,125 @@ fn cuda_distributed_step(
     let mut total_loss = 0.0f32;
     let mut loss_count = 0usize;
     let event_timing = cuda_event_timing_enabled();
-    let replica_results = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(runtime.replicas.len());
-        for (rank_idx, replica) in runtime.replicas.iter_mut().enumerate() {
-            let rank_batches = batches.map(|all_batches| &all_batches[rank_idx]);
-            handles.push(
-                scope.spawn(move || -> PgResult<ReplicaBackwardLaunchResult> {
-                    let stream = replica.gpu_model.gemm.stream().clone();
-                    let backward_host_t0 = Instant::now();
-                    let backward_start_event = if event_timing {
-                        Some(
-                            stream
-                                .record_event(Some(
-                                    cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                                ))
-                                .map_err(|e| {
-                                    pg_core::PgError::InvalidOp(format!(
-                                        "cuda backward event record failed: {e:?}"
-                                    ))
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
+    let use_backward_bucket_overlap = backward_nccl_bucket_overlap_enabled()
+        && distributed_optimizer_backend == DistributedOptimizerBackend::ShardedParallelMuon;
+    if use_backward_bucket_overlap {
+        if compute_step_loss {
+            return Err(pg_core::PgError::InvalidOp(
+                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires no-loss backward; disable step-loss timing for this record path".into(),
+            ));
+        }
+        if runtime.comm_side_comms.is_none() {
+            return Err(pg_core::PgError::InvalidOp(
+                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires side-stream NCCL communicators".into(),
+            ));
+        }
+        if runtime
+            .parallel_muon
+            .as_ref()
+            .map(|parallel_muon| parallel_muon.replicas.len())
+            != Some(runtime.replicas.len())
+        {
+            return Err(pg_core::PgError::InvalidOp(
+                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires initialized sharded Parallel Muon replicas".into(),
+            ));
+        }
+    }
 
-                    let zero_host_t0 = Instant::now();
-                    let zero_start_event = if event_timing {
-                        Some(
-                            stream
-                                .record_event(Some(
-                                    cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                                ))
-                                .map_err(|e| {
-                                    pg_core::PgError::InvalidOp(format!(
-                                        "cuda zero-grads event record failed: {e:?}"
-                                    ))
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    zero_gpu_grads(&replica.gpu_model.kernels, &mut replica.gpu_grads)?;
+    let replica_results = if use_backward_bucket_overlap {
+        let world_size = runtime.replicas.len();
+        let num_layers = runtime
+            .replicas
+            .first()
+            .map(|replica| replica.gpu_model.config.num_layers)
+            .unwrap_or(0);
+        let side_comms = runtime
+            .comm_side_comms
+            .as_ref()
+            .expect("checked side-stream comms for backward buckets");
+        let side_streams = &runtime.comm_side_streams;
+        let side_events = &runtime.comm_side_events;
+        let sharded_replicas = &mut runtime
+            .parallel_muon
+            .as_mut()
+            .expect("checked sharded Parallel Muon for backward buckets")
+            .replicas;
 
-                    let mut result = ReplicaBackwardLaunchResult::default();
-                    if let Some(start) = zero_start_event {
-                        let end = stream
-                            .record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                            ))
-                            .map_err(|e| {
-                                pg_core::PgError::InvalidOp(format!(
-                                    "cuda zero-grads event record failed: {e:?}"
-                                ))
-                            })?;
-                        result.cuda_zero_grads_ms = start.elapsed_ms(&end).map_err(|e| {
-                            pg_core::PgError::InvalidOp(format!(
-                                "cuda zero-grads event elapsed failed: {e:?}"
-                            ))
-                        })? as f64;
-                    } else {
-                        result.cuda_zero_grads_ms = zero_host_t0.elapsed().as_secs_f64() * 1000.0;
-                    }
-
-                    let compute_loss = compute_step_loss && rank_idx == 0;
-                    if let Some(rank_batches) = rank_batches {
-                        flatten_microbatches_into(
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(runtime.replicas.len());
+            for (rank_idx, (replica, sharded_replica)) in runtime
+                .replicas
+                .iter_mut()
+                .zip(sharded_replicas.iter_mut())
+                .enumerate()
+            {
+                let rank_batches = batches.map(|all_batches| &all_batches[rank_idx]);
+                let comm = &side_comms[rank_idx];
+                let side_stream = &side_streams[rank_idx];
+                let side_events = &side_events[rank_idx];
+                handles.push(
+                    scope.spawn(move || -> PgResult<ReplicaBackwardLaunchResult> {
+                        let mut observer = BackwardBucketOverlapObserver {
+                            rank: rank_idx,
+                            world_size,
+                            num_layers,
+                            comm,
+                            side_stream,
+                            side_events,
+                            sharded: sharded_replica,
+                        };
+                        cuda_distributed_launch_replica_backward(
+                            replica,
+                            rank_idx,
                             rank_batches,
-                            &mut replica.host_input_ids,
-                            &mut replica.host_targets,
-                        );
-                    }
-                    let mut local_timing = RunTiming::default();
-                    result.loss = cuda_fast_accumulate_runtime_grads(
-                        replica,
-                        compute_loss,
-                        runtime_seq_len.max(1),
-                        Some(&mut local_timing),
-                    )?;
-                    result.cuda_h2d_ms = local_timing.cuda_h2d_ms;
-                    result.loss_count = usize::from(compute_loss);
+                            compute_step_loss,
+                            runtime_seq_len,
+                            event_timing,
+                            Some(&mut observer),
+                        )
+                    }),
+                );
+            }
 
-                    if let Some(start) = backward_start_event {
-                        let end = stream
-                            .record_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-                            ))
-                            .map_err(|e| {
-                                pg_core::PgError::InvalidOp(format!(
-                                    "cuda backward event record failed: {e:?}"
-                                ))
-                            })?;
-                        result.cuda_backward_ms = start.elapsed_ms(&end).map_err(|e| {
-                            pg_core::PgError::InvalidOp(format!(
-                                "cuda backward event elapsed failed: {e:?}"
-                            ))
-                        })? as f64;
-                    } else {
-                        result.cuda_backward_ms = backward_host_t0.elapsed().as_secs_f64() * 1000.0;
-                    }
-                    Ok(result)
-                }),
-            );
-        }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let result = handle.join().map_err(|_| {
+                    pg_core::PgError::InvalidOp("cuda distributed worker thread panicked".into())
+                })??;
+                results.push(result);
+            }
+            PgResult::Ok(results)
+        })?
+    } else {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(runtime.replicas.len());
+            for (rank_idx, replica) in runtime.replicas.iter_mut().enumerate() {
+                let rank_batches = batches.map(|all_batches| &all_batches[rank_idx]);
+                handles.push(
+                    scope.spawn(move || -> PgResult<ReplicaBackwardLaunchResult> {
+                        cuda_distributed_launch_replica_backward(
+                            replica,
+                            rank_idx,
+                            rank_batches,
+                            compute_step_loss,
+                            runtime_seq_len,
+                            event_timing,
+                            None,
+                        )
+                    }),
+                );
+            }
 
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let result = handle.join().map_err(|_| {
-                pg_core::PgError::InvalidOp("cuda distributed worker thread panicked".into())
-            })??;
-            results.push(result);
-        }
-        PgResult::Ok(results)
-    })?;
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let result = handle.join().map_err(|_| {
+                    pg_core::PgError::InvalidOp("cuda distributed worker thread panicked".into())
+                })??;
+                results.push(result);
+            }
+            PgResult::Ok(results)
+        })?
+    };
     let mut max_backward_ms = 0.0f64;
     for result in replica_results {
         total_loss += result.loss;
@@ -3868,11 +4370,29 @@ fn record_path_audit_json(
     ));
     fields.push(json_str_field(
         "sharded_parallel_muon_bank_grad_wire_dtype",
-        if sharded_bank_grad_bf16_wire_enabled_for_audit() {
+        if backward_nccl_bucket_overlap_enabled_for_audit() {
+            // The overlapped per-layer bucket path reduces directly from the
+            // stable F32 gradient-bank matrix into the owner rank's shard. The
+            // non-overlapped full-bank reduce-scatter path can still use BF16
+            // on wire, but the audit must describe the active path.
+            "f32"
+        } else if sharded_bank_grad_bf16_wire_enabled_for_audit() {
             "bf16"
         } else {
             "f32"
         },
+    ));
+    fields.push(json_str_field(
+        "sharded_parallel_muon_bank_grad_collective",
+        if backward_nccl_bucket_overlap_enabled_for_audit() {
+            "per_layer_reduce_to_owner"
+        } else {
+            "reduce_scatter"
+        },
+    ));
+    fields.push(format!(
+        "\"nccl_side_stream_collectives\":{}",
+        nccl_side_stream_collectives_enabled_for_audit()
     ));
     fields.push(format!(
         "\"backward_nccl_bucket_overlap\":{}",
@@ -4060,6 +4580,10 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"bf16_attention_backward_tail\":{}",
         bf16_attention_backward_tail_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"bf16_attention_tail_qkv_pack\":{}",
+        bf16_attention_tail_qkv_pack_enabled_for_audit(run_spec)
     ));
     fields.push(format!(
         "\"final_norm_bf16_side_output\":{}",
@@ -4576,6 +5100,18 @@ fn bf16_attention_backward_tail_enabled_for_audit(run_spec: &RunSpec) -> bool {
         )
 }
 
+fn bf16_attention_tail_qkv_pack_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    bf16_attention_backward_tail_enabled_for_audit(run_spec)
+        && bf16_qkv_dx_output_enabled_for_audit(run_spec)
+        && matches!(
+            std::env::var("PG_GPU_BF16_ATTN_TAIL_QKV_PACK")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+}
+
 fn final_norm_bf16_side_output_enabled_for_audit(run_spec: &RunSpec) -> bool {
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && bf16_forward_projection_gemm_enabled(run_spec)
@@ -4942,8 +5478,45 @@ fn sharded_grouped_grad_collectives_enabled_for_audit() -> bool {
     )
 }
 
+/// Returns true when the runtime should issue post-backward NCCL collectives
+/// on a dedicated side stream with cross-stream event sync. This is useful
+/// plumbing, but it is not true backward bucket overlap: collectives still fire
+/// after the full backward pass until the per-layer bucket scheduler exists.
+///
+/// `PG_NCCL_BUCKET_OVERLAP` remains accepted as a compatibility alias for the
+/// existing Modal/deploy flag. New callers should prefer
+/// `PG_NCCL_SIDE_STREAM_COLLECTIVES`.
+fn nccl_side_stream_collectives_enabled() -> bool {
+    let is_enabled = |name: &str| {
+        matches!(
+            std::env::var(name)
+                .unwrap_or_else(|_| "0".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    };
+    is_enabled("PG_NCCL_SIDE_STREAM_COLLECTIVES")
+        || is_enabled("PG_NCCL_BUCKET_OVERLAP")
+        || is_enabled("PG_NCCL_BACKWARD_BUCKET_OVERLAP")
+}
+
+fn nccl_side_stream_collectives_enabled_for_audit() -> bool {
+    nccl_side_stream_collectives_enabled()
+}
+
+fn backward_nccl_bucket_overlap_enabled() -> bool {
+    matches!(
+        std::env::var("PG_NCCL_BACKWARD_BUCKET_OVERLAP")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn backward_nccl_bucket_overlap_enabled_for_audit() -> bool {
-    false
+    backward_nccl_bucket_overlap_enabled()
 }
 
 fn cudnn_frontend_sdpa_available() -> bool {
@@ -4995,6 +5568,11 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         }
         if !bf16_attention_backward_tail_enabled_for_audit(run_spec) {
             gaps.push("record-grade cuDNN SDPA backward must keep dQ/dK in the BF16 tail through QK/RoPE/gain backward; current config promotes attention gradients back to F32 immediately");
+        }
+        if bf16_attention_backward_tail_enabled_for_audit(run_spec)
+            && !bf16_attention_tail_qkv_pack_enabled_for_audit(run_spec)
+        {
+            gaps.push("record-grade cuDNN SDPA backward tail must feed fused QKV backward from BF16-packed dQ/dK/dV; current config still repacks through F32 before the QKV GEMM");
         }
         if gpu_saved_layer_activations_mode_for_audit().to_ascii_lowercase() != "all"
             || !direct_saved_layer_activations_enabled_for_audit()
@@ -5640,6 +6218,68 @@ mod tests {
         spec.train.train_data_pattern = None;
         let err = validate_backend_request(&spec, RunMode::Record).unwrap_err();
         assert!(err.to_string().contains("--train-data"));
+    }
+
+    #[test]
+    fn nccl_side_stream_audit_does_not_claim_bucket_overlap() {
+        // Side-stream collectives are useful plumbing, but they are not true
+        // backward bucket overlap until reduce-scatter fires while layer
+        // backward is still running. The audit must keep those states separate.
+        let prev = std::env::var("PG_NCCL_BUCKET_OVERLAP").ok();
+        let prev_side = std::env::var("PG_NCCL_SIDE_STREAM_COLLECTIVES").ok();
+        let prev_backward = std::env::var("PG_NCCL_BACKWARD_BUCKET_OVERLAP").ok();
+
+        unsafe {
+            std::env::set_var("PG_NCCL_BUCKET_OVERLAP", "0");
+            std::env::remove_var("PG_NCCL_SIDE_STREAM_COLLECTIVES");
+            std::env::remove_var("PG_NCCL_BACKWARD_BUCKET_OVERLAP");
+        }
+        assert!(!nccl_side_stream_collectives_enabled());
+        assert!(!nccl_side_stream_collectives_enabled_for_audit());
+        assert!(!backward_nccl_bucket_overlap_enabled_for_audit());
+
+        unsafe {
+            std::env::set_var("PG_NCCL_BUCKET_OVERLAP", "1");
+        }
+        assert!(nccl_side_stream_collectives_enabled());
+        assert!(nccl_side_stream_collectives_enabled_for_audit());
+        assert!(!backward_nccl_bucket_overlap_enabled_for_audit());
+
+        unsafe {
+            std::env::set_var("PG_NCCL_BUCKET_OVERLAP", "true");
+        }
+        assert!(nccl_side_stream_collectives_enabled());
+        assert!(nccl_side_stream_collectives_enabled_for_audit());
+
+        unsafe {
+            std::env::remove_var("PG_NCCL_BUCKET_OVERLAP");
+            std::env::set_var("PG_NCCL_SIDE_STREAM_COLLECTIVES", "true");
+        }
+        assert!(nccl_side_stream_collectives_enabled());
+        assert!(nccl_side_stream_collectives_enabled_for_audit());
+        assert!(!backward_nccl_bucket_overlap_enabled_for_audit());
+
+        unsafe {
+            std::env::remove_var("PG_NCCL_BUCKET_OVERLAP");
+            std::env::remove_var("PG_NCCL_SIDE_STREAM_COLLECTIVES");
+            std::env::set_var("PG_NCCL_BACKWARD_BUCKET_OVERLAP", "true");
+        }
+        assert!(nccl_side_stream_collectives_enabled());
+        assert!(nccl_side_stream_collectives_enabled_for_audit());
+        assert!(backward_nccl_bucket_overlap_enabled_for_audit());
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("PG_NCCL_BUCKET_OVERLAP", value) },
+            None => unsafe { std::env::remove_var("PG_NCCL_BUCKET_OVERLAP") },
+        }
+        match prev_side {
+            Some(value) => unsafe { std::env::set_var("PG_NCCL_SIDE_STREAM_COLLECTIVES", value) },
+            None => unsafe { std::env::remove_var("PG_NCCL_SIDE_STREAM_COLLECTIVES") },
+        }
+        match prev_backward {
+            Some(value) => unsafe { std::env::set_var("PG_NCCL_BACKWARD_BUCKET_OVERLAP", value) },
+            None => unsafe { std::env::remove_var("PG_NCCL_BACKWARD_BUCKET_OVERLAP") },
+        }
     }
 
     #[test]

@@ -102,6 +102,18 @@ pub struct NcclComm {
     comm: Option<Comm>,
 }
 
+// The wrapper is shared across host worker threads by the distributed training
+// runtime so each rank can enqueue its own communicator's collectives while
+// that rank's backward pass is still running. The runtime invariant is one
+// host worker per communicator during the bucketed-backward phase; the main
+// thread does not reuse those communicators until the scoped workers have
+// joined. The underlying NCCL operations are still ordered by their bound CUDA
+// streams/events. Do not call methods concurrently on the same `NcclComm`.
+#[cfg(feature = "cuda")]
+unsafe impl Send for NcclComm {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for NcclComm {}
+
 #[cfg(not(feature = "cuda"))]
 pub struct NcclComm {
     pub rank: usize,
@@ -227,6 +239,138 @@ impl NcclComm {
             .reduce_scatter::<_, _, f32>(&raw_send, &mut raw_recv, &ReduceOp::Sum)
             .map(|_| ())
             .map_err(|e| PgError::Nccl(format!("reduce_scatter_sum_tensor_f32 failed: {e:?}")))
+    }
+
+    pub fn reduce_sum_tensor_f32_to_rank(
+        &self,
+        send: &GpuTensor,
+        recv: Option<&mut GpuTensor>,
+        root_rank: usize,
+    ) -> PgResult<()> {
+        if send.dtype() != crate::DType::F32 {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_f32_to_rank requires F32 send tensor, got {:?}",
+                send.dtype()
+            )));
+        }
+        if root_rank >= self.world_size {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_f32_to_rank root rank {root_rank} >= world_size {}",
+                self.world_size
+            )));
+        }
+        if self.rank == root_rank && recv.is_none() {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_f32_to_rank root rank {} must provide recv tensor",
+                self.rank
+            )));
+        }
+        if let Some(recv) = recv.as_ref() {
+            if recv.dtype() != crate::DType::F32 {
+                return Err(PgError::Nccl(format!(
+                    "reduce_sum_tensor_f32_to_rank requires F32 recv tensor, got {:?}",
+                    recv.dtype()
+                )));
+            }
+            if recv.numel() != send.numel() {
+                return Err(PgError::Nccl(format!(
+                    "reduce_sum_tensor_f32_to_rank shape mismatch: send elements {} recv elements {}",
+                    send.numel(),
+                    recv.numel()
+                )));
+            }
+        }
+        let stream = self.comm()?.stream();
+        let send_ptr = send.cu_ptr(&stream)?;
+        let raw_send = RawF32Buffer {
+            ptr: send_ptr,
+            len: send.numel(),
+            stream: stream.clone(),
+        };
+        let mut raw_recv = if let Some(recv) = recv {
+            Some(RawF32Buffer {
+                ptr: recv.cu_ptr(&stream)?,
+                len: recv.numel(),
+                stream,
+            })
+        } else {
+            None
+        };
+        self.comm()?
+            .reduce::<_, _, f32>(
+                &raw_send,
+                raw_recv.as_mut(),
+                &ReduceOp::Sum,
+                root_rank as i32,
+            )
+            .map(|_| ())
+            .map_err(|e| PgError::Nccl(format!("reduce_sum_tensor_f32_to_rank failed: {e:?}")))
+    }
+
+    pub fn reduce_sum_tensor_bf16_to_rank(
+        &self,
+        send: &GpuTensor,
+        recv: Option<&mut GpuTensor>,
+        root_rank: usize,
+    ) -> PgResult<()> {
+        if send.dtype() != crate::DType::BF16 {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_bf16_to_rank requires BF16 send tensor, got {:?}",
+                send.dtype()
+            )));
+        }
+        if root_rank >= self.world_size {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_bf16_to_rank root rank {root_rank} >= world_size {}",
+                self.world_size
+            )));
+        }
+        if self.rank == root_rank && recv.is_none() {
+            return Err(PgError::Nccl(format!(
+                "reduce_sum_tensor_bf16_to_rank root rank {} must provide recv tensor",
+                self.rank
+            )));
+        }
+        if let Some(recv) = recv.as_ref() {
+            if recv.dtype() != crate::DType::BF16 {
+                return Err(PgError::Nccl(format!(
+                    "reduce_sum_tensor_bf16_to_rank requires BF16 recv tensor, got {:?}",
+                    recv.dtype()
+                )));
+            }
+            if recv.numel() != send.numel() {
+                return Err(PgError::Nccl(format!(
+                    "reduce_sum_tensor_bf16_to_rank shape mismatch: send elements {} recv elements {}",
+                    send.numel(),
+                    recv.numel()
+                )));
+            }
+        }
+        let stream = self.comm()?.stream();
+        let send_ptr = send.cu_ptr(&stream)?;
+        let raw_send = RawBf16Buffer {
+            ptr: send_ptr,
+            len: send.numel(),
+            stream: stream.clone(),
+        };
+        let mut raw_recv = if let Some(recv) = recv {
+            Some(RawBf16Buffer {
+                ptr: recv.cu_ptr(&stream)?,
+                len: recv.numel(),
+                stream,
+            })
+        } else {
+            None
+        };
+        self.comm()?
+            .reduce::<_, _, bf16>(
+                &raw_send,
+                raw_recv.as_mut(),
+                &ReduceOp::Sum,
+                root_rank as i32,
+            )
+            .map(|_| ())
+            .map_err(|e| PgError::Nccl(format!("reduce_sum_tensor_bf16_to_rank failed: {e:?}")))
     }
 
     pub fn reduce_scatter_sum_tensor_bf16(
