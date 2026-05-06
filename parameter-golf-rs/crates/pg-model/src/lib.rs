@@ -13,6 +13,6 @@ pub use model::{ForwardBuffer, GptModel};
 pub use plan::ExecutionPlan;
 pub use spec::{
     AttentionBackend, AttnOutGateSpec, CompressionMode, DistributedOptimizerBackend,
-    EvalAdaptationBackend, EvalSpec, ModelComputePrecision, ModelSpec, QuantScheme, QuantSpec,
-    RunMode, RunSpec, TrainBackend, TrainSpec, VariantFamily,
+    EvalAdaptationBackend, EvalSpec, ModelComputePrecision, ModelSpec, OutputCeBackend,
+    QuantScheme, QuantSpec, RunMode, RunSpec, TrainBackend, TrainSpec, VariantFamily,
 };

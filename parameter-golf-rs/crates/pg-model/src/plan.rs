@@ -603,6 +603,10 @@ mod tests {
         assert_eq!(spec.name, "frontier_1855_merged_target");
         assert_eq!(spec.model.family, VariantFamily::Frontier1855Like);
         assert_eq!(spec.model.mlp_mult, 4.0);
+        assert_eq!(
+            spec.model.output_ce_backend,
+            crate::spec::OutputCeBackend::ChunkedBf16Cache
+        );
         assert_eq!(spec.model.qk_gain_init, 5.0);
         assert!(spec.model.caseops.byte_sidecar);
         assert_eq!(spec.model.sparse_attn_gate.scale, 0.5);
@@ -636,6 +640,10 @@ mod tests {
 
         let mut changed = spec.clone();
         changed.train.adam_beta2 = 0.98;
+        assert_ne!(base, fingerprint(&changed));
+
+        let mut changed = spec.clone();
+        changed.model.output_ce_backend = crate::spec::OutputCeBackend::FusedExactWmma;
         assert_ne!(base, fingerprint(&changed));
     }
 }

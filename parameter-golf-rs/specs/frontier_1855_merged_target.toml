@@ -11,6 +11,7 @@ mode = "record"
 family = "frontier_1855_like"
 attention_backend = "cudnn_sdpa_bf16"
 compute_precision = "bf16_tensor_core"
+output_ce_backend = "chunked_bf16_cache"
 vocab_size = 8192
 num_layers = 11
 model_dim = 512

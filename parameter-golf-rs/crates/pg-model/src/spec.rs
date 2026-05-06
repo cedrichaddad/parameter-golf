@@ -54,6 +54,21 @@ pub enum ModelComputePrecision {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum OutputCeBackend {
+    /// Current fastest measured bridge: bounded BF16 chunk logits cache, no
+    /// persistent full local-batch logits tensor.
+    #[default]
+    ChunkedBf16Cache,
+    /// Exact no-persistent-logits path that streams vocab tiles and recomputes
+    /// output projection for backward.
+    TiledRepeatedGemm,
+    /// Production extension boundary for exact fused output projection +
+    /// softcapped CE/backward. This stays opt-in until H100 A/B proves it.
+    FusedExactWmma,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum DistributedOptimizerBackend {
     /// Current distributed path: NCCL all-reduce grads, every rank updates a
     /// full replica. Correctness-first, but not Parallel Muon.
@@ -278,6 +293,7 @@ pub struct ModelSpec {
     pub family: VariantFamily,
     pub attention_backend: AttentionBackend,
     pub compute_precision: ModelComputePrecision,
+    pub output_ce_backend: OutputCeBackend,
     pub vocab_size: usize,
     pub num_layers: usize,
     pub model_dim: usize,
@@ -316,6 +332,7 @@ impl ModelSpec {
             family,
             attention_backend: AttentionBackend::NaiveF32,
             compute_precision: ModelComputePrecision::F32Tf32,
+            output_ce_backend: OutputCeBackend::ChunkedBf16Cache,
             vocab_size: 8192,
             num_layers: 11,
             model_dim: 512,

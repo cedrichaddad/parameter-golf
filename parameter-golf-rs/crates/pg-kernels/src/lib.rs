@@ -18,3 +18,6 @@ pub mod gpu_kernels;
 
 #[cfg(feature = "cuda")]
 pub mod flash_attn;
+
+#[cfg(feature = "cuda")]
+pub mod output_ce;

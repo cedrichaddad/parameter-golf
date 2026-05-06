@@ -10,8 +10,13 @@
 # === Build stage ===
 FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS builder
 
+# Modal image builds occasionally hit transient Ubuntu mirror/DNS failures.
+# Keep retry policy in the image rather than requiring manual reruns.
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+    > /etc/apt/apt.conf.d/80-retries
+
 # Install Rust toolchain
-RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev ca-certificates && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -41,6 +46,9 @@ RUN cargo build --release --features cuda -p pg-train -p pg-bench -p pg-eval
 
 # === Runtime stage ===
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+    > /etc/apt/apt.conf.d/80-retries
 
 RUN apt-get update && apt-get install -y --allow-change-held-packages \
     libnccl2=2.25.1-1+cuda12.8 \
