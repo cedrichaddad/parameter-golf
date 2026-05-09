@@ -4,6 +4,7 @@ import subprocess
 import os
 import glob
 import shutil
+import shlex
 import struct
 import json
 import tomllib
@@ -13,7 +14,6 @@ app = modal.App("pg-train-detached")
 
 image = (
     modal.Image.from_dockerfile("deploy/Dockerfile", context_dir=".", add_python="3.12")
-    .pip_install("huggingface_hub")
 )
 
 data_volume = modal.Volume.from_name("pg-data", create_if_missing=True)
@@ -57,6 +57,29 @@ def _write_running_result_json(path: str | None, label: str, cmd: list[str]):
             "tail": "",
         },
     )
+
+
+def _pg_train_command() -> list[str]:
+    explicit = os.environ.get("PG_TRAIN_BIN")
+    if explicit:
+        return [explicit]
+    existing = shutil.which("pg-train")
+    if existing:
+        return [existing]
+    source_dir = "/build"
+    binary = os.path.join(source_dir, "target", "release", "pg-train")
+    if not os.path.exists(binary):
+        print("pg-train binary missing; compiling inside Modal function", flush=True)
+        subprocess.run(
+            ["cargo", "build", "--release", "--features", "cuda", "-p", "pg-train"],
+            cwd=source_dir,
+            check=True,
+        )
+    if os.environ.get("PG_STRIP_TRAIN_BIN", "1").lower() not in {"0", "false", "no", "off"}:
+        strip = shutil.which("strip")
+        if strip:
+            subprocess.run([strip, binary], check=True)
+    return [binary]
 
 
 def _forwarded_option(args: list[str], name: str) -> str | None:
@@ -148,10 +171,15 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     # Matches the best measured record-shaped profile line. Keep this as an
     # explicit opt-in so slow correctness baselines remain easy to run.
     os.environ["PG_CUDA_EVENT_TIMING"] = "1"
+    os.environ["PG_CUDA_BACKWARD_GRAPH"] = "0"
+    os.environ["PG_CUDA_BACKWARD_GRAPH_STRICT"] = "0"
     os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1" if stage_timing else "0"
     os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "all"
     os.environ["PG_GPU_DIRECT_SAVED_ACTS"] = "1"
     os.environ["PG_GPU_BF16_PRIMARY_FORWARD_GEMM"] = "1"
+    os.environ["PG_CUBLAS_FAST_TF32"] = "1"
+    os.environ.setdefault("PG_CUBLAS_FORCE_TENSOR_OP_ALGO", "1")
+    os.environ.setdefault("PG_CUBLAS_BF16_ALGO", "1")
     os.environ["PG_GPU_BF16_LOGITS"] = "1"
     os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
     os.environ["PG_GPU_FUSED_QKV_PROJ"] = "1"
@@ -171,13 +199,32 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     os.environ.setdefault("PG_NCCL_BF16_BANK_GRAD_WIRE", "1")
     os.environ.setdefault("PG_NCCL_GROUP_SHARDED_GRAD_COLLECTIVES", "1")
     os.environ.setdefault("PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER", "1")
+    os.environ["PG_GPU_TOKEN_RING_SAMPLER"] = "1"
+    os.environ["PG_GPU_TOKEN_RING_FULL_SCHEDULE"] = "1"
+    os.environ["PG_RECORD_REQUIRE_DEVICE_BATCH"] = "1"
     os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "1"
+    os.environ["PG_GPU_CHUNKED_RESIDUAL_SCALE_BWD"] = "1"
+    os.environ["PG_GPU_TILED_RESIDUAL_SCALE_BWD"] = "1"
+    os.environ.setdefault("PG_GPU_RESIDUAL_SCALE_BWD_ROWS_PER_CHUNK", "256")
+    os.environ["PG_GPU_OVERWRITE_BANK_GRADS"] = "0"
     os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
-    # v82 H100 A/B regressed this path (278.9 ms/step vs v76 251.7 ms).
-    # Keep it as an explicit A/B flag until the downstream BF16 QKV gradient
-    # pack path is complete enough to offset the cuDNN BF16-gradient overhead.
-    os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "0"
-    os.environ["PG_GPU_BF16_ATTN_TAIL_QKV_PACK"] = "0"
+    os.environ["PG_GPU_BF16_MLP_DOWN_DX"] = "1"
+    os.environ["PG_GPU_VEC4_MLP_ACT_BWD"] = "1"
+    os.environ["PG_GPU_FAST_MLP_ACT_BWD"] = "1"
+    os.environ["PG_GPU_OVERLAP_MLP_DOWN_BWD_GEMMS"] = "1"
+    os.environ["PG_GPU_OVERLAP_MLP_UP_BWD_GEMMS"] = "1"
+    os.environ["PG_GPU_OVERLAP_QKV_BWD_GEMMS"] = "1"
+    os.environ["PG_GPU_OVERLAP_ATTN_OUT_BWD_GEMMS"] = "1"
+    os.environ["PG_GPU_BF16_BACKWARD_CHAIN"] = "1"
+    os.environ.setdefault("PG_GPU_BF16_BACKWARD_CHAIN_STRICT", "1")
+    os.environ["PG_GPU_BF16_ATTN_BACKWARD_TAIL"] = "1"
+    os.environ["PG_GPU_BF16_ATTN_TAIL_QKV_PACK"] = "1"
+    os.environ["PG_GPU_BF16_ATTN_TAIL_DIRECT_QKV_PACK"] = "1"
+    os.environ["PG_GPU_BF16_ATTN_BACKWARD_BHSD_DO"] = "1"
+    os.environ.setdefault("PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER", "direct_compact")
+    os.environ["PG_GPU_SPLIT_QKV_NORM_RESID_BWD"] = "0"
+    os.environ["PG_GPU_CHUNKED_QKV_NORM_RESID_BWD"] = "0"
+    os.environ["PG_GPU_COMPACT_ATTN_GATE_GRAD_INPUT"] = "1"
     os.environ["PG_GPU_BF16_QKV_DX_OUTPUT"] = "1"
     os.environ["PG_GPU_OUTPUT_CE_BACKEND"] = "chunked_bf16_cache"
     os.environ["PG_GPU_TILED_OUTPUT_CE"] = "0"
@@ -199,6 +246,9 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--frontier-fast-record-profile" in forwarded:
         forwarded.remove("--frontier-fast-record-profile")
         _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=True)
+    if "--frontier-throughput-stage-profile" in forwarded:
+        forwarded.remove("--frontier-throughput-stage-profile")
+        _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=False)
     if "--frontier-throughput-record-profile" in forwarded:
         forwarded.remove("--frontier-throughput-record-profile")
         _apply_frontier_fast_record_env(stage_timing=False, poison_prepacked_qkv=False)
@@ -207,6 +257,7 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         _apply_frontier_fast_record_env(stage_timing=False, poison_prepacked_qkv=False)
         os.environ["PG_CUDA_BACKWARD_GRAPH"] = "1"
         os.environ["PG_CUDA_BACKWARD_GRAPH_STRICT"] = "1"
+        os.environ.setdefault("PG_CUDA_GRAPH_CAPTURE_MODE", "relaxed")
     if "--chunked-residual-mix-bwd" in forwarded:
         forwarded.remove("--chunked-residual-mix-bwd")
         os.environ["PG_GPU_CHUNKED_RESIDUAL_MIX_BWD"] = "1"
@@ -216,6 +267,12 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-chunked-qkv-norm-resid-bwd" in forwarded:
         forwarded.remove("--disable-chunked-qkv-norm-resid-bwd")
         os.environ["PG_GPU_CHUNKED_QKV_NORM_RESID_BWD"] = "0"
+    if "--enable-overwrite-bank-grads" in forwarded:
+        forwarded.remove("--enable-overwrite-bank-grads")
+        os.environ["PG_GPU_OVERWRITE_BANK_GRADS"] = "1"
+    if "--disable-overwrite-bank-grads" in forwarded:
+        forwarded.remove("--disable-overwrite-bank-grads")
+        os.environ["PG_GPU_OVERWRITE_BANK_GRADS"] = "0"
     if "--enable-split-qkv-norm-resid-bwd" in forwarded:
         forwarded.remove("--enable-split-qkv-norm-resid-bwd")
         os.environ["PG_GPU_SPLIT_QKV_NORM_RESID_BWD"] = "1"
@@ -260,6 +317,20 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--cuda-event-timing" in forwarded:
         forwarded.remove("--cuda-event-timing")
         os.environ["PG_CUDA_EVENT_TIMING"] = "1"
+    if "--disable-cuda-event-timing" in forwarded:
+        forwarded.remove("--disable-cuda-event-timing")
+        os.environ["PG_CUDA_EVENT_TIMING"] = "0"
+    if "--enable-cublaslt-bf16-gemm" in forwarded:
+        forwarded.remove("--enable-cublaslt-bf16-gemm")
+        os.environ["PG_CUBLASLT_BF16_GEMM"] = "1"
+    if "--enable-cublaslt-bf16-strict" in forwarded:
+        forwarded.remove("--enable-cublaslt-bf16-strict")
+        os.environ["PG_CUBLASLT_BF16_GEMM"] = "1"
+        os.environ["PG_CUBLASLT_BF16_STRICT"] = "1"
+    if "--disable-cublaslt-bf16-gemm" in forwarded:
+        forwarded.remove("--disable-cublaslt-bf16-gemm")
+        os.environ["PG_CUBLASLT_BF16_GEMM"] = "0"
+        os.environ["PG_CUBLASLT_BF16_STRICT"] = "0"
     if "--backward-stage-timing" in forwarded:
         forwarded.remove("--backward-stage-timing")
         os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1"
@@ -273,6 +344,30 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         forwarded.remove("--cuda-backward-graph-strict")
         os.environ["PG_CUDA_BACKWARD_GRAPH"] = "1"
         os.environ["PG_CUDA_BACKWARD_GRAPH_STRICT"] = "1"
+    if "--cuda-graph-capture-debug" in forwarded:
+        forwarded.remove("--cuda-graph-capture-debug")
+        os.environ["PG_CUDA_GRAPH_CAPTURE_DEBUG"] = "1"
+    if "--cuda-graph-disable-cudnn-sdpa" in forwarded:
+        forwarded.remove("--cuda-graph-disable-cudnn-sdpa")
+        os.environ["PG_CUDA_GRAPH_DISABLE_CUDNN_SDPA"] = "1"
+    if "--enable-lean-forward-cache" in forwarded:
+        forwarded.remove("--enable-lean-forward-cache")
+        os.environ["PG_GPU_LEAN_FORWARD_CACHE"] = "1"
+    if "--disable-lean-forward-cache" in forwarded:
+        forwarded.remove("--disable-lean-forward-cache")
+        os.environ["PG_GPU_LEAN_FORWARD_CACHE"] = "0"
+    if "--cuda-graph-capture-mode" in forwarded:
+        idx = forwarded.index("--cuda-graph-capture-mode")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--cuda-graph-capture-mode requires thread_local|global|relaxed")
+        mode = forwarded[idx + 1]
+        allowed = {"thread_local", "global", "relaxed"}
+        if mode not in allowed:
+            raise RuntimeError(
+                f"--cuda-graph-capture-mode must be one of {sorted(allowed)}, got {mode!r}"
+            )
+        os.environ["PG_CUDA_GRAPH_CAPTURE_MODE"] = mode
+        del forwarded[idx : idx + 2]
     if "--save-layer-acts" in forwarded:
         forwarded.remove("--save-layer-acts")
         os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "1"
@@ -315,6 +410,24 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--skip-first-step-timing" in forwarded:
         forwarded.remove("--skip-first-step-timing")
         os.environ["PG_RECORD_TIMING_SKIP_STEPS"] = "1"
+    if "--record-timing-skip-steps" in forwarded:
+        idx = forwarded.index("--record-timing-skip-steps")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--record-timing-skip-steps requires a non-negative integer")
+        value = int(forwarded[idx + 1])
+        if value < 0:
+            raise RuntimeError("--record-timing-skip-steps must be >= 0")
+        os.environ["PG_RECORD_TIMING_SKIP_STEPS"] = str(value)
+        del forwarded[idx : idx + 2]
+    if "--record-shaped-proxy-max-steps" in forwarded:
+        idx = forwarded.index("--record-shaped-proxy-max-steps")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--record-shaped-proxy-max-steps requires a positive integer")
+        value = int(forwarded[idx + 1])
+        if value <= 0:
+            raise RuntimeError("--record-shaped-proxy-max-steps must be > 0")
+        os.environ["PG_RECORD_SHAPED_PROXY_MAX_STEPS"] = str(value)
+        del forwarded[idx : idx + 2]
     if "--record-max-ms-per-step" in forwarded:
         idx = forwarded.index("--record-max-ms-per-step")
         if idx + 1 >= len(forwarded):
@@ -355,6 +468,13 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-overlap-linear-bwd-gemms" in forwarded:
         forwarded.remove("--disable-overlap-linear-bwd-gemms")
         os.environ["PG_GPU_OVERLAP_LINEAR_BWD_GEMMS"] = "0"
+    if "--enable-graph-side-gemm-capture" in forwarded:
+        forwarded.remove("--enable-graph-side-gemm-capture")
+        os.environ["PG_GPU_GRAPH_SIDE_GEMM_CAPTURE"] = "1"
+        os.environ.setdefault("PG_CUDA_GRAPH_CAPTURE_MODE", "relaxed")
+    if "--disable-graph-side-gemm-capture" in forwarded:
+        forwarded.remove("--disable-graph-side-gemm-capture")
+        os.environ["PG_GPU_GRAPH_SIDE_GEMM_CAPTURE"] = "0"
     if "--enable-overlap-mlp-bwd-gemms" in forwarded:
         forwarded.remove("--enable-overlap-mlp-bwd-gemms")
         os.environ["PG_GPU_OVERLAP_MLP_DOWN_BWD_GEMMS"] = "1"
@@ -472,6 +592,18 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-fused-qk-rope-gain-fwd" in forwarded:
         forwarded.remove("--disable-fused-qk-rope-gain-fwd")
         os.environ["PG_GPU_FUSED_QK_ROPE_GAIN_FWD"] = "0"
+    if "--enable-record-require-device-batch" in forwarded:
+        forwarded.remove("--enable-record-require-device-batch")
+        os.environ["PG_RECORD_REQUIRE_DEVICE_BATCH"] = "1"
+    if "--disable-record-require-device-batch" in forwarded:
+        forwarded.remove("--disable-record-require-device-batch")
+        os.environ["PG_RECORD_REQUIRE_DEVICE_BATCH"] = "0"
+    if "--enable-fused-qkv-rope-prepack-fwd" in forwarded:
+        forwarded.remove("--enable-fused-qkv-rope-prepack-fwd")
+        os.environ["PG_GPU_FUSED_QKV_ROPE_PREPACK_FWD"] = "1"
+    if "--disable-fused-qkv-rope-prepack-fwd" in forwarded:
+        forwarded.remove("--disable-fused-qkv-rope-prepack-fwd")
+        os.environ["PG_GPU_FUSED_QKV_ROPE_PREPACK_FWD"] = "0"
     if "--disable-fused-residual-mix-norm" in forwarded:
         forwarded.remove("--disable-fused-residual-mix-norm")
         os.environ["PG_GPU_FUSED_RESIDUAL_MIX_NORM"] = "0"
@@ -607,6 +739,12 @@ def _apply_gpu_env_flags(forwarded: list[str]):
             raise RuntimeError("--muon-ns-profile requires simple|quintic|polar_express")
         os.environ["PG_GPU_MUON_NS_PROFILE"] = forwarded[idx + 1]
         del forwarded[idx : idx + 2]
+    if "--muon-ns-steps" in forwarded:
+        idx = forwarded.index("--muon-ns-steps")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--muon-ns-steps requires a positive integer")
+        os.environ["PG_GPU_MUON_NS_STEPS"] = forwarded[idx + 1]
+        del forwarded[idx : idx + 2]
     if "--legacy-muon-ns" in forwarded:
         forwarded.remove("--legacy-muon-ns")
         os.environ["PG_GPU_MUON_NS_PROFILE"] = "simple"
@@ -671,6 +809,56 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-bf16-shadow-all-gather" in forwarded:
         forwarded.remove("--disable-bf16-shadow-all-gather")
         os.environ["PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER"] = "0"
+    if "--enable-sharded-muon-fused-global-clip" in forwarded:
+        forwarded.remove("--enable-sharded-muon-fused-global-clip")
+        os.environ["PG_GPU_SHARDED_MUON_FUSED_GLOBAL_CLIP"] = "1"
+    if "--disable-sharded-muon-fused-global-clip" in forwarded:
+        forwarded.remove("--disable-sharded-muon-fused-global-clip")
+        os.environ["PG_GPU_SHARDED_MUON_FUSED_GLOBAL_CLIP"] = "0"
+    if "--enable-sharded-muon-phase-timing" in forwarded:
+        forwarded.remove("--enable-sharded-muon-phase-timing")
+        os.environ["PG_GPU_SHARDED_MUON_PHASE_TIMING"] = "1"
+    if "--disable-sharded-muon-phase-timing" in forwarded:
+        forwarded.remove("--disable-sharded-muon-phase-timing")
+        os.environ["PG_GPU_SHARDED_MUON_PHASE_TIMING"] = "0"
+    if "--enable-sharded-muon-parallel-local" in forwarded:
+        forwarded.remove("--enable-sharded-muon-parallel-local")
+        os.environ["PG_GPU_SHARDED_MUON_PARALLEL_LOCAL"] = "1"
+    if "--disable-sharded-muon-parallel-local" in forwarded:
+        forwarded.remove("--disable-sharded-muon-parallel-local")
+        os.environ["PG_GPU_SHARDED_MUON_PARALLEL_LOCAL"] = "0"
+    if "--enable-sharded-muon-local-graph" in forwarded:
+        forwarded.remove("--enable-sharded-muon-local-graph")
+        os.environ["PG_GPU_SHARDED_MUON_LOCAL_GRAPH"] = "1"
+    if "--disable-sharded-muon-local-graph" in forwarded:
+        forwarded.remove("--disable-sharded-muon-local-graph")
+        os.environ["PG_GPU_SHARDED_MUON_LOCAL_GRAPH"] = "0"
+    if "--enable-sharded-muon-pre-norm-graph" in forwarded:
+        forwarded.remove("--enable-sharded-muon-pre-norm-graph")
+        os.environ["PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH"] = "1"
+    if "--disable-sharded-muon-pre-norm-graph" in forwarded:
+        forwarded.remove("--disable-sharded-muon-pre-norm-graph")
+        os.environ["PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH"] = "0"
+    if "--enable-adamw-bf16-shadow-update" in forwarded:
+        forwarded.remove("--enable-adamw-bf16-shadow-update")
+        os.environ["PG_GPU_ADAMW_BF16_SHADOW_UPDATE"] = "1"
+    if "--disable-adamw-bf16-shadow-update" in forwarded:
+        forwarded.remove("--disable-adamw-bf16-shadow-update")
+        os.environ["PG_GPU_ADAMW_BF16_SHADOW_UPDATE"] = "0"
+    if "--enable-deferred-weight-gemms" in forwarded:
+        forwarded.remove("--enable-deferred-weight-gemms")
+        os.environ["PG_GPU_DEFER_MLP_UP_BWD_DW"] = "1"
+        os.environ["PG_GPU_DEFER_ATTN_OUT_BWD_DW"] = "1"
+    if "--enable-deferred-all-weight-gemms" in forwarded:
+        forwarded.remove("--enable-deferred-all-weight-gemms")
+        os.environ["PG_GPU_DEFER_LINEAR_BACKWARD_WEIGHT_GEMMS"] = "1"
+    if "--disable-deferred-weight-gemms" in forwarded:
+        forwarded.remove("--disable-deferred-weight-gemms")
+        os.environ["PG_GPU_DEFER_LINEAR_BACKWARD_WEIGHT_GEMMS"] = "0"
+        os.environ["PG_GPU_DEFER_MLP_DOWN_BWD_DW"] = "0"
+        os.environ["PG_GPU_DEFER_MLP_UP_BWD_DW"] = "0"
+        os.environ["PG_GPU_DEFER_QKV_BWD_DW"] = "0"
+        os.environ["PG_GPU_DEFER_ATTN_OUT_BWD_DW"] = "0"
     if "--enable-chunked-q-gain-bwd" in forwarded:
         forwarded.remove("--enable-chunked-q-gain-bwd")
         os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
@@ -713,6 +901,7 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         os.environ["PG_GPU_BF16_ATTN_TAIL_DIRECT_QKV_PACK"] = "1"
         os.environ["PG_GPU_BF16_ATTN_BACKWARD_BHSD_DO"] = "1"
         os.environ["PG_GPU_BF16_QKV_DX_OUTPUT"] = "1"
+        os.environ["PG_GPU_BF16_MLP_DOWN_DX"] = "1"
         reducer = os.environ.setdefault(
             "PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER", "direct_compact"
         )
@@ -811,6 +1000,24 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-gpu-token-full-schedule" in forwarded:
         forwarded.remove("--disable-gpu-token-full-schedule")
         os.environ["PG_GPU_TOKEN_RING_FULL_SCHEDULE"] = "0"
+    if (
+        os.environ.get("PG_GPU_TOKEN_RING_FULL_SCHEDULE", "").lower()
+        in {"1", "true", "yes", "on"}
+        and "PG_GPU_TOKEN_RING_STEPS" not in os.environ
+    ):
+        total_iterations = _forwarded_option(forwarded, "--total-iterations")
+        if total_iterations is None:
+            spec_iterations = _spec_total_iterations(forwarded)
+            if spec_iterations is not None:
+                total_iterations = str(spec_iterations)
+        if total_iterations is None:
+            raise ValueError(
+                "PG_GPU_TOKEN_RING_FULL_SCHEDULE=1 requires --total-iterations, "
+                "--gpu-token-ring-steps, or a spec with [train].total_iterations"
+            )
+        if int(total_iterations) <= 0:
+            raise ValueError("--total-iterations requires a positive integer")
+        os.environ["PG_GPU_TOKEN_RING_STEPS"] = total_iterations
     if "--require-gpu-data-sampler" in forwarded:
         forwarded.remove("--require-gpu-data-sampler")
         os.environ["PG_RECORD_REQUIRE_GPU_DATA_SAMPLER"] = "1"
@@ -877,6 +1084,7 @@ def _maybe_seed_data_env():
 
 def _run_pg_train(args: list[str], label: str):
     os.environ["RUST_LOG"] = "info"
+    os.environ.setdefault("RUST_BACKTRACE", "1")
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
@@ -909,7 +1117,7 @@ def _run_pg_train(args: list[str], label: str):
         forwarded.extend(["--eval-max-tokens", os.environ.get("PG_EVAL_MAX_TOKENS", "16384")])
     if not forwarded or forwarded[0] not in {"run", "sweep"}:
         forwarded.insert(0, "run")
-    cmd = ["pg-train"] + forwarded
+    cmd = _pg_train_command() + forwarded
     print(f"Running {label} command:", " ".join(cmd), flush=True)
     print(
         "Data environment:",
@@ -1177,10 +1385,6 @@ def _run_pg_bench(args: list[str]):
 
 
 def _forwarded_requests_multi_gpu(forwarded: list[str]) -> bool:
-    if "--backend" in forwarded:
-        idx = forwarded.index("--backend")
-        if idx + 1 < len(forwarded) and forwarded[idx + 1] == "cuda-distributed":
-            return True
     if "--world-size" in forwarded:
         idx = forwarded.index("--world-size")
         if idx + 1 < len(forwarded):
@@ -1188,6 +1392,10 @@ def _forwarded_requests_multi_gpu(forwarded: list[str]) -> bool:
                 return int(forwarded[idx + 1]) > 1
             except ValueError:
                 return False
+    if "--backend" in forwarded:
+        idx = forwarded.index("--backend")
+        if idx + 1 < len(forwarded) and forwarded[idx + 1] == "cuda-distributed":
+            return True
     return False
 
 
@@ -1279,6 +1487,22 @@ def run_command(args: list[str]):
 )
 def run_command_multi(args: list[str]):
     return _run_pg_train(args, "multi-GPU")
+
+
+@app.function(
+    image=image,
+    gpu="H100:8",
+    timeout=3600,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+    },
+)
+def run_command_multi_string(args: str):
+    """CLI-friendly multi-GPU entrypoint for detached validation jobs."""
+
+    return _run_pg_train(shlex.split(args), "multi-GPU")
 
 
 @app.function(

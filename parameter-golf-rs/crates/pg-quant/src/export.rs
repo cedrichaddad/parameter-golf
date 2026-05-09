@@ -223,6 +223,7 @@ pub fn export_model_with_spec(
 
 fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
     let int4 = GroupConfig::new(Bits::B4, Block::PerRow);
+    let int5 = GroupConfig::new(Bits::B5, Block::PerRow);
     let int7 = GroupConfig::new(Bits::B7, Block::PerRow);
     let int8 = GroupConfig::new(Bits::B8, Block::PerRow);
     let matrix = GroupConfig::new(
@@ -251,8 +252,8 @@ fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
             attn_k: matrix.clone(),
             attn_v: matrix.clone(),
             attn_o: matrix.clone(),
-            mlp_up: matrix.clone(),
-            mlp_down: matrix,
+            mlp_up: int5.clone(),
+            mlp_down: int5,
             embed,
         }),
         QuantScheme::Aggressive => Ok(Scheme {

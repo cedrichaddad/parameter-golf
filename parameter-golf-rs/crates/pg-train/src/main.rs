@@ -50,6 +50,7 @@ fn main() {
             let mut attn_out_gate_width: Option<usize> = None;
             let mut quant_scheme: Option<QuantScheme> = None;
             let mut prune_keep_ratio: Option<f32> = None;
+            let mut result_json_path: Option<PathBuf> = None;
             let mut fast_bank_updates = false;
             let mut allow_unsupported_variants = false;
 
@@ -118,6 +119,7 @@ fn main() {
                     "--prune-keep-ratio" => {
                         prune_keep_ratio = args.next().and_then(|v| v.parse::<f32>().ok())
                     }
+                    "--result-json" => result_json_path = args.next().map(PathBuf::from),
                     "--fast-bank-updates" => fast_bank_updates = true,
                     "--allow-unsupported-variants" => allow_unsupported_variants = true,
                     _ => {}
@@ -617,7 +619,7 @@ fn main() {
             if let Some(bpb) = result.proxy_bpb {
                 println!("proxy_bpb={bpb:.6}");
             }
-            if let Some(source) = result.proxy_metric_source {
+            if let Some(source) = result.proxy_metric_source.as_deref() {
                 println!("proxy_metric_source={source}");
             }
             if let Some(tokens) = result.eval_tokens {
@@ -628,6 +630,14 @@ fn main() {
             }
             if let Some(bpb) = result.final_bpb {
                 println!("final_bpb={bpb:.6}");
+            }
+            let run_timing_json = pg_train::run_timing_json(&result);
+            println!("run_timing_json={run_timing_json}");
+            if let Some(path) = result_json_path {
+                if let Err(err) = std::fs::write(&path, format!("{run_timing_json}\n")) {
+                    eprintln!("failed to write --result-json {}: {err}", path.display());
+                    std::process::exit(1);
+                }
             }
         }
         "sweep" => {

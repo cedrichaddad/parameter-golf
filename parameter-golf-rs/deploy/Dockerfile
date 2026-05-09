@@ -15,9 +15,13 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS builder
 RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
     > /etc/apt/apt.conf.d/80-retries
 
-# Install Rust toolchain
+# Install the minimal Rust toolchain. Modal builders have previously inherited a
+# default rustup profile that pulled clippy/rustfmt and caused avoidable network
+# failures during H100 validation image rebuilds.
 RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev ca-certificates && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    export RUSTUP_INIT_SKIP_PATH_CHECK=yes && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install NCCL/cuDNN matching the CUDA 12.8 base image. Falling through to the
@@ -41,33 +45,17 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build all binaries with CUDA feature
-RUN cargo build --release --features cuda -p pg-train -p pg-bench -p pg-eval
+# Fetch dependencies in the image, but compile pg-train inside the Modal worker.
+# This keeps image finalization short during rapid CUDA iteration; the timing
+# harness measures only the subprocess training step, not the pre-run compile.
+RUN cargo fetch
 
 # === Runtime stage ===
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+# Use the builder image as the runtime while iterating so the remote function
+# can compile pg-train after startup. This intentionally trades image size for
+# reliable validation.
+FROM builder
 
-RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
-    > /etc/apt/apt.conf.d/80-retries
-
-RUN apt-get update && apt-get install -y --allow-change-held-packages \
-    libnccl2=2.25.1-1+cuda12.8 \
-    libnccl-dev=2.25.1-1+cuda12.8 \
-    libcudnn9-cuda-12 \
-    cuda-nvrtc-12-8 || \
-    apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev libcudnn8 && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /build/target/release/pg-train /usr/local/bin/pg-train
-COPY --from=builder /build/target/release/smoke /usr/local/bin/pg-smoke
-COPY --from=builder /build/target/release/gemm-bench /usr/local/bin/pg-gemm-bench
-COPY --from=builder /build/target/release/attention-bench /usr/local/bin/pg-attention-bench
-COPY --from=builder /build/target/release/nccl-bench /usr/local/bin/pg-nccl-bench
-COPY --from=builder /build/target/release/preliminary /usr/local/bin/pg-preliminary
-COPY --from=builder /build/target/release/parity-forward /usr/local/bin/pg-parity-forward
-COPY --from=builder /build/target/release/parity-step /usr/local/bin/pg-parity-step
-COPY --from=builder /build/target/release/parity-kernels /usr/local/bin/pg-parity-kernels
-COPY --from=builder /build/target/release/run /usr/local/bin/pg-eval
 COPY specs /specs
 # Data directory mount point
 # VOLUME /data removed since Modal handles volumes via @app.function(volumes={...})

@@ -44,28 +44,46 @@ impl DataShard {
         // SAFETY: read-only mmap, file must not be modified externally during lifetime
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Parse header (little-endian i32)
-        let header_bytes = &mmap[..HEADER_BYTES];
-        let header: &[i32] = bytemuck::cast_slice(&header_bytes[..HEADER_INTS * 4]);
+        // Parse header from bytes explicitly. mmap-backed slices are not a
+        // Rust alignment contract, and bytemuck::cast_slice may reject them.
+        let read_header_i32 = |idx: usize| -> i32 {
+            let start = idx * std::mem::size_of::<i32>();
+            i32::from_le_bytes([
+                mmap[start],
+                mmap[start + 1],
+                mmap[start + 2],
+                mmap[start + 3],
+            ])
+        };
+        let magic = read_header_i32(0);
+        let version = read_header_i32(1);
+        let num_tokens_raw = read_header_i32(2);
 
-        if header[0] != MAGIC {
+        if magic != MAGIC {
             return Err(PgError::DataFormat(format!(
                 "shard {} has wrong magic: {} (expected {})",
                 path.display(),
-                header[0],
+                magic,
                 MAGIC
             )));
         }
-        if header[1] != VERSION {
+        if version != VERSION {
             return Err(PgError::DataFormat(format!(
                 "shard {} has wrong version: {} (expected {})",
                 path.display(),
-                header[1],
+                version,
                 VERSION
             )));
         }
 
-        let num_tokens = header[2] as usize;
+        if num_tokens_raw < 0 {
+            return Err(PgError::DataFormat(format!(
+                "shard {} has negative token count: {}",
+                path.display(),
+                num_tokens_raw
+            )));
+        }
+        let num_tokens = num_tokens_raw as usize;
         let expected_size = HEADER_BYTES + num_tokens * 2; // uint16 = 2 bytes
         if file_len != expected_size {
             return Err(PgError::DataFormat(format!(

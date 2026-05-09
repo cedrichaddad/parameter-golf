@@ -32,6 +32,15 @@ fn batched_muon_ns_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn muon_ns_steps_override(default_steps: usize) -> usize {
+    std::env::var("PG_GPU_MUON_NS_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|steps| *steps > 0)
+        .unwrap_or(default_steps)
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MuonNsProfile {
     Simple,
@@ -167,6 +176,7 @@ impl GpuMuonBankState {
 #[cfg(feature = "cuda")]
 pub struct GpuMuon {
     gemm: GemmEngine,
+    hyper: GpuTensor,
     pub lr: f32,
     pub momentum: f32,
     pub nesterov: bool,
@@ -188,6 +198,13 @@ impl GpuMuon {
         bank_shapes: &[[usize; 3]],
     ) -> PgResult<Self> {
         let gemm = GemmEngine::new(stream.clone())?;
+        let ns_steps = muon_ns_steps_override(ns_steps);
+        let hyper = GpuTensor::from_host_data_gpu(
+            stream.clone(),
+            bytemuck::cast_slice(&[lr, momentum, weight_decay, 0.0f32]),
+            &[4],
+            DType::F32,
+        )?;
         let bank_states = bank_shapes
             .iter()
             .copied()
@@ -195,6 +212,7 @@ impl GpuMuon {
             .collect::<PgResult<Vec<_>>>()?;
         Ok(Self {
             gemm,
+            hyper,
             lr,
             momentum,
             nesterov,
@@ -203,6 +221,19 @@ impl GpuMuon {
             ns_profile: MuonNsProfile::from_env(),
             bank_states,
         })
+    }
+
+    pub fn update_hyper_device(
+        &mut self,
+        lr: f32,
+        momentum: f32,
+        weight_decay: f32,
+    ) -> PgResult<()> {
+        self.lr = lr;
+        self.momentum = momentum;
+        self.weight_decay = weight_decay;
+        self.hyper
+            .copy_from_host_bytes(bytemuck::cast_slice(&[lr, momentum, weight_decay, 0.0f32]))
     }
 
     pub fn step_bank(
@@ -224,6 +255,94 @@ impl GpuMuon {
         global_norm_sum_sq: Option<&GpuTensor>,
         max_norm: f32,
     ) -> PgResult<()> {
+        self.step_bank_inner(
+            kernels,
+            bank_idx,
+            param,
+            None,
+            grad,
+            global_norm_sum_sq,
+            max_norm,
+            false,
+        )
+    }
+
+    pub fn step_bank_with_global_clip_bf16_shadow(
+        &mut self,
+        kernels: &GpuKernels,
+        bank_idx: usize,
+        param: &GpuTensor,
+        param_bf16: &GpuTensor,
+        grad: &GpuTensor,
+        global_norm_sum_sq: Option<&GpuTensor>,
+        max_norm: f32,
+    ) -> PgResult<()> {
+        self.step_bank_inner(
+            kernels,
+            bank_idx,
+            param,
+            Some(param_bf16),
+            grad,
+            global_norm_sum_sq,
+            max_norm,
+            false,
+        )
+    }
+
+    pub fn step_bank_with_global_clip_bf16_shadow_hyper(
+        &mut self,
+        kernels: &GpuKernels,
+        bank_idx: usize,
+        param: &GpuTensor,
+        param_bf16: &GpuTensor,
+        grad: &GpuTensor,
+        global_norm_sum_sq: Option<&GpuTensor>,
+        max_norm: f32,
+    ) -> PgResult<()> {
+        self.step_bank_inner(
+            kernels,
+            bank_idx,
+            param,
+            Some(param_bf16),
+            grad,
+            global_norm_sum_sq,
+            max_norm,
+            true,
+        )
+    }
+
+    pub fn step_bank_with_global_clip_hyper(
+        &mut self,
+        kernels: &GpuKernels,
+        bank_idx: usize,
+        param: &GpuTensor,
+        grad: &GpuTensor,
+        global_norm_sum_sq: Option<&GpuTensor>,
+        max_norm: f32,
+    ) -> PgResult<()> {
+        self.step_bank_inner(
+            kernels,
+            bank_idx,
+            param,
+            None,
+            grad,
+            global_norm_sum_sq,
+            max_norm,
+            true,
+        )
+    }
+
+    fn step_bank_inner(
+        &mut self,
+        kernels: &GpuKernels,
+        bank_idx: usize,
+        param: &GpuTensor,
+        param_bf16: Option<&GpuTensor>,
+        grad: &GpuTensor,
+        global_norm_sum_sq: Option<&GpuTensor>,
+        max_norm: f32,
+        use_device_hyper: bool,
+    ) -> PgResult<()> {
         let state = self
             .bank_states
             .get_mut(bank_idx)
@@ -238,6 +357,21 @@ impl GpuMuon {
                 "GpuMuon::step_bank expects rank-3 bank tensors fitting the allocated state".into(),
             ));
         }
+        if let Some(param_bf16) = param_bf16 {
+            if param_bf16.shape() != param.shape() {
+                return Err(PgError::InvalidOp(format!(
+                    "GpuMuon::step_bank BF16 shadow shape mismatch: param={:?} bf16={:?}",
+                    param.shape(),
+                    param_bf16.shape()
+                )));
+            }
+            if param_bf16.dtype() != DType::BF16 {
+                return Err(PgError::InvalidOp(format!(
+                    "GpuMuon::step_bank BF16 shadow requires BF16 dtype, got {:?}",
+                    param_bf16.dtype()
+                )));
+            }
+        }
 
         let active_batch = param.shape()[0];
         if active_batch == 0 {
@@ -251,14 +385,37 @@ impl GpuMuon {
         let ns_b = state.ns_b.slice_range(0, active_batch)?;
         let ns_tmp = state.ns_tmp.slice_range(0, active_batch)?;
         let bank_numel = param.numel() as u32;
+        let hyper = if use_device_hyper {
+            Some(CudaPtr(self.hyper.cu_ptr(kernels.stream())?))
+        } else {
+            None
+        };
         if let Some(sum_sq) = global_norm_sum_sq {
-            kernels.scale_add_inplace_global_norm_fwd(
+            if let Some(hyper) = hyper {
+                kernels.scale_add_inplace_global_norm_hyper_momentum_fwd(
+                    CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                    CudaPtr(grad.cu_ptr(kernels.stream())?),
+                    CudaPtr(sum_sq.cu_ptr(kernels.stream())?),
+                    hyper,
+                    max_norm,
+                    bank_numel,
+                )?;
+            } else {
+                kernels.scale_add_inplace_global_norm_fwd(
+                    CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                    CudaPtr(grad.cu_ptr(kernels.stream())?),
+                    CudaPtr(sum_sq.cu_ptr(kernels.stream())?),
+                    max_norm,
+                    self.momentum,
+                    1.0,
+                    bank_numel,
+                )?;
+            }
+        } else if let Some(hyper) = hyper {
+            kernels.scale_add_inplace_hyper_momentum_fwd(
                 CudaPtr(momentum.cu_ptr(kernels.stream())?),
                 CudaPtr(grad.cu_ptr(kernels.stream())?),
-                CudaPtr(sum_sq.cu_ptr(kernels.stream())?),
-                max_norm,
-                self.momentum,
-                1.0,
+                hyper,
                 bank_numel,
             )?;
         } else {
@@ -272,14 +429,24 @@ impl GpuMuon {
         }
 
         if self.nesterov {
-            kernels.linear_comb2_fwd(
-                CudaPtr(grad.cu_ptr(kernels.stream())?),
-                CudaPtr(momentum.cu_ptr(kernels.stream())?),
-                CudaPtr(ns_update.cu_ptr(kernels.stream())?),
-                1.0,
-                self.momentum,
-                bank_numel,
-            )?;
+            if let Some(hyper) = hyper {
+                kernels.nesterov_update_hyper_fwd(
+                    CudaPtr(grad.cu_ptr(kernels.stream())?),
+                    CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+                    hyper,
+                    bank_numel,
+                )?;
+            } else {
+                kernels.linear_comb2_fwd(
+                    CudaPtr(grad.cu_ptr(kernels.stream())?),
+                    CudaPtr(momentum.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_update.cu_ptr(kernels.stream())?),
+                    1.0,
+                    self.momentum,
+                    bank_numel,
+                )?;
+            }
         } else {
             kernels.copy_fwd(
                 CudaPtr(momentum.cu_ptr(kernels.stream())?),
@@ -514,13 +681,43 @@ impl GpuMuon {
             state.scale,
             bank_numel,
         )?;
-        kernels.decay_sgd_step(
-            CudaPtr(param.cu_ptr(kernels.stream())?),
-            CudaPtr(ns_x.cu_ptr(kernels.stream())?),
-            self.lr,
-            self.weight_decay,
-            bank_numel,
-        )?;
+        if let Some(param_bf16) = param_bf16 {
+            if let Some(hyper) = hyper {
+                kernels.decay_sgd_step_bf16_shadow_hyper(
+                    CudaPtr(param.cu_ptr(kernels.stream())?),
+                    CudaPtr(param_bf16.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
+                    hyper,
+                    bank_numel,
+                )?;
+            } else {
+                kernels.decay_sgd_step_bf16_shadow(
+                    CudaPtr(param.cu_ptr(kernels.stream())?),
+                    CudaPtr(param_bf16.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
+                    self.lr,
+                    self.weight_decay,
+                    bank_numel,
+                )?;
+            }
+        } else {
+            if let Some(hyper) = hyper {
+                kernels.decay_sgd_step_hyper(
+                    CudaPtr(param.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
+                    hyper,
+                    bank_numel,
+                )?;
+            } else {
+                kernels.decay_sgd_step(
+                    CudaPtr(param.cu_ptr(kernels.stream())?),
+                    CudaPtr(ns_x.cu_ptr(kernels.stream())?),
+                    self.lr,
+                    self.weight_decay,
+                    bank_numel,
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -598,6 +795,55 @@ impl GpuOptimizer {
         let bc2 = 1.0 - hyper.beta2.powi(state.step as i32);
         kernels.adamw_step(
             CudaPtr(param.cu_ptr(kernels.stream())?),
+            CudaPtr(grad.cu_ptr(kernels.stream())?),
+            CudaPtr(state.m.cu_ptr(kernels.stream())?),
+            CudaPtr(state.v.cu_ptr(kernels.stream())?),
+            hyper.lr,
+            hyper.beta1,
+            hyper.beta2,
+            bc1,
+            bc2,
+            hyper.eps,
+            hyper.weight_decay,
+            param.numel() as u32,
+        )
+    }
+
+    pub fn adamw_step_bf16_shadow(
+        &mut self,
+        kernels: &GpuKernels,
+        param: &GpuTensor,
+        param_bf16: &GpuTensor,
+        grad: &GpuTensor,
+        state: &mut GpuAdamWState,
+        hyper: AdamWHyper,
+    ) -> PgResult<()> {
+        if param.shape() != grad.shape()
+            || param.shape() != param_bf16.shape()
+            || param.shape() != state.m.shape()
+            || param.shape() != state.v.shape()
+        {
+            return Err(PgError::InvalidOp(format!(
+                "adamw_step_bf16_shadow shape mismatch: param={:?} bf16={:?} grad={:?} m={:?} v={:?}",
+                param.shape(),
+                param_bf16.shape(),
+                grad.shape(),
+                state.m.shape(),
+                state.v.shape()
+            )));
+        }
+        if param_bf16.dtype() != DType::BF16 {
+            return Err(PgError::InvalidOp(format!(
+                "adamw_step_bf16_shadow requires BF16 shadow, got {:?}",
+                param_bf16.dtype()
+            )));
+        }
+        state.step += 1;
+        let bc1 = 1.0 - hyper.beta1.powi(state.step as i32);
+        let bc2 = 1.0 - hyper.beta2.powi(state.step as i32);
+        kernels.adamw_step_bf16_shadow(
+            CudaPtr(param.cu_ptr(kernels.stream())?),
+            CudaPtr(param_bf16.cu_ptr(kernels.stream())?),
             CudaPtr(grad.cu_ptr(kernels.stream())?),
             CudaPtr(state.m.cu_ptr(kernels.stream())?),
             CudaPtr(state.v.cu_ptr(kernels.stream())?),

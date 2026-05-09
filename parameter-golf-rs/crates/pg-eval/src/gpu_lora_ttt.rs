@@ -1015,7 +1015,7 @@ fn score_chunk_gpu(
         input_gpu.copy_from_host_bytes(bytemuck::cast_slice(&host.input))?;
         target_gpu.copy_from_host_bytes(bytemuck::cast_slice(&host.target))?;
 
-        if model.uses_tiled_output_ce() {
+        if model.uses_tiled_output_ce() || model.uses_chunked_bf16_output_ce_cache() {
             model.forward_hidden_with_seq_len(input_gpu, activations, seq_len)?;
         } else {
             model.forward_with_seq_len(input_gpu, activations, seq_len)?;
@@ -1045,11 +1045,26 @@ fn score_chunk_gpu(
         }
     }
     let loss_sum_bytes = loss_sum_gpu.to_host_bytes()?;
-    let loss_sum = bytemuck::cast_slice::<u8, f32>(&loss_sum_bytes)
+    let loss_sum = decode_f32_host_bytes(&loss_sum_bytes)?
         .first()
         .copied()
         .unwrap_or(0.0) as f64;
     Ok((loss_sum, token_count, byte_count))
+}
+
+#[cfg(feature = "cuda")]
+fn decode_f32_host_bytes(bytes: &[u8]) -> PgResult<Vec<f32>> {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(PgError::InvalidOp(format!(
+            "GPU f32 download returned {} bytes, not divisible by {}",
+            bytes.len(),
+            std::mem::size_of::<f32>()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 #[cfg(feature = "cuda")]

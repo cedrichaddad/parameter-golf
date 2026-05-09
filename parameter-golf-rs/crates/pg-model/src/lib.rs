@@ -12,7 +12,9 @@ pub use config::{ModelConfig, TrainConfig};
 pub use model::{ForwardBuffer, GptModel};
 pub use plan::ExecutionPlan;
 pub use spec::{
-    AttentionBackend, AttnOutGateSpec, CompressionMode, DistributedOptimizerBackend,
-    EvalAdaptationBackend, EvalSpec, ModelComputePrecision, ModelSpec, OutputCeBackend,
-    QuantScheme, QuantSpec, RunMode, RunSpec, TrainBackend, TrainSpec, VariantFamily,
+    AsymLogitSpec, AttentionBackend, AttnOutGateSpec, BackwardChainProfile, CompressionMode,
+    CudaGraphProfile, DistributedOptimizerBackend, EvalAdaptationBackend, EvalSpec,
+    ModelComputePrecision, ModelSpec, NcclOverlapMode, NgramTiltSpec, OutputCeBackend, QuantScheme,
+    QuantSpec, RecordProfile, RunMode, RunSpec, RuntimeSpec, ShortDocScoreFirstEntry, TrainBackend,
+    TrainSeqScheduleEntry, TrainSpec, TttMask, VariantFamily,
 };

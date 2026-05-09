@@ -393,6 +393,38 @@ fn validate_run_spec(run_spec: &RunSpec) -> PgResult<()> {
             "value embedding enabled but dim is zero".into(),
         ));
     }
+    for entry in &run_spec.train.seq_schedule {
+        if entry.seq_len == 0 {
+            return Err(PgError::InvalidOp(
+                "train.seq_schedule entries must use a non-zero seq_len".into(),
+            ));
+        }
+        if !entry.frac.is_finite() || !(0.0..=1.0).contains(&entry.frac) {
+            return Err(PgError::InvalidOp(format!(
+                "train.seq_schedule frac must be in [0,1], got {}",
+                entry.frac
+            )));
+        }
+    }
+    for pair in run_spec.train.seq_schedule.windows(2) {
+        if pair[0].frac > pair[1].frac {
+            return Err(PgError::InvalidOp(
+                "train.seq_schedule entries must be sorted by frac".into(),
+            ));
+        }
+    }
+    if run_spec.eval.ngram_tilt.enabled {
+        if run_spec.eval.ngram_tilt.token_order < 2 {
+            return Err(PgError::InvalidOp(
+                "eval.ngram_tilt.token_order must be >= 2 when enabled".into(),
+            ));
+        }
+        if !run_spec.eval.ngram_tilt.precompute_inside_eval_timer {
+            return Err(PgError::InvalidOp(
+                "eval.ngram_tilt.precompute_inside_eval_timer must be true".into(),
+            ));
+        }
+    }
     if spec.rope.dims > spec.model_dim / spec.num_heads {
         return Err(PgError::InvalidOp(format!(
             "rope dims {} exceed head dim {}",
@@ -490,10 +522,13 @@ fn fingerprint(run_spec: &RunSpec) -> String {
     format!("{:?}", run_spec.model).hash(&mut hasher);
     format!("{:?}", run_spec.quant).hash(&mut hasher);
     format!("{:?}", run_spec.eval).hash(&mut hasher);
+    format!("{:?}", run_spec.runtime).hash(&mut hasher);
     format!("{:?}", run_spec.train.backend).hash(&mut hasher);
     format!("{:?}", run_spec.train.distributed_optimizer_backend).hash(&mut hasher);
     run_spec.train.batch_tokens.hash(&mut hasher);
     run_spec.train.seq_len.hash(&mut hasher);
+    run_spec.train.grad_clip_norm.to_bits().hash(&mut hasher);
+    format!("{:?}", run_spec.train.seq_schedule).hash(&mut hasher);
     run_spec.train.fast_bank_updates.hash(&mut hasher);
     run_spec.train.warmup_steps.hash(&mut hasher);
     run_spec.train.total_iterations.hash(&mut hasher);
@@ -531,7 +566,10 @@ fn fingerprint(run_spec: &RunSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompressionMode, EvalAdaptationBackend, RunSpec, VariantFamily};
+    use crate::{
+        BackwardChainProfile, CompressionMode, CudaGraphProfile, EvalAdaptationBackend,
+        RecordProfile, RunSpec, TttMask, VariantFamily,
+    };
 
     #[test]
     fn hybrid_competitive_plan_accepts_sparse_attn_gate() {
@@ -627,6 +665,53 @@ mod tests {
         );
         assert_eq!(spec.eval.lora_rank, 80);
         assert_eq!(spec.eval.ttt_beta2, 0.99);
+    }
+
+    #[test]
+    fn frontier_2014_and_2135_specs_load_runtime_targets() {
+        let specs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../specs");
+        let clean = RunSpec::load(&specs_dir.join("frontier_2014_clean_target.toml")).unwrap();
+        assert_eq!(
+            clean.runtime.record_profile,
+            RecordProfile::Frontier2014Clean
+        );
+        assert_eq!(
+            clean.runtime.backward_chain_profile,
+            BackwardChainProfile::Bf16DirectCompact
+        );
+        assert_eq!(
+            clean.runtime.cuda_graph_profile,
+            CudaGraphProfile::RecordStepNoLoss
+        );
+        assert_eq!(clean.model.train_seq_len, 3072);
+        assert_eq!(clean.eval.ttt_seq_len, Some(3072));
+        assert_eq!(clean.eval.ttt_mask, TttMask::NoQv);
+        assert_eq!(clean.train.seq_schedule.len(), 3);
+        ExecutionPlan::from_run_spec(&clean).unwrap();
+
+        let audit = RunSpec::load(&specs_dir.join("frontier_2135_audit_target.toml")).unwrap();
+        assert_eq!(
+            audit.runtime.record_profile,
+            RecordProfile::Frontier2135Audit
+        );
+        assert_eq!(audit.quant.gptq_calibration_batches, 32);
+        assert_eq!(audit.model.train_seq_len, 2048);
+        assert_eq!(audit.train.seq_len, 2048);
+        assert_eq!(audit.train.batch_tokens, 786_432);
+        assert_eq!(audit.train.grad_clip_norm, 0.3);
+        assert_eq!(audit.train.scalar_lr, 0.02);
+        assert_eq!(audit.train.tied_embed_lr, 0.03);
+        assert_eq!(audit.train.muon_momentum, 0.97);
+        assert_eq!(audit.train.muon_wd, 0.095);
+        assert_eq!(audit.train.adam_wd, 0.02);
+        assert!(audit.model.asym_logit.enabled);
+        assert!(audit.eval.ngram_tilt.enabled);
+        assert_eq!(audit.eval.ngram_tilt.within_boost, 0.0);
+        assert_eq!(audit.eval.ngram_tilt.word_boost, 0.0);
+        assert_eq!(audit.eval.ngram_tilt.agree_add_boost, 0.0);
+        assert_eq!(audit.eval.ttt_seq_len, Some(2560));
+        assert_eq!(audit.eval.ttt_mask, TttMask::KOff);
+        ExecutionPlan::from_run_spec(&audit).unwrap();
     }
 
     #[test]

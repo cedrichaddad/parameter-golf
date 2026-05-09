@@ -1,10 +1,13 @@
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use pg_model::backward::GradBuffers;
 use pg_model::{
-    AttentionBackend, DistributedOptimizerBackend, EvalAdaptationBackend, ExecutionPlan,
-    ForwardBuffer, GptModel, ModelComputePrecision, OutputCeBackend, RunMode, RunSpec,
-    TrainBackend,
+    AttentionBackend, BackwardChainProfile, CudaGraphProfile, DistributedOptimizerBackend,
+    EvalAdaptationBackend, ExecutionPlan, ForwardBuffer, GptModel, ModelComputePrecision,
+    NcclOverlapMode, OutputCeBackend, RecordProfile, RunMode, RunSpec, TrainBackend, TttMask,
 };
 use pg_optim::adamw::{AdamW, AdamWState};
 use pg_optim::ema::{Ema, Swa};
@@ -16,6 +19,191 @@ use pg_optim::scheduler;
 use pg_core::PgResult;
 use pg_data::bpb::{BpbLuts, compute_bpb};
 use pg_data::token_stream::DistributedTokenLoader;
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+#[derive(Clone)]
+struct Sha256State {
+    h: [u32; 8],
+    len: u64,
+    buf: [u8; 64],
+    buf_len: usize,
+}
+
+impl Sha256State {
+    fn new() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            len: 0,
+            buf: [0; 64],
+            buf_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.len = self.len.wrapping_add(input.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(input.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&input[..take]);
+            self.buf_len += take;
+            input = &input[take..];
+            if self.buf_len == 64 {
+                let block = self.buf;
+                self.compress(&block);
+                self.buf_len = 0;
+            }
+        }
+        while input.len() >= 64 {
+            self.compress(&input[..64]);
+            input = &input[64..];
+        }
+        if !input.is_empty() {
+            self.buf[..input.len()].copy_from_slice(input);
+            self.buf_len = input.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.len.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            for b in &mut self.buf[self.buf_len..] {
+                *b = 0;
+            }
+            let block = self.buf;
+            self.compress(&block);
+            self.buf_len = 0;
+        }
+        for b in &mut self.buf[self.buf_len..56] {
+            *b = 0;
+        }
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buf;
+        self.compress(&block);
+        let mut out = [0u8; 32];
+        for (chunk, word) in out.chunks_exact_mut(4).zip(self.h) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn compress(&mut self, block: &[u8]) {
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, value) in self.h.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = (*slot).wrapping_add(value);
+        }
+    }
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn sha256_file(path: &Path) -> PgResult<String> {
+    let mut file = File::open(path)?;
+    let mut state = Sha256State::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        state.update(&buf[..n]);
+    }
+    Ok(hex_digest(state.finalize()))
+}
+
+fn simple_glob_paths(pattern: &str) -> PgResult<Vec<PathBuf>> {
+    let Some(star) = pattern.find('*') else {
+        return Ok(vec![PathBuf::from(pattern)]);
+    };
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    let prefix_path = Path::new(prefix);
+    let dir = prefix_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem_prefix = prefix_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with(stem_prefix) && path.to_string_lossy().ends_with(suffix) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn sha256_file_set(pattern: &str) -> PgResult<Option<String>> {
+    let paths = simple_glob_paths(pattern)?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut state = Sha256State::new();
+    for path in paths {
+        state.update(path.to_string_lossy().as_bytes());
+        state.update(b"\0");
+        let digest = sha256_file(&path)?;
+        state.update(digest.as_bytes());
+        state.update(b"\0");
+    }
+    Ok(Some(hex_digest(state.finalize())))
+}
 
 #[derive(Debug, Clone)]
 pub struct VariantResult {
@@ -34,6 +222,9 @@ pub struct VariantResult {
     pub submission_code_bytes: Option<usize>,
     pub submission_total_bytes: Option<usize>,
     pub artifact_budget_ok: Option<bool>,
+    pub artifact_model_sha256: Option<String>,
+    pub artifact_code_sha256: Option<String>,
+    pub caseops_byte_sidecar_sha256: Option<String>,
     pub attention_backend: String,
     pub distributed_optimizer_backend: String,
     pub eval_adaptation_backend: String,
@@ -51,6 +242,11 @@ pub struct VariantResult {
     pub wallclock_seconds: f64,
     pub timing_steps: usize,
     pub timing_measured_ms_per_step: f64,
+    pub host_batch_flatten_calls: usize,
+    pub host_to_device_batch_bytes: usize,
+    pub device_batch_ready_steps: usize,
+    pub device_batch_missing_steps: usize,
+    pub device_to_host_scalar_reads: usize,
     pub timing_data_sampling_ms: f64,
     pub timing_train_step_ms: f64,
     pub timing_cuda_zero_grads_ms: f64,
@@ -92,6 +288,14 @@ pub struct VariantResult {
     pub timing_cuda_backward_tail_ms: f64,
     pub timing_cuda_non_bank_sync_ms: f64,
     pub timing_cuda_bank_update_ms: f64,
+    pub timing_cuda_bank_update_stage_pack_ms: f64,
+    pub timing_cuda_bank_update_stage_grad_collectives_ms: f64,
+    pub timing_cuda_bank_update_stage_scale_ms: f64,
+    pub timing_cuda_bank_update_stage_norm_ms: f64,
+    pub timing_cuda_bank_update_stage_clip_ms: f64,
+    pub timing_cuda_bank_update_stage_muon_ms: f64,
+    pub timing_cuda_bank_update_stage_param_gather_ms: f64,
+    pub timing_cuda_bank_update_stage_copy_back_ms: f64,
     pub timing_cuda_non_bank_update_ms: f64,
     pub timing_post_train_sync_ms: f64,
     pub timing_artifact_export_ms: f64,
@@ -160,16 +364,40 @@ struct RunTiming {
     cuda_backward_tail_ms: f64,
     cuda_non_bank_sync_ms: f64,
     cuda_bank_update_ms: f64,
+    cuda_bank_update_stage_pack_ms: f64,
+    cuda_bank_update_stage_grad_collectives_ms: f64,
+    cuda_bank_update_stage_scale_ms: f64,
+    cuda_bank_update_stage_norm_ms: f64,
+    cuda_bank_update_stage_clip_ms: f64,
+    cuda_bank_update_stage_muon_ms: f64,
+    cuda_bank_update_stage_param_gather_ms: f64,
+    cuda_bank_update_stage_copy_back_ms: f64,
     cuda_non_bank_update_ms: f64,
     post_train_sync_ms: f64,
     artifact_export_ms: f64,
     eval_ms: f64,
+    host_batch_flatten_calls: usize,
+    host_to_device_batch_bytes: usize,
+    device_batch_ready_steps: usize,
+    device_batch_missing_steps: usize,
+    device_to_host_scalar_reads: usize,
 }
 
 #[cfg(feature = "cuda")]
 fn cuda_event_timing_enabled() -> bool {
     matches!(
         std::env::var("PG_CUDA_EVENT_TIMING")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_overwrite_bank_grads_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_OVERWRITE_BANK_GRADS")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str(),
@@ -211,6 +439,70 @@ fn cuda_backward_graph_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn cuda_graph_capture_mode() -> cudarc::driver::sys::CUstreamCaptureMode {
+    match std::env::var("PG_CUDA_GRAPH_CAPTURE_MODE")
+        .unwrap_or_else(|_| "thread_local".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "relaxed" => cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        "global" => cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+        _ => cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_backward_graph_warmup_steps() -> usize {
+    std::env::var("PG_CUDA_BACKWARD_GRAPH_WARMUP_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_parallel_muon_local_graph_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_LOCAL_GRAPH")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    ) && cuda_backward_graph_enabled()
+        && !cuda_stage_timing_enabled()
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_parallel_muon_pre_norm_graph_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    ) && cuda_backward_graph_enabled()
+        && !cuda_stage_timing_enabled()
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_parallel_muon_local_graph_warmup_steps() -> usize {
+    std::env::var("PG_GPU_SHARDED_MUON_LOCAL_GRAPH_WARMUP_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_parallel_muon_pre_norm_graph_warmup_steps() -> usize {
+    std::env::var("PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH_WARMUP_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_timing_backend_label() -> &'static str {
     if cuda_backward_graph_enabled() && cuda_event_timing_enabled() {
         "cuda_event_max_per_replica_backward_graph"
@@ -223,6 +515,168 @@ fn cuda_timing_backend_label() -> &'static str {
     } else {
         "host_wallclock_cuda_boundary"
     }
+}
+
+fn env_flag_raw(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn set_env_var(name: &str, value: &str) {
+    unsafe {
+        std::env::set_var(name, value);
+    }
+}
+
+fn apply_bool_runtime_env(name: &str, expected: bool, record_authoritative: bool) -> PgResult<()> {
+    if record_authoritative {
+        if let Some(actual) = env_flag_raw(name) {
+            if actual != expected {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record mode runtime profile owns {name}; env requested {actual}, spec requires {expected}"
+                )));
+            }
+        }
+        set_env_var(name, if expected { "1" } else { "0" });
+    } else if std::env::var_os(name).is_none() {
+        set_env_var(name, if expected { "1" } else { "0" });
+    }
+    Ok(())
+}
+
+fn apply_string_runtime_env(
+    name: &str,
+    expected: &str,
+    record_authoritative: bool,
+) -> PgResult<()> {
+    if record_authoritative {
+        if let Ok(actual) = std::env::var(name) {
+            if actual != expected {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record mode runtime profile owns {name}; env requested {actual:?}, spec requires {expected:?}"
+                )));
+            }
+        }
+        set_env_var(name, expected);
+    } else if std::env::var_os(name).is_none() {
+        set_env_var(name, expected);
+    }
+    Ok(())
+}
+
+fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> {
+    if !is_record_shaped_mode(mode) {
+        return Ok(());
+    }
+    let record_authoritative = mode == RunMode::Record;
+    let bf16_chain = run_spec.runtime.backward_chain_profile != BackwardChainProfile::Off;
+    let direct_compact =
+        run_spec.runtime.backward_chain_profile == BackwardChainProfile::Bf16DirectCompact;
+
+    apply_bool_runtime_env(
+        "PG_GPU_BF16_BACKWARD_CHAIN",
+        bf16_chain,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_BF16_BACKWARD_CHAIN_STRICT",
+        bf16_chain,
+        record_authoritative,
+    )?;
+    if bf16_chain {
+        apply_string_runtime_env("PG_GPU_SAVE_LAYER_ACTS", "all", record_authoritative)?;
+        apply_bool_runtime_env("PG_GPU_DIRECT_SAVED_ACTS", true, record_authoritative)?;
+        apply_bool_runtime_env(
+            "PG_GPU_CUDNN_PREPACKED_BF16_ATTN",
+            true,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env("PG_GPU_FUSED_QKV_PROJ", true, record_authoritative)?;
+        apply_bool_runtime_env(
+            "PG_GPU_FUSED_QKV_PROJ_RECORD_OK",
+            true,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env("PG_GPU_BF16_ATTN_BACKWARD_TAIL", true, record_authoritative)?;
+        apply_bool_runtime_env("PG_GPU_BF16_ATTN_TAIL_QKV_PACK", true, record_authoritative)?;
+        apply_bool_runtime_env(
+            "PG_GPU_BF16_ATTN_TAIL_DIRECT_QKV_PACK",
+            direct_compact,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_BF16_ATTN_BACKWARD_BHSD_DO",
+            direct_compact,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env("PG_GPU_BF16_QKV_DX_OUTPUT", true, record_authoritative)?;
+        apply_bool_runtime_env("PG_GPU_BF16_MLP_DOWN_DX", true, record_authoritative)?;
+        apply_string_runtime_env(
+            "PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER",
+            if direct_compact {
+                "direct_compact"
+            } else {
+                "split_compact"
+            },
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_SPLIT_QKV_NORM_RESID_BWD",
+            !direct_compact,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_CHUNKED_QKV_NORM_RESID_BWD",
+            false,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_COMPACT_ATTN_GATE_GRAD_INPUT",
+            true,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_RECOMPUTE_RESIDUAL_MIX_NORM_INPUTS",
+            false,
+            record_authoritative,
+        )?;
+        apply_bool_runtime_env(
+            "PG_GPU_SPLIT_RESIDUAL_MIX_GRAD",
+            false,
+            record_authoritative,
+        )?;
+    }
+
+    apply_bool_runtime_env(
+        "PG_RECORD_REQUIRE_DEVICE_BATCH",
+        run_spec.runtime.require_device_batch,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_TOKEN_RING_FULL_SCHEDULE",
+        run_spec.runtime.token_ring_full_schedule,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_NCCL_BACKWARD_BUCKET_OVERLAP",
+        run_spec.runtime.nccl_overlap_mode == NcclOverlapMode::BucketedMeasured,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_CUDA_BACKWARD_GRAPH",
+        run_spec.runtime.cuda_graph_profile != CudaGraphProfile::Off,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_CUDA_BACKWARD_GRAPH_STRICT",
+        run_spec.runtime.cuda_graph_profile != CudaGraphProfile::Off,
+        record_authoritative,
+    )?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -275,6 +729,14 @@ struct CudaBackwardGraph(cudarc::driver::CudaGraph);
 unsafe impl Send for CudaBackwardGraph {}
 
 #[cfg(feature = "cuda")]
+struct CudaMuonLocalGraph(cudarc::driver::CudaGraph);
+
+// One local Muon graph is owned by one sharded optimizer replica and is never
+// launched concurrently for that replica.
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaMuonLocalGraph {}
+
+#[cfg(feature = "cuda")]
 struct CudaSingleHybridRuntime {
     gpu_model: pg_model::gpu::GpuModel,
     backward_state: pg_model::gpu::GpuBackwardState,
@@ -316,7 +778,7 @@ struct CudaSingleFastRuntime {
     backward_state: pg_model::gpu::GpuBackwardState,
     backward_graph: Option<CudaBackwardGraph>,
     backward_graph_seq_len: usize,
-    backward_graph_warmed: bool,
+    backward_graph_warmup_steps_done: usize,
     input_ids: pg_core::GpuTensor,
     targets: pg_core::GpuTensor,
     token_span_u16: pg_core::GpuTensor,
@@ -373,6 +835,17 @@ impl CudaSingleFastRuntime {
         let ctx = cudarc::driver::CudaContext::new(device_ordinal).map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda context init failed: {:?}", e))
         })?;
+        if cuda_backward_graph_enabled() {
+            // cudarc's allocation event tracking injects stream waits in
+            // `DevicePtr::device_ptr`. Those waits are not part of the capture
+            // and CUDA rejects the first captured kernel with
+            // STREAM_CAPTURE_ISOLATION. The record graph path already uses
+            // explicit stream ordering, so allocate graph-mode tensors without
+            // cudarc's implicit per-pointer event bookkeeping.
+            unsafe {
+                ctx.disable_event_tracking();
+            }
+        }
         let stream = ctx.new_stream().map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda stream init failed: {:?}", e))
         })?;
@@ -394,7 +867,7 @@ impl CudaSingleFastRuntime {
             )?,
             backward_graph: None,
             backward_graph_seq_len: 0,
-            backward_graph_warmed: false,
+            backward_graph_warmup_steps_done: 0,
             input_ids: pg_core::GpuTensor::zeros_gpu(
                 stream.clone(),
                 &[tokens],
@@ -516,6 +989,17 @@ impl CudaSingleFastRuntime {
 }
 
 #[cfg(feature = "cuda")]
+fn set_cuda_runtime_recurrence_active(runtime: &mut CudaSingleFastRuntime, active: bool) {
+    if runtime.gpu_model.recurrence_active() == active {
+        return;
+    }
+    runtime.gpu_model.set_recurrence_active(active);
+    runtime.backward_graph = None;
+    runtime.backward_graph_seq_len = 0;
+    runtime.backward_graph_warmup_steps_done = 0;
+}
+
+#[cfg(feature = "cuda")]
 struct CudaDistributedRuntime {
     replicas: Vec<CudaSingleFastRuntime>,
     comms: Vec<pg_core::nccl::NcclComm>,
@@ -557,6 +1041,10 @@ struct ShardedParallelMuonRuntime {
 struct ShardedParallelMuonReplica {
     banks: Vec<ShardedBankBuffers>,
     muon: GpuMuon,
+    pre_norm_graph: Option<CudaMuonLocalGraph>,
+    pre_norm_graph_warmup_steps_done: usize,
+    local_update_graph: Option<CudaMuonLocalGraph>,
+    local_update_graph_warmup_steps_done: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -588,6 +1076,447 @@ fn sharded_bank_real_batch(buffers: &ShardedBankBuffers, rank: usize) -> usize {
     let shard_start = rank * buffers.chunk_batch;
     let shard_end = (shard_start + buffers.chunk_batch).min(buffers.real_batch);
     shard_end.saturating_sub(shard_start)
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn sharded_parallel_muon_local_rank_step(
+    kernels: &pg_kernels::gpu_kernels::GpuKernels,
+    grad_norm_scratch: &pg_core::GpuTensor,
+    sharded_replica: &mut ShardedParallelMuonReplica,
+    rank: usize,
+    bank_count: usize,
+    train_config: &pg_model::TrainConfig,
+    step: usize,
+    lr_scale: f32,
+    apply_global_clip: bool,
+    fused_global_clip: bool,
+    bf16_shadow_all_gather: bool,
+    use_device_hyper: bool,
+) -> PgResult<()> {
+    for bank_idx in 0..bank_count {
+        let buffers = &mut sharded_replica.banks[bank_idx];
+        let active_batch = sharded_bank_real_batch(buffers, rank);
+        if active_batch == 0 {
+            continue;
+        }
+        let shard_param = buffers.shard_param.slice_range(0, active_batch)?;
+        let shard_param_bf16 = if bf16_shadow_all_gather {
+            Some(buffers.shard_param_bf16.slice_range(0, active_batch)?)
+        } else {
+            None
+        };
+        let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
+        sharded_replica.muon.lr = train_config.matrix_lr * lr_scale;
+        sharded_replica.muon.momentum = train_config.muon_momentum_at(step);
+        sharded_replica.muon.weight_decay = train_config.muon_wd;
+        if apply_global_clip && fused_global_clip {
+            if let Some(shard_param_bf16) = shard_param_bf16.as_ref() {
+                if use_device_hyper {
+                    sharded_replica
+                        .muon
+                        .step_bank_with_global_clip_bf16_shadow_hyper(
+                            kernels,
+                            bank_idx,
+                            &shard_param,
+                            shard_param_bf16,
+                            &shard_grad,
+                            Some(grad_norm_scratch),
+                            train_config.grad_clip_norm,
+                        )?;
+                } else {
+                    sharded_replica
+                        .muon
+                        .step_bank_with_global_clip_bf16_shadow(
+                            kernels,
+                            bank_idx,
+                            &shard_param,
+                            shard_param_bf16,
+                            &shard_grad,
+                            Some(grad_norm_scratch),
+                            train_config.grad_clip_norm,
+                        )?;
+                }
+            } else {
+                if use_device_hyper {
+                    sharded_replica.muon.step_bank_with_global_clip_hyper(
+                        kernels,
+                        bank_idx,
+                        &shard_param,
+                        &shard_grad,
+                        Some(grad_norm_scratch),
+                        train_config.grad_clip_norm,
+                    )?;
+                } else {
+                    sharded_replica.muon.step_bank_with_global_clip(
+                        kernels,
+                        bank_idx,
+                        &shard_param,
+                        &shard_grad,
+                        Some(grad_norm_scratch),
+                        train_config.grad_clip_norm,
+                    )?;
+                }
+            }
+        } else if let Some(shard_param_bf16) = shard_param_bf16.as_ref() {
+            if use_device_hyper {
+                sharded_replica
+                    .muon
+                    .step_bank_with_global_clip_bf16_shadow_hyper(
+                        kernels,
+                        bank_idx,
+                        &shard_param,
+                        shard_param_bf16,
+                        &shard_grad,
+                        None,
+                        0.0,
+                    )?;
+            } else {
+                sharded_replica
+                    .muon
+                    .step_bank_with_global_clip_bf16_shadow(
+                        kernels,
+                        bank_idx,
+                        &shard_param,
+                        shard_param_bf16,
+                        &shard_grad,
+                        None,
+                        0.0,
+                    )?;
+            }
+        } else {
+            if use_device_hyper {
+                sharded_replica.muon.step_bank_with_global_clip_hyper(
+                    kernels,
+                    bank_idx,
+                    &shard_param,
+                    &shard_grad,
+                    None,
+                    0.0,
+                )?;
+            } else {
+                sharded_replica
+                    .muon
+                    .step_bank(kernels, bank_idx, &shard_param, &shard_grad)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn sharded_parallel_muon_local_rank_step_graph_or_eager(
+    kernels: &pg_kernels::gpu_kernels::GpuKernels,
+    grad_norm_scratch: &pg_core::GpuTensor,
+    sharded_replica: &mut ShardedParallelMuonReplica,
+    rank: usize,
+    bank_count: usize,
+    train_config: &pg_model::TrainConfig,
+    step: usize,
+    lr_scale: f32,
+    apply_global_clip: bool,
+    fused_global_clip: bool,
+    bf16_shadow_all_gather: bool,
+) -> PgResult<()> {
+    let graph_enabled = sharded_parallel_muon_local_graph_enabled();
+    if !graph_enabled {
+        return sharded_parallel_muon_local_rank_step(
+            kernels,
+            grad_norm_scratch,
+            sharded_replica,
+            rank,
+            bank_count,
+            train_config,
+            step,
+            lr_scale,
+            apply_global_clip,
+            fused_global_clip,
+            bf16_shadow_all_gather,
+            false,
+        );
+    }
+
+    let lr = train_config.matrix_lr * lr_scale;
+    let momentum = train_config.muon_momentum_at(step);
+    sharded_replica
+        .muon
+        .update_hyper_device(lr, momentum, train_config.muon_wd)?;
+
+    if let Some(graph) = sharded_replica.local_update_graph.as_ref() {
+        graph.0.launch().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon local graph launch failed: {e:?}"
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let stream = kernels.stream().clone();
+    let required_warmup = sharded_parallel_muon_local_graph_warmup_steps();
+    if sharded_replica.local_update_graph_warmup_steps_done < required_warmup {
+        sharded_parallel_muon_local_rank_step(
+            kernels,
+            grad_norm_scratch,
+            sharded_replica,
+            rank,
+            bank_count,
+            train_config,
+            step,
+            lr_scale,
+            apply_global_clip,
+            fused_global_clip,
+            bf16_shadow_all_gather,
+            true,
+        )?;
+        stream.synchronize().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon local graph warmup sync failed: {e:?}"
+            ))
+        })?;
+        sharded_replica.local_update_graph_warmup_steps_done += 1;
+        return Ok(());
+    }
+
+    stream.synchronize().map_err(|e| {
+        pg_core::PgError::InvalidOp(format!(
+            "sharded Parallel Muon local graph pre-capture sync failed: {e:?}"
+        ))
+    })?;
+    stream
+        .begin_capture(cuda_graph_capture_mode())
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon local graph capture begin failed: {e:?}"
+            ))
+        })?;
+    let capture_result = sharded_parallel_muon_local_rank_step(
+        kernels,
+        grad_norm_scratch,
+        sharded_replica,
+        rank,
+        bank_count,
+        train_config,
+        step,
+        lr_scale,
+        apply_global_clip,
+        fused_global_clip,
+        bf16_shadow_all_gather,
+        true,
+    );
+    if let Err(err) = capture_result {
+        let _ = stream.end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        return Err(err);
+    }
+    let graph = stream
+        .end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon local graph capture end failed: {e:?}"
+            ))
+        })?;
+    sharded_replica.local_update_graph = graph.map(CudaMuonLocalGraph);
+    sharded_replica
+        .local_update_graph
+        .as_ref()
+        .ok_or_else(|| {
+            pg_core::PgError::InvalidOp(
+                "sharded Parallel Muon local graph capture produced no graph".into(),
+            )
+        })?
+        .0
+        .launch()
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon local graph launch failed: {e:?}"
+            ))
+        })?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn sharded_parallel_muon_pre_norm_rank_step(
+    replica: &mut CudaSingleFastRuntime,
+    non_bank_packed: &pg_core::GpuTensor,
+    sharded_replica: &ShardedParallelMuonReplica,
+    rank: usize,
+    world_size: usize,
+    inv_total: f32,
+    apply_global_clip: bool,
+) -> PgResult<()> {
+    let kernels = &replica.gpu_model.kernels;
+    if apply_global_clip {
+        scale_gpu_tensor(kernels, &replica.grad_norm_scratch, 0.0)?;
+        let scratch =
+            pg_kernels::gpu_kernels::CudaPtr(replica.grad_norm_scratch.cu_ptr(kernels.stream())?);
+        let non_bank_alpha = 1.0f32 / world_size as f32;
+        kernels.scale_square_accumulate(
+            pg_kernels::gpu_kernels::CudaPtr(non_bank_packed.cu_ptr(kernels.stream())?),
+            scratch,
+            inv_total,
+            non_bank_alpha,
+            non_bank_packed.numel() as u32,
+        )?;
+        for buffers in &sharded_replica.banks {
+            let active_batch = sharded_bank_real_batch(buffers, rank);
+            if active_batch == 0 {
+                continue;
+            }
+            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
+            if sharded_bank_grad_bf16_wire_enabled_for_audit() {
+                let shard_grad_bf16 = buffers.shard_grad_bf16.slice_range(0, active_batch)?;
+                kernels.bf16_to_f32_scale_square_accumulate(
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad_bf16.cu_ptr(kernels.stream())?),
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
+                    scratch,
+                    inv_total,
+                    1.0,
+                    shard_grad.numel() as u32,
+                )?;
+            } else {
+                kernels.scale_square_accumulate(
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
+                    scratch,
+                    inv_total,
+                    1.0,
+                    shard_grad.numel() as u32,
+                )?;
+            }
+        }
+    } else {
+        scale_gpu_tensor(kernels, non_bank_packed, inv_total)?;
+        for buffers in &sharded_replica.banks {
+            let active_batch = sharded_bank_real_batch(buffers, rank);
+            if active_batch == 0 {
+                continue;
+            }
+            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
+            if sharded_bank_grad_bf16_wire_enabled_for_audit() {
+                let shard_grad_bf16 = buffers.shard_grad_bf16.slice_range(0, active_batch)?;
+                kernels.bf16_to_f32(
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad_bf16.cu_ptr(kernels.stream())?),
+                    pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
+                    shard_grad.numel() as u32,
+                )?;
+            }
+            scale_gpu_tensor(kernels, &shard_grad, inv_total)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn sharded_parallel_muon_pre_norm_rank_step_graph_or_eager(
+    replica: &mut CudaSingleFastRuntime,
+    non_bank_packed: &pg_core::GpuTensor,
+    sharded_replica: &mut ShardedParallelMuonReplica,
+    rank: usize,
+    world_size: usize,
+    inv_total: f32,
+    apply_global_clip: bool,
+) -> PgResult<()> {
+    let graph_enabled = sharded_parallel_muon_pre_norm_graph_enabled();
+    if !graph_enabled {
+        return sharded_parallel_muon_pre_norm_rank_step(
+            replica,
+            non_bank_packed,
+            sharded_replica,
+            rank,
+            world_size,
+            inv_total,
+            apply_global_clip,
+        );
+    }
+
+    if let Some(graph) = sharded_replica.pre_norm_graph.as_ref() {
+        graph.0.launch().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon pre-norm graph launch failed: {e:?}"
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let stream = replica.gpu_model.kernels.stream().clone();
+    let required_warmup = sharded_parallel_muon_pre_norm_graph_warmup_steps();
+    if sharded_replica.pre_norm_graph_warmup_steps_done < required_warmup {
+        sharded_parallel_muon_pre_norm_rank_step(
+            replica,
+            non_bank_packed,
+            sharded_replica,
+            rank,
+            world_size,
+            inv_total,
+            apply_global_clip,
+        )?;
+        stream.synchronize().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon pre-norm graph warmup sync failed: {e:?}"
+            ))
+        })?;
+        sharded_replica.pre_norm_graph_warmup_steps_done += 1;
+        return Ok(());
+    }
+
+    stream.synchronize().map_err(|e| {
+        pg_core::PgError::InvalidOp(format!(
+            "sharded Parallel Muon pre-norm graph pre-capture sync failed: {e:?}"
+        ))
+    })?;
+    stream
+        .begin_capture(cuda_graph_capture_mode())
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon pre-norm graph capture begin failed: {e:?}"
+            ))
+        })?;
+    let capture_result = sharded_parallel_muon_pre_norm_rank_step(
+        replica,
+        non_bank_packed,
+        sharded_replica,
+        rank,
+        world_size,
+        inv_total,
+        apply_global_clip,
+    );
+    if let Err(err) = capture_result {
+        let _ = stream.end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        return Err(err);
+    }
+    let graph = stream
+        .end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        )
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon pre-norm graph capture end failed: {e:?}"
+            ))
+        })?;
+    sharded_replica.pre_norm_graph = graph.map(CudaMuonLocalGraph);
+    sharded_replica
+        .pre_norm_graph
+        .as_ref()
+        .ok_or_else(|| {
+            pg_core::PgError::InvalidOp(
+                "sharded Parallel Muon pre-norm graph capture produced no graph".into(),
+            )
+        })?
+        .0
+        .launch()
+        .map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "sharded Parallel Muon pre-norm graph launch failed: {e:?}"
+            ))
+        })?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -822,6 +1751,10 @@ impl ShardedParallelMuonRuntime {
                         train_config.muon_wd,
                         &shard_shapes,
                     )?,
+                    pre_norm_graph: None,
+                    pre_norm_graph_warmup_steps_done: 0,
+                    local_update_graph: None,
+                    local_update_graph_warmup_steps_done: 0,
                 })
             })
             .collect::<PgResult<Vec<_>>>()?;
@@ -833,8 +1766,14 @@ impl ShardedParallelMuonRuntime {
 fn record_replica_events(
     runtime: &CudaDistributedRuntime,
 ) -> PgResult<Vec<cudarc::driver::CudaEvent>> {
-    runtime
-        .replicas
+    record_replica_events_for(&runtime.replicas)
+}
+
+#[cfg(feature = "cuda")]
+fn record_replica_events_for(
+    replicas: &[CudaSingleFastRuntime],
+) -> PgResult<Vec<cudarc::driver::CudaEvent>> {
+    replicas
         .iter()
         .map(|replica| {
             replica
@@ -872,6 +1811,26 @@ fn max_elapsed_replica_events_ms(
     Ok(max_ms)
 }
 
+#[cfg(feature = "cuda")]
+fn record_sharded_muon_phase_ms(
+    replicas: &[CudaSingleFastRuntime],
+    phase_start_events: &mut Option<Vec<cudarc::driver::CudaEvent>>,
+    phase_start_host: &mut Option<Instant>,
+    timing: &mut RunTiming,
+    field: fn(&mut RunTiming) -> &mut f64,
+) -> PgResult<()> {
+    if let Some(starts) = phase_start_events.take() {
+        let ends = record_replica_events_for(replicas)?;
+        *field(timing) += max_elapsed_replica_events_ms(starts, ends)?;
+        *phase_start_events = Some(record_replica_events_for(replicas)?);
+    } else if let Some(start) = phase_start_host.as_mut() {
+        let now = Instant::now();
+        *field(timing) += now.duration_since(*start).as_secs_f64() * 1000.0;
+        *start = now;
+    }
+    Ok(())
+}
+
 impl VariantRunner {
     pub fn new(run_spec: RunSpec) -> PgResult<Self> {
         let plan = ExecutionPlan::from_run_spec(&run_spec)?;
@@ -881,6 +1840,7 @@ impl VariantRunner {
     pub fn run(&self, mode: RunMode) -> PgResult<VariantResult> {
         let model_config = self.run_spec.model.to_model_config();
         let train_config = self.run_spec.train.to_train_config();
+        apply_runtime_profile_env(&self.run_spec, mode)?;
         validate_backend_request(&self.run_spec, mode)?;
         validate_executable_variant(&self.run_spec, mode)?;
         let mut model = GptModel::new(model_config.clone());
@@ -1010,7 +1970,14 @@ impl VariantRunner {
         let requested_steps = match mode {
             RunMode::Smoke => 4usize,
             RunMode::Proxy => 32usize,
-            RunMode::RecordShapedProxy => train_config.total_iterations.min(8),
+            RunMode::RecordShapedProxy => {
+                let proxy_cap = std::env::var("PG_RECORD_SHAPED_PROXY_MAX_STEPS")
+                    .ok()
+                    .and_then(|raw| raw.parse::<usize>().ok())
+                    .filter(|&value| value > 0)
+                    .unwrap_or(8);
+                train_config.total_iterations.min(proxy_cap)
+            }
             RunMode::Record => train_config.total_iterations,
         };
         let max_steps = requested_steps.min(train_config.total_iterations);
@@ -1071,7 +2038,8 @@ impl VariantRunner {
             )
         );
         if mode == RunMode::Record
-            && record_require_gpu_data_sampler_for_audit()
+            && (record_require_gpu_data_sampler_for_audit()
+                || self.run_spec.runtime.require_device_batch)
             && !gpu_record_data_sampler_final_for_audit(&self.run_spec, mode)
         {
             return Err(pg_core::PgError::InvalidOp(
@@ -1127,6 +2095,32 @@ impl VariantRunner {
             if elapsed > train_config.max_wallclock_seconds {
                 break;
             }
+            let active_batch_plan = step_batch_plan_for_train_step(
+                &self.run_spec,
+                mode,
+                &model_config,
+                world_size,
+                step,
+                max_steps,
+            )?;
+            #[cfg(feature = "cuda")]
+            {
+                let recurrence_active = active_recurrence_for_train_step(
+                    &self.run_spec,
+                    step,
+                    train_config.total_iterations,
+                    elapsed,
+                    train_config.max_wallclock_seconds,
+                );
+                if let Some(runtime) = cuda_single_fast_runtime.as_mut() {
+                    set_cuda_runtime_recurrence_active(runtime, recurrence_active);
+                }
+                if let Some(runtime) = cuda_distributed_runtime.as_mut() {
+                    for replica in runtime.replicas.iter_mut() {
+                        set_cuda_runtime_recurrence_active(replica, recurrence_active);
+                    }
+                }
+            }
             let lr_scale = scheduler::lr_scale_with_floor(
                 step,
                 train_config.warmup_steps,
@@ -1144,23 +2138,23 @@ impl VariantRunner {
             let data_t0 = Instant::now();
             #[cfg_attr(not(feature = "cuda"), allow(unused_mut, unused_variables))]
             let mut distributed_batches_preloaded = false;
-            let synthetic_distributed_batches = || {
+            let synthetic_distributed_batches = |step_plan: StepBatchPlan| {
                 (0..world_size)
                     .map(|rank_idx| {
                         let local_tokens =
-                            batch_plan.microbatch_tokens * batch_plan.local_microbatches_per_step;
+                            step_plan.microbatch_tokens * step_plan.local_microbatches_per_step;
                         let mut x = Vec::with_capacity(local_tokens);
                         let mut y = Vec::with_capacity(local_tokens);
-                        for micro_idx in 0..batch_plan.local_microbatches_per_step {
-                            let offset = step * batch_plan.global_batch_tokens
-                                + micro_idx * batch_plan.microbatch_tokens * world_size
-                                + rank_idx * batch_plan.microbatch_tokens;
+                        for micro_idx in 0..step_plan.local_microbatches_per_step {
+                            let offset = step * step_plan.global_batch_tokens
+                                + micro_idx * step_plan.microbatch_tokens * world_size
+                                + rank_idx * step_plan.microbatch_tokens;
                             x.extend(
-                                (0..batch_plan.microbatch_tokens)
+                                (0..step_plan.microbatch_tokens)
                                     .map(|i| ((offset + i) % model_config.vocab_size) as u32),
                             );
                             y.extend(
-                                (1..=batch_plan.microbatch_tokens)
+                                (1..=step_plan.microbatch_tokens)
                                     .map(|i| ((offset + i) % model_config.vocab_size) as u32),
                             );
                         }
@@ -1187,7 +2181,7 @@ impl VariantRunner {
                         cuda_distributed_generate_synthetic_record_batches(
                             runtime,
                             step,
-                            &batch_plan,
+                            &active_batch_plan,
                             model_config.vocab_size,
                         )?;
                         distributed_batches_preloaded = true;
@@ -1211,7 +2205,7 @@ impl VariantRunner {
                             runtime,
                             loaders,
                             step,
-                            &batch_plan,
+                            &active_batch_plan,
                         )?;
                         distributed_batches_preloaded = true;
                         None
@@ -1223,14 +2217,14 @@ impl VariantRunner {
                         {
                             if gpu_shifted_u16_batch_upload_enabled_for_audit() {
                                 loader.next_batch_shifted_span_u16_into(
-                                    batch_plan.global_batch_tokens,
+                                    active_batch_plan.global_batch_tokens,
                                     &mut replica.host_token_span_u16,
                                 )?;
                                 replica.host_input_ids.clear();
                                 replica.host_targets.clear();
                             } else {
                                 loader.next_batch_u32_into(
-                                    batch_plan.global_batch_tokens,
+                                    active_batch_plan.global_batch_tokens,
                                     &mut replica.host_input_ids,
                                     &mut replica.host_targets,
                                 )?;
@@ -1240,11 +2234,11 @@ impl VariantRunner {
                         distributed_batches_preloaded = true;
                         None
                     } else {
-                        Some(synthetic_distributed_batches())
+                        Some(synthetic_distributed_batches(active_batch_plan))
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        Some(synthetic_distributed_batches())
+                        Some(synthetic_distributed_batches(active_batch_plan))
                     }
                 } else if let Some(loaders) = distributed_data_loaders.as_mut() {
                     Some(
@@ -1252,8 +2246,8 @@ impl VariantRunner {
                             .iter_mut()
                             .map(|loader| {
                                 let (x, y) = loader.next_batch(
-                                    batch_plan.global_batch_tokens,
-                                    batch_plan.microbatch_tokens,
+                                    active_batch_plan.global_batch_tokens,
+                                    active_batch_plan.microbatch_tokens,
                                 )?;
                                 Ok::<_, pg_core::PgError>(vec![(
                                     x.into_iter().map(|v| v as u32).collect(),
@@ -1263,7 +2257,7 @@ impl VariantRunner {
                             .collect::<PgResult<Vec<_>>>()?,
                     )
                 } else {
-                    Some(synthetic_distributed_batches())
+                    Some(synthetic_distributed_batches(active_batch_plan))
                 }
             } else {
                 None
@@ -1273,11 +2267,11 @@ impl VariantRunner {
             } else if let Some(batches) = distributed_batches.as_ref() {
                 batches[0].clone()
             } else if let Some(loader) = data_loader.as_mut() {
-                (0..batch_plan.local_microbatches_per_step)
+                (0..active_batch_plan.local_microbatches_per_step)
                     .map(|_| {
-                        let global_tokens = batch_plan.microbatch_tokens * world_size;
-                        let (x, y) =
-                            loader.next_batch(global_tokens, batch_plan.microbatch_tokens)?;
+                        let global_tokens = active_batch_plan.microbatch_tokens * world_size;
+                        let (x, y) = loader
+                            .next_batch(global_tokens, active_batch_plan.microbatch_tokens)?;
                         Ok::<_, pg_core::PgError>((
                             x.into_iter().map(|v| v as u32).collect(),
                             y.into_iter().map(|v| v as u32).collect(),
@@ -1285,16 +2279,16 @@ impl VariantRunner {
                     })
                     .collect::<PgResult<Vec<_>>>()?
             } else {
-                (0..batch_plan.local_microbatches_per_step)
+                (0..active_batch_plan.local_microbatches_per_step)
                     .map(|micro_idx| {
-                        let offset = step * batch_plan.global_batch_tokens
-                            + micro_idx * batch_plan.microbatch_tokens * world_size
-                            + rank * batch_plan.microbatch_tokens;
+                        let offset = step * active_batch_plan.global_batch_tokens
+                            + micro_idx * active_batch_plan.microbatch_tokens * world_size
+                            + rank * active_batch_plan.microbatch_tokens;
                         (
-                            (0..batch_plan.microbatch_tokens)
+                            (0..active_batch_plan.microbatch_tokens)
                                 .map(|i| ((offset + i) % model_config.vocab_size) as u32)
                                 .collect(),
-                            (1..=batch_plan.microbatch_tokens)
+                            (1..=active_batch_plan.microbatch_tokens)
                                 .map(|i| ((offset + i) % model_config.vocab_size) as u32)
                                 .collect(),
                         )
@@ -1404,7 +2398,7 @@ impl VariantRunner {
                         lr_scale,
                         self.run_spec.train.distributed_optimizer_backend,
                         !is_record_shaped_mode(mode),
-                        batch_plan.microbatch_tokens,
+                        active_batch_plan.microbatch_tokens,
                         step_timing,
                     )?
                 }
@@ -1415,7 +2409,9 @@ impl VariantRunner {
                 self.run_spec.train.backend,
                 TrainBackend::CudaSingle | TrainBackend::CudaDistributed
             ) {
-                grads.clip_grad_norm(train_config.grad_clip_norm);
+                if train_config.grad_clip_norm > 0.0 {
+                    grads.clip_grad_norm(train_config.grad_clip_norm);
+                }
 
                 if fast_bank_updates {
                     // Smoke mode is a correctness/liveness gate. Full CPU NS5 over 26M+
@@ -1579,10 +2575,22 @@ impl VariantRunner {
             0.0
         };
         if mode == RunMode::Record && timing_steps > 0 {
-            let max_ms = record_max_ms_per_step_for_submission();
+            let max_ms = record_max_ms_per_step_for_submission(&self.run_spec);
             if max_ms > 0.0 && timing_measured_ms_per_step > max_ms {
                 return Err(pg_core::PgError::InvalidOp(format!(
                     "record run is too slow for a leaderboard submission: measured_ms_per_step={timing_measured_ms_per_step:.3} max_ms_per_step={max_ms:.3}. Set PG_RECORD_MAX_MS_PER_STEP=0 only for non-submission debugging."
+                )));
+            }
+            if self.run_spec.runtime.require_device_batch
+                && (timing.host_batch_flatten_calls > 0
+                    || timing.host_to_device_batch_bytes > 0
+                    || timing.device_batch_missing_steps > 0)
+            {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record runtime requires zero hot-path host batch work after warmup: host_batch_flatten_calls={} host_to_device_batch_bytes={} device_batch_missing_steps={}",
+                    timing.host_batch_flatten_calls,
+                    timing.host_to_device_batch_bytes,
+                    timing.device_batch_missing_steps
                 )));
             }
         }
@@ -1643,6 +2651,16 @@ impl VariantRunner {
         };
         timing.artifact_export_ms += artifact_t0.elapsed().as_secs_f64() * 1000.0;
         let submission_code_bytes = artifact_bytes.and_then(|_| current_executable_bytes());
+        let artifact_model_sha256 = artifact_bytes.and_then(|_| {
+            sha256_file(std::path::Path::new(&self.run_spec.train.artifact_path)).ok()
+        });
+        let artifact_code_sha256 = artifact_bytes.and_then(|_| current_executable_sha256());
+        let caseops_byte_sidecar_sha256 = self
+            .run_spec
+            .eval
+            .caseops_byte_sidecar_pattern
+            .as_deref()
+            .and_then(|pattern| sha256_file_set(pattern).ok().flatten());
         let submission_total_bytes = artifact_bytes
             .zip(submission_code_bytes)
             .map(|(a, c)| a + c);
@@ -1656,6 +2674,20 @@ impl VariantRunner {
             return Err(pg_core::PgError::InvalidOp(format!(
                 "record artifact budget failed: artifact_bytes={artifact_bytes:?} submission_code_bytes={submission_code_bytes:?} submission_total_bytes={submission_total_bytes:?} limit={}",
                 self.plan.quant_layout.target_artifact_bytes
+            )));
+        }
+        if mode == RunMode::Record
+            && (artifact_model_sha256.is_none()
+                || artifact_code_sha256.is_none()
+                || (self.run_spec.model.caseops.enabled
+                    && self.run_spec.model.caseops.byte_sidecar
+                    && caseops_byte_sidecar_sha256.is_none()))
+        {
+            return Err(pg_core::PgError::InvalidOp(format!(
+                "record artifact audit failed: artifact_model_sha256_known={} artifact_code_sha256_known={} caseops_byte_sidecar_sha256_known={}",
+                artifact_model_sha256.is_some(),
+                artifact_code_sha256.is_some(),
+                caseops_byte_sidecar_sha256.is_some()
             )));
         }
         if let (Some(model_bytes), Some(code_bytes), Some(total_bytes), Some(ok)) = (
@@ -1672,6 +2704,21 @@ impl VariantRunner {
                 budget.code_bytes,
                 total_bytes,
                 ok
+            );
+        }
+        if artifact_bytes.is_some() {
+            println!(
+                "record_artifact_audit_json={}",
+                record_artifact_audit_json(
+                    &self.run_spec,
+                    artifact_bytes,
+                    submission_code_bytes,
+                    submission_total_bytes,
+                    artifact_budget_ok,
+                    artifact_model_sha256.as_deref(),
+                    artifact_code_sha256.as_deref(),
+                    caseops_byte_sidecar_sha256.as_deref(),
+                )
             );
         }
         let (bpb_luts, bpb_byte_source) =
@@ -1777,6 +2824,9 @@ impl VariantRunner {
             submission_code_bytes,
             submission_total_bytes,
             artifact_budget_ok,
+            artifact_model_sha256,
+            artifact_code_sha256,
+            caseops_byte_sidecar_sha256,
             attention_backend: format!("{:?}", self.run_spec.model.attention_backend),
             distributed_optimizer_backend: format!(
                 "{:?}",
@@ -1797,6 +2847,11 @@ impl VariantRunner {
             wallclock_seconds,
             timing_steps,
             timing_measured_ms_per_step,
+            host_batch_flatten_calls: timing.host_batch_flatten_calls,
+            host_to_device_batch_bytes: timing.host_to_device_batch_bytes,
+            device_batch_ready_steps: timing.device_batch_ready_steps,
+            device_batch_missing_steps: timing.device_batch_missing_steps,
+            device_to_host_scalar_reads: timing.device_to_host_scalar_reads,
             timing_data_sampling_ms: timing.data_sampling_ms,
             timing_train_step_ms: timing.train_step_ms,
             timing_cuda_zero_grads_ms: timing.cuda_zero_grads_ms,
@@ -1849,6 +2904,16 @@ impl VariantRunner {
             timing_cuda_backward_tail_ms: timing.cuda_backward_tail_ms,
             timing_cuda_non_bank_sync_ms: timing.cuda_non_bank_sync_ms,
             timing_cuda_bank_update_ms: timing.cuda_bank_update_ms,
+            timing_cuda_bank_update_stage_pack_ms: timing.cuda_bank_update_stage_pack_ms,
+            timing_cuda_bank_update_stage_grad_collectives_ms: timing
+                .cuda_bank_update_stage_grad_collectives_ms,
+            timing_cuda_bank_update_stage_scale_ms: timing.cuda_bank_update_stage_scale_ms,
+            timing_cuda_bank_update_stage_norm_ms: timing.cuda_bank_update_stage_norm_ms,
+            timing_cuda_bank_update_stage_clip_ms: timing.cuda_bank_update_stage_clip_ms,
+            timing_cuda_bank_update_stage_muon_ms: timing.cuda_bank_update_stage_muon_ms,
+            timing_cuda_bank_update_stage_param_gather_ms: timing
+                .cuda_bank_update_stage_param_gather_ms,
+            timing_cuda_bank_update_stage_copy_back_ms: timing.cuda_bank_update_stage_copy_back_ms,
             timing_cuda_non_bank_update_ms: timing.cuda_non_bank_update_ms,
             timing_post_train_sync_ms: timing.post_train_sync_ms,
             timing_artifact_export_ms: timing.artifact_export_ms,
@@ -1998,19 +3063,24 @@ fn cuda_single_hybrid_step(
 fn zero_gpu_grads(
     _kernels: &pg_kernels::gpu_kernels::GpuKernels,
     grads: &mut pg_model::gpu::GpuGradBuffers,
+    config: &pg_model::ModelConfig,
 ) -> PgResult<()> {
     let zero = |tensor: &mut pg_core::GpuTensor| tensor.zero_bytes();
 
     zero(&mut grads.tok_emb)?;
-    zero(&mut grads.bigram_embed)?;
-    zero(&mut grads.bigram_proj)?;
-    zero(&mut grads.bigram_scale)?;
+    if config.bigram_vocab_size > 0 && config.bigram_dim > 0 {
+        zero(&mut grads.bigram_embed)?;
+        zero(&mut grads.bigram_proj)?;
+        zero(&mut grads.bigram_scale)?;
+    }
     zero(&mut grads.smear_gate)?;
     zero(&mut grads.skip_weights)?;
-    zero(&mut grads.qo_bank)?;
-    zero(&mut grads.kv_bank)?;
-    zero(&mut grads.mlp_up_bank)?;
-    zero(&mut grads.mlp_down_bank)?;
+    if !gpu_overwrite_bank_grads_enabled() {
+        zero(&mut grads.qo_bank)?;
+        zero(&mut grads.kv_bank)?;
+        zero(&mut grads.mlp_up_bank)?;
+        zero(&mut grads.mlp_down_bank)?;
+    }
     for tensor in &mut grads.block_attn_scale {
         zero(tensor)?;
     }
@@ -2023,19 +3093,23 @@ fn zero_gpu_grads(
     for tensor in &mut grads.block_q_gain {
         zero(tensor)?;
     }
-    for tensor in &mut grads.block_attn_gate_weight {
-        zero(tensor)?;
-    }
-    for tensor in &mut grads.block_attn_gate_bias {
-        zero(tensor)?;
+    if config.attn_out_gate_enabled {
+        for tensor in &mut grads.block_attn_gate_weight {
+            zero(tensor)?;
+        }
+        for tensor in &mut grads.block_attn_gate_bias {
+            zero(tensor)?;
+        }
     }
     for tensor in &mut grads.block_sparse_attn_gate_weight {
         zero(tensor)?;
     }
-    zero(&mut grads.ve_embed)?;
-    zero(&mut grads.ve_proj)?;
-    zero(&mut grads.ve_scale)?;
-    zero(&mut grads.ve_layer_scales)?;
+    if config.ve_enabled {
+        zero(&mut grads.ve_embed)?;
+        zero(&mut grads.ve_proj)?;
+        zero(&mut grads.ve_scale)?;
+        zero(&mut grads.ve_layer_scales)?;
+    }
     Ok(())
 }
 
@@ -2043,23 +3117,39 @@ fn zero_gpu_grads(
 fn cuda_single_fast_step(
     runtime: &mut CudaSingleFastRuntime,
     _model: &mut GptModel,
-    _plan: &ExecutionPlan,
+    plan: &ExecutionPlan,
     microbatches: &[(Vec<u32>, Vec<u32>)],
     train_config: &pg_model::TrainConfig,
     step: usize,
     lr_scale: f32,
 ) -> PgResult<f32> {
-    zero_gpu_grads(&runtime.gpu_model.kernels, &mut runtime.gpu_grads)?;
-    let seq_len = microbatches
-        .first()
-        .map(|(input_ids, _)| input_ids.len())
-        .unwrap_or(1)
-        .max(1);
-    flatten_microbatches_into(
-        microbatches,
-        &mut runtime.host_input_ids,
-        &mut runtime.host_targets,
-    );
+    zero_gpu_grads(
+        &runtime.gpu_model.kernels,
+        &mut runtime.gpu_grads,
+        &runtime.gpu_model.config,
+    )?;
+    let strict_device_batch = record_strict_device_batch_enabled();
+    let seq_len = if strict_device_batch && runtime.device_batch_ready {
+        plan.run_spec.train.seq_len.max(1)
+    } else {
+        microbatches
+            .first()
+            .map(|(input_ids, _)| input_ids.len())
+            .unwrap_or(1)
+            .max(1)
+    };
+    if strict_device_batch && !runtime.device_batch_ready {
+        return Err(pg_core::PgError::InvalidOp(
+            "record runtime requires device_batch_ready before cuda_single_fast_step; refusing host microbatch flatten".into(),
+        ));
+    }
+    if !strict_device_batch {
+        flatten_microbatches_into(
+            microbatches,
+            &mut runtime.host_input_ids,
+            &mut runtime.host_targets,
+        );
+    }
     let loss_sum = cuda_fast_accumulate_runtime_grads(runtime, true, seq_len, None, None)?;
     cuda_fast_apply_updates(runtime, train_config, step, lr_scale)?;
     Ok(loss_sum)
@@ -2076,6 +3166,9 @@ fn cuda_fast_accumulate_runtime_grads(
     let h2d_t0 = Instant::now();
     if runtime.device_batch_ready {
         runtime.device_batch_ready = false;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.device_batch_ready_steps += 1;
+        }
     } else if gpu_shifted_u16_batch_upload_enabled_for_audit()
         && runtime.host_token_span_u16.len() == runtime.input_ids.numel() + 1
     {
@@ -2089,13 +3182,31 @@ fn cuda_fast_accumulate_runtime_grads(
             pg_kernels::gpu_kernels::CudaPtr(runtime.targets.cu_ptr(stream)?),
             runtime.input_ids.numel() as u32,
         )?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.device_batch_missing_steps += 1;
+            timing.host_to_device_batch_bytes += runtime.host_token_span_u16.len() * 2;
+        }
     } else {
+        if record_strict_device_batch_enabled() {
+            return Err(pg_core::PgError::InvalidOp(
+                "PG_RECORD_REQUIRE_DEVICE_BATCH=1 but a step fell back to host_input_ids \
+                 H2D copy (device_batch_ready was false and shifted-u16 upload was not active); \
+                 wire the device-resident token-ring sampler to keep host copies off the record hot path"
+                    .into(),
+            ));
+        }
         runtime
             .input_ids
             .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_input_ids))?;
         runtime
             .targets
             .copy_from_host_bytes(bytemuck::cast_slice(&runtime.host_targets))?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.device_batch_missing_steps += 1;
+            timing.host_to_device_batch_bytes += (runtime.host_input_ids.len()
+                + runtime.host_targets.len())
+                * std::mem::size_of::<u32>();
+        }
     }
     if let Some(timing) = timing.as_deref_mut() {
         timing.cuda_h2d_ms += h2d_t0.elapsed().as_secs_f64() * 1000.0;
@@ -2164,9 +3275,16 @@ fn cuda_fast_accumulate_runtime_grads_no_loss_graph(
     if runtime.backward_graph.is_some() {
         runtime.backward_graph = None;
         runtime.backward_graph_seq_len = 0;
+        runtime.backward_graph_warmup_steps_done = 0;
     }
 
-    if !runtime.backward_graph_warmed {
+    let required_warmup_steps = cuda_backward_graph_warmup_steps();
+    if runtime.backward_graph_warmup_steps_done < required_warmup_steps {
+        zero_gpu_grads(
+            &runtime.gpu_model.kernels,
+            &mut runtime.gpu_grads,
+            &runtime.gpu_model.config,
+        )?;
         runtime.gpu_model.backward_with_state_seq_len_no_loss(
             &runtime.input_ids,
             &runtime.targets,
@@ -2175,25 +3293,49 @@ fn cuda_fast_accumulate_runtime_grads_no_loss_graph(
             &mut runtime.gpu_grads,
             runtime_seq_len,
         )?;
-        runtime.backward_graph_warmed = true;
+        stream.synchronize().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!("cuda graph warmup sync failed: {e:?}"))
+        })?;
+        runtime.backward_graph_warmup_steps_done += 1;
         return Ok(());
     }
 
+    // The device batch is materialized immediately before this function. If the
+    // capture begins while that uncaptured kernel is still in flight, CUDA marks
+    // the first captured forward kernel as depending on uncaptured work and
+    // invalidates the graph with STREAM_CAPTURE_ISOLATION. Pay this sync once at
+    // instantiation time; steady-state graph launches still run without it.
+    stream.synchronize().map_err(|e| {
+        pg_core::PgError::InvalidOp(format!("cuda graph pre-capture sync failed: {e:?}"))
+    })?;
+
     stream
-        .begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )
+        .begin_capture(cuda_graph_capture_mode())
         .map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda backward graph capture begin failed: {e:?}"))
         })?;
-    let capture_result = runtime.gpu_model.backward_with_state_seq_len_no_loss(
-        &runtime.input_ids,
-        &runtime.targets,
-        &mut runtime.gpu_buf,
-        &mut runtime.backward_state,
-        &mut runtime.gpu_grads,
-        runtime_seq_len,
-    );
+    let capture_result = (|| -> PgResult<()> {
+        zero_gpu_grads(
+            &runtime.gpu_model.kernels,
+            &mut runtime.gpu_grads,
+            &runtime.gpu_model.config,
+        )?;
+        runtime.gpu_model.backward_with_state_seq_len_no_loss(
+            &runtime.input_ids,
+            &runtime.targets,
+            &mut runtime.gpu_buf,
+            &mut runtime.backward_state,
+            &mut runtime.gpu_grads,
+            runtime_seq_len,
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = capture_result {
+        let _ = stream.end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        return Err(err);
+    }
     let graph = stream
         .end_capture(
             cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
@@ -2201,7 +3343,6 @@ fn cuda_fast_accumulate_runtime_grads_no_loss_graph(
         .map_err(|e| {
             pg_core::PgError::InvalidOp(format!("cuda backward graph capture end failed: {e:?}"))
         })?;
-    capture_result?;
     runtime.backward_graph = graph.map(CudaBackwardGraph);
     runtime.backward_graph_seq_len = runtime_seq_len;
     runtime
@@ -2493,6 +3634,10 @@ struct ReplicaBackwardLaunchResult {
     cuda_zero_grads_ms: f64,
     cuda_h2d_ms: f64,
     cuda_backward_ms: f64,
+    host_batch_flatten_calls: usize,
+    host_to_device_batch_bytes: usize,
+    device_batch_ready_steps: usize,
+    device_batch_missing_steps: usize,
     backward_bucket_flushes: usize,
     backward_bucket_layers: usize,
     backward_bucket_matrix_reductions: usize,
@@ -2527,49 +3672,23 @@ fn collect_gpu_grad_refs(grads: &pg_model::gpu::GpuGradBuffers) -> Vec<&pg_core:
 }
 
 #[cfg(feature = "cuda")]
-fn collect_gpu_non_bank_grad_refs(
-    grads: &pg_model::gpu::GpuGradBuffers,
-) -> Vec<&pg_core::GpuTensor> {
-    let mut grad_refs: Vec<&pg_core::GpuTensor> = vec![
-        &grads.tok_emb,
-        &grads.bigram_embed,
-        &grads.bigram_proj,
-        &grads.bigram_scale,
-        &grads.smear_gate,
-        &grads.skip_weights,
-        &grads.ve_embed,
-        &grads.ve_proj,
-        &grads.ve_scale,
-        &grads.ve_layer_scales,
-    ];
-    grad_refs.extend(grads.block_attn_scale.iter());
-    grad_refs.extend(grads.block_mlp_scale.iter());
-    grad_refs.extend(grads.block_resid_mix.iter());
-    grad_refs.extend(grads.block_q_gain.iter());
-    grad_refs.extend(grads.block_attn_gate_weight.iter());
-    grad_refs.extend(grads.block_attn_gate_bias.iter());
-    grad_refs.extend(grads.block_sparse_attn_gate_weight.iter());
-    grad_refs
-}
-
-#[cfg(feature = "cuda")]
 fn cuda_fast_apply_updates(
     runtime: &mut CudaSingleFastRuntime,
     train_config: &pg_model::TrainConfig,
     step: usize,
     lr_scale: f32,
 ) -> PgResult<()> {
-    cuda_fast_apply_updates_inner(runtime, train_config, step, lr_scale, true, true)
+    cuda_fast_apply_updates_inner(runtime, train_config, step, lr_scale, true, true, true)
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_fast_apply_non_bank_updates_unclipped(
+fn cuda_fast_apply_non_bank_updates_unclipped_no_shadow_refresh(
     runtime: &mut CudaSingleFastRuntime,
     train_config: &pg_model::TrainConfig,
     step: usize,
     lr_scale: f32,
 ) -> PgResult<()> {
-    cuda_fast_apply_updates_inner(runtime, train_config, step, lr_scale, false, false)
+    cuda_fast_apply_updates_inner(runtime, train_config, step, lr_scale, false, false, false)
 }
 
 #[cfg(feature = "cuda")]
@@ -2580,6 +3699,7 @@ fn cuda_fast_apply_updates_inner(
     lr_scale: f32,
     update_banks: bool,
     clip_grads: bool,
+    refresh_bf16_shadows: bool,
 ) -> PgResult<()> {
     let (gpu_optimizer, grad_norm_scratch, gpu_model, gpu_grads) = (
         &mut runtime.gpu_optimizer,
@@ -2587,7 +3707,7 @@ fn cuda_fast_apply_updates_inner(
         &runtime.gpu_model,
         &runtime.gpu_grads,
     );
-    if clip_grads {
+    if clip_grads && train_config.grad_clip_norm > 0.0 {
         let grad_refs = collect_gpu_grad_refs(gpu_grads);
         gpu_optimizer.clip_grad_norm(
             &gpu_model.kernels,
@@ -2642,13 +3762,24 @@ fn cuda_fast_apply_updates_inner(
         )?;
     }
 
-    runtime.gpu_optimizer.adamw_step(
-        &runtime.gpu_model.kernels,
-        &runtime.gpu_model.weights.tok_emb,
-        &runtime.gpu_grads.tok_emb,
-        &mut runtime.state_tok_emb,
-        embed_hyper,
-    )?;
+    if gpu_adamw_bf16_shadow_update_enabled() {
+        runtime.gpu_optimizer.adamw_step_bf16_shadow(
+            &runtime.gpu_model.kernels,
+            &runtime.gpu_model.weights.tok_emb,
+            &runtime.gpu_model.weights.tok_emb_bf16,
+            &runtime.gpu_grads.tok_emb,
+            &mut runtime.state_tok_emb,
+            embed_hyper,
+        )?;
+    } else {
+        runtime.gpu_optimizer.adamw_step(
+            &runtime.gpu_model.kernels,
+            &runtime.gpu_model.weights.tok_emb,
+            &runtime.gpu_grads.tok_emb,
+            &mut runtime.state_tok_emb,
+            embed_hyper,
+        )?;
+    }
     if runtime.gpu_model.config.bigram_vocab_size > 0 && runtime.gpu_model.config.bigram_dim > 0 {
         runtime.gpu_optimizer.adamw_step(
             &runtime.gpu_model.kernels,
@@ -2786,7 +3917,9 @@ fn cuda_fast_apply_updates_inner(
                 download_gpu_f32(&runtime.gpu_model.weights.ve_layer_scales)?;
         }
     }
-    runtime.gpu_model.refresh_bf16_shadows()?;
+    if refresh_bf16_shadows {
+        runtime.gpu_model.refresh_bf16_shadows()?;
+    }
 
     Ok(())
 }
@@ -2799,6 +3932,17 @@ fn gpu_host_scalar_updates_enabled() -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "0" | "false" | "no" | "off"
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_adamw_bf16_shadow_update_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_ADAMW_BF16_SHADOW_UPDATE")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
     )
 }
 
@@ -3254,20 +4398,6 @@ fn pack_non_bank_sync_buffers(runtime: &mut CudaDistributedRuntime) -> PgResult<
 }
 
 #[cfg(feature = "cuda")]
-fn scale_and_unpack_non_bank_sync_buffers(
-    runtime: &mut CudaDistributedRuntime,
-    scale: f32,
-) -> PgResult<()> {
-    for rank in 0..runtime.replicas.len() {
-        let replica = &mut runtime.replicas[rank];
-        let packed = &runtime.non_bank_sync[rank].packed_grad;
-        scale_gpu_tensor(&replica.gpu_model.kernels, packed, scale)?;
-        unpack_non_bank_gpu_grads(&replica.gpu_model.kernels, packed, &mut replica.gpu_grads)?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "cuda")]
 fn bank_param(replica: &CudaSingleFastRuntime, bank_idx: usize) -> PgResult<&pg_core::GpuTensor> {
     match bank_idx {
         0 => Ok(&replica.gpu_model.weights.qo_bank),
@@ -3598,6 +4728,18 @@ fn cuda_distributed_sharded_parallel_muon_step(
     let bf16_shadow_all_gather = sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit();
     let bank_grads_bucketed_during_backward =
         backward_nccl_bucket_overlap_enabled() && runtime.comm_side_comms.is_some();
+    let apply_global_clip = train_config.grad_clip_norm > 0.0;
+    let bank_phase_timing = sharded_parallel_muon_phase_timing_enabled();
+    let mut bank_phase_events = if bank_phase_timing && event_timing {
+        Some(record_replica_events(runtime)?)
+    } else {
+        None
+    };
+    let mut bank_phase_host_start = if bank_phase_timing && !event_timing {
+        Some(Instant::now())
+    } else {
+        None
+    };
     if runtime
         .parallel_muon
         .as_ref()
@@ -3666,6 +4808,13 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 }
             }
         }
+        record_sharded_muon_phase_ms(
+            &runtime.replicas,
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_pack_ms,
+        )?;
 
         // Choose which NCCL communicator pool to use. Side-stream collectives
         // run on `comm_side_streams[rank]`. In bucketed mode the side stream
@@ -3768,135 +4917,118 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 },
             )?;
         }
+        record_sharded_muon_phase_ms(
+            &runtime.replicas,
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_grad_collectives_ms,
+        )?;
     }
 
-    scale_and_unpack_non_bank_sync_buffers(runtime, inv_total)?;
     {
         let parallel_muon = runtime
             .parallel_muon
             .as_mut()
             .expect("validated sharded Parallel Muon runtime");
-        for bank_idx in 0..bank_count {
-            for rank in 0..world_size {
-                let replica = &runtime.replicas[rank];
-                let buffers = &mut parallel_muon.replicas[rank].banks[bank_idx];
-                // BF16-on-wire collectives land in `shard_grad_bf16` for both
-                // the post-backward reduce-scatter path and the per-layer
-                // bucket-overlap path; Muon consumes F32 shards, so convert
-                // after the side/main synchronization has made the collective
-                // output visible on the main stream.
-                if sharded_bank_grad_bf16_wire_enabled_for_audit() {
-                    replica.gpu_model.kernels.bf16_to_f32(
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            buffers
-                                .shard_grad_bf16
-                                .cu_ptr(replica.gpu_model.kernels.stream())?,
-                        ),
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            buffers
-                                .shard_grad
-                                .cu_ptr(replica.gpu_model.kernels.stream())?,
-                        ),
-                        buffers.shard_grad.numel() as u32,
-                    )?;
-                }
-                scale_gpu_tensor(&replica.gpu_model.kernels, &buffers.shard_grad, inv_total)?;
-            }
-        }
-    }
-    // Exact global-norm clipping for sharded Parallel Muon:
-    // - non-bank grads are replicated after all-reduce, so each rank contributes
-    //   1/world_size of their squared norm before the scalar all-reduce.
-    // - bank grads are reduce-scattered, so each rank contributes only its shard.
-    for rank in 0..world_size {
-        let replica = &mut runtime.replicas[rank];
-        let kernels = &replica.gpu_model.kernels;
-        scale_gpu_tensor(kernels, &replica.grad_norm_scratch, 0.0)?;
-        let scratch =
-            pg_kernels::gpu_kernels::CudaPtr(replica.grad_norm_scratch.cu_ptr(kernels.stream())?);
-        let non_bank_alpha = 1.0f32 / world_size as f32;
-        for grad in collect_gpu_non_bank_grad_refs(&replica.gpu_grads) {
-            kernels.dot_accumulate(
-                pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
-                pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
-                scratch,
-                non_bank_alpha,
-                grad.numel() as u32,
-            )?;
-        }
-        let parallel_muon = runtime
-            .parallel_muon
-            .as_ref()
-            .expect("validated sharded Parallel Muon runtime");
-        for buffers in &parallel_muon.replicas[rank].banks {
-            let active_batch = sharded_bank_real_batch(buffers, rank);
-            if active_batch == 0 {
-                continue;
-            }
-            let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
-            kernels.dot_accumulate(
-                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
-                pg_kernels::gpu_kernels::CudaPtr(shard_grad.cu_ptr(kernels.stream())?),
-                scratch,
-                1.0,
-                shard_grad.numel() as u32,
+        for rank in 0..world_size {
+            let replica = &mut runtime.replicas[rank];
+            let non_bank_packed = &runtime.non_bank_sync[rank].packed_grad;
+            let sharded_replica = &mut parallel_muon.replicas[rank];
+            sharded_parallel_muon_pre_norm_rank_step_graph_or_eager(
+                replica,
+                non_bank_packed,
+                sharded_replica,
+                rank,
+                world_size,
+                inv_total,
+                apply_global_clip,
             )?;
         }
     }
-    // Grad-norm scalar all-reduce. Same side-stream collective pattern as the
-    // non-bank packed reduce above: main stream records "norm scratch ready"
-    // after the dot_accumulate kernels, side stream waits + issues the
-    // all-reduce, then main stream waits before clip kernels read the reduced
-    // scalar.
-    let use_side_comms_norm = runtime.comm_side_comms.is_some();
-    if use_side_comms_norm {
-        nccl_side_stream_main_to_side(
+    record_sharded_muon_phase_ms(
+        &runtime.replicas,
+        &mut bank_phase_events,
+        &mut bank_phase_host_start,
+        timing,
+        |timing| &mut timing.cuda_bank_update_stage_scale_ms,
+    )?;
+    if apply_global_clip {
+        // Exact global-norm clipping for sharded Parallel Muon:
+        // - non-bank grads are replicated after all-reduce, so each rank contributes
+        //   1/world_size of their squared norm before the scalar all-reduce.
+        // - bank grads are reduce-scattered, so each rank contributes only its shard.
+        // Grad-norm scalar all-reduce. Same side-stream collective pattern as the
+        // non-bank packed reduce above: main stream records "norm scratch ready"
+        // after the dot_accumulate kernels, side stream waits + issues the
+        // all-reduce, then main stream waits before clip kernels read the reduced
+        // scalar.
+        let use_side_comms_norm = runtime.comm_side_comms.is_some();
+        if use_side_comms_norm {
+            nccl_side_stream_main_to_side(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                "grad-norm all-reduce",
+            )?;
+        }
+        let active_comms_norm = if use_side_comms_norm {
+            runtime
+                .comm_side_comms
+                .as_ref()
+                .expect("checked use_side_comms_norm")
+        } else {
+            &runtime.comms
+        };
+        cudarc::nccl::group_start()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
+        for rank in 0..world_size {
+            active_comms_norm[rank].all_reduce_sum_tensor_f32_in_place(
+                &mut runtime.replicas[rank].grad_norm_scratch,
+            )?;
+        }
+        cudarc::nccl::group_end()
+            .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
+        if use_side_comms_norm {
+            nccl_side_stream_side_to_main(
+                &runtime.replicas,
+                &runtime.comm_side_streams,
+                &runtime.comm_side_events,
+                "grad-norm all-reduce",
+            )?;
+        }
+        record_sharded_muon_phase_ms(
             &runtime.replicas,
-            &runtime.comm_side_streams,
-            &runtime.comm_side_events,
-            "grad-norm all-reduce",
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_norm_ms,
         )?;
-    }
-    let active_comms_norm = if use_side_comms_norm {
-        runtime
-            .comm_side_comms
-            .as_ref()
-            .expect("checked use_side_comms_norm")
-    } else {
-        &runtime.comms
-    };
-    cudarc::nccl::group_start()
-        .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
-    for rank in 0..world_size {
-        active_comms_norm[rank]
-            .all_reduce_sum_tensor_f32_in_place(&mut runtime.replicas[rank].grad_norm_scratch)?;
-    }
-    cudarc::nccl::group_end()
-        .map_err(|e| pg_core::PgError::Nccl(format!("group_end failed: {e:?}")))?;
-    if use_side_comms_norm {
-        nccl_side_stream_side_to_main(
-            &runtime.replicas,
-            &runtime.comm_side_streams,
-            &runtime.comm_side_events,
-            "grad-norm all-reduce",
-        )?;
-    }
 
-    for rank in 0..world_size {
-        let replica = &runtime.replicas[rank];
-        let kernels = &replica.gpu_model.kernels;
-        let scratch =
-            pg_kernels::gpu_kernels::CudaPtr(replica.grad_norm_scratch.cu_ptr(kernels.stream())?);
-        for grad in collect_gpu_non_bank_grad_refs(&replica.gpu_grads) {
+        for rank in 0..world_size {
+            let replica = &mut runtime.replicas[rank];
+            let kernels = &replica.gpu_model.kernels;
+            let packed = &runtime.non_bank_sync[rank].packed_grad;
+            let scratch = pg_kernels::gpu_kernels::CudaPtr(
+                replica.grad_norm_scratch.cu_ptr(kernels.stream())?,
+            );
             kernels.clip_by_global_norm(
-                pg_kernels::gpu_kernels::CudaPtr(grad.cu_ptr(kernels.stream())?),
+                pg_kernels::gpu_kernels::CudaPtr(packed.cu_ptr(kernels.stream())?),
                 scratch,
                 train_config.grad_clip_norm,
-                grad.numel() as u32,
+                packed.numel() as u32,
             )?;
+            unpack_non_bank_gpu_grads(kernels, packed, &mut replica.gpu_grads)?;
+        }
+    } else {
+        for rank in 0..world_size {
+            let replica = &mut runtime.replicas[rank];
+            let kernels = &replica.gpu_model.kernels;
+            let packed = &runtime.non_bank_sync[rank].packed_grad;
+            unpack_non_bank_gpu_grads(kernels, packed, &mut replica.gpu_grads)?;
         }
     }
-    if !sharded_parallel_muon_fused_global_clip_enabled_for_audit() {
+    if apply_global_clip && !sharded_parallel_muon_fused_global_clip_enabled_for_audit() {
         let parallel_muon = runtime
             .parallel_muon
             .as_ref()
@@ -3922,58 +5054,78 @@ fn cuda_distributed_sharded_parallel_muon_step(
             }
         }
     }
+    record_sharded_muon_phase_ms(
+        &runtime.replicas,
+        &mut bank_phase_events,
+        &mut bank_phase_host_start,
+        timing,
+        |timing| &mut timing.cuda_bank_update_stage_clip_ms,
+    )?;
 
     {
         let parallel_muon = runtime
             .parallel_muon
             .as_mut()
             .expect("validated sharded Parallel Muon runtime");
-        for bank_idx in 0..bank_count {
+        let fused_global_clip = sharded_parallel_muon_fused_global_clip_enabled_for_audit();
+        if sharded_parallel_muon_parallel_local_enabled() {
+            std::thread::scope(|scope| -> PgResult<()> {
+                let mut handles = Vec::with_capacity(world_size);
+                for (rank, sharded_replica) in parallel_muon.replicas.iter_mut().enumerate() {
+                    let replica = &runtime.replicas[rank];
+                    let kernels = &replica.gpu_model.kernels;
+                    let grad_norm_scratch = &replica.grad_norm_scratch;
+                    handles.push(scope.spawn(move || {
+                        sharded_parallel_muon_local_rank_step_graph_or_eager(
+                            kernels,
+                            grad_norm_scratch,
+                            sharded_replica,
+                            rank,
+                            bank_count,
+                            train_config,
+                            step,
+                            lr_scale,
+                            apply_global_clip,
+                            fused_global_clip,
+                            bf16_shadow_all_gather,
+                        )
+                    }));
+                }
+                for handle in handles {
+                    handle.join().map_err(|_| {
+                        pg_core::PgError::InvalidOp(
+                            "sharded Parallel Muon local worker panicked".into(),
+                        )
+                    })??;
+                }
+                Ok(())
+            })?;
+        } else {
             for rank in 0..world_size {
                 let replica = &runtime.replicas[rank];
                 let sharded_replica = &mut parallel_muon.replicas[rank];
-                let buffers = &mut sharded_replica.banks[bank_idx];
-                let active_batch = sharded_bank_real_batch(buffers, rank);
-                if active_batch == 0 {
-                    continue;
-                }
-                let shard_param = buffers.shard_param.slice_range(0, active_batch)?;
-                let shard_grad = buffers.shard_grad.slice_range(0, active_batch)?;
-                sharded_replica.muon.lr = train_config.matrix_lr * lr_scale;
-                sharded_replica.muon.momentum = train_config.muon_momentum_at(step);
-                sharded_replica.muon.weight_decay = train_config.muon_wd;
-                if sharded_parallel_muon_fused_global_clip_enabled_for_audit() {
-                    sharded_replica.muon.step_bank_with_global_clip(
-                        &replica.gpu_model.kernels,
-                        bank_idx,
-                        &shard_param,
-                        &shard_grad,
-                        Some(&replica.grad_norm_scratch),
-                        train_config.grad_clip_norm,
-                    )?;
-                } else {
-                    sharded_replica.muon.step_bank(
-                        &replica.gpu_model.kernels,
-                        bank_idx,
-                        &shard_param,
-                        &shard_grad,
-                    )?;
-                }
-                if bf16_shadow_all_gather {
-                    replica.gpu_model.kernels.f32_to_bf16(
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            shard_param.cu_ptr(replica.gpu_model.kernels.stream())?,
-                        ),
-                        pg_kernels::gpu_kernels::CudaPtr(
-                            buffers
-                                .shard_param_bf16
-                                .cu_ptr(replica.gpu_model.kernels.stream())?,
-                        ),
-                        buffers.shard_param.numel() as u32,
-                    )?;
-                }
+                sharded_parallel_muon_local_rank_step_graph_or_eager(
+                    &replica.gpu_model.kernels,
+                    &replica.grad_norm_scratch,
+                    sharded_replica,
+                    rank,
+                    bank_count,
+                    train_config,
+                    step,
+                    lr_scale,
+                    apply_global_clip,
+                    fused_global_clip,
+                    bf16_shadow_all_gather,
+                )?;
             }
         }
+        record_sharded_muon_phase_ms(
+            &runtime.replicas,
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_muon_ms,
+        )?;
 
         // Param all-gather. Same side-stream collective pattern: side stream waits on the
         // main-stream Muon-step event before reading shard_param; main stream
@@ -4022,6 +5174,13 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 "bank param all-gather",
             )?;
         }
+        record_sharded_muon_phase_ms(
+            &runtime.replicas,
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_param_gather_ms,
+        )?;
 
         for bank_idx in 0..bank_count {
             for rank in 0..world_size {
@@ -4049,6 +5208,13 @@ fn cuda_distributed_sharded_parallel_muon_step(
                 }
             }
         }
+        record_sharded_muon_phase_ms(
+            &runtime.replicas,
+            &mut bank_phase_events,
+            &mut bank_phase_host_start,
+            timing,
+            |timing| &mut timing.cuda_bank_update_stage_copy_back_ms,
+        )?;
     }
     let bank_host_ms = bank_t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(starts) = bank_start_events {
@@ -4064,16 +5230,39 @@ fn cuda_distributed_sharded_parallel_muon_step(
         None
     };
     let non_bank_t0 = Instant::now();
-    for replica in runtime.replicas.iter_mut() {
-        cuda_fast_apply_non_bank_updates_unclipped(replica, train_config, step, lr_scale)?;
-        if bf16_shadow_all_gather {
-            replica
-                .gpu_model
-                .refresh_bf16_non_bank_shadows_after_sharded_bank_update()?;
-        } else {
-            replica.gpu_model.refresh_bf16_shadows()?;
+    let adamw_bf16_shadow = gpu_adamw_bf16_shadow_update_enabled();
+    std::thread::scope(|scope| -> PgResult<()> {
+        let mut handles = Vec::with_capacity(runtime.replicas.len());
+        for replica in runtime.replicas.iter_mut() {
+            handles.push(scope.spawn(move || {
+                cuda_fast_apply_non_bank_updates_unclipped_no_shadow_refresh(
+                    replica,
+                    train_config,
+                    step,
+                    lr_scale,
+                )?;
+                if bf16_shadow_all_gather {
+                    if adamw_bf16_shadow {
+                        replica
+                            .gpu_model
+                            .refresh_bf16_qkv_shadow_after_sharded_bank_update()
+                    } else {
+                        replica
+                            .gpu_model
+                            .refresh_bf16_non_bank_shadows_after_sharded_bank_update()
+                    }
+                } else {
+                    replica.gpu_model.refresh_bf16_shadows()
+                }
+            }));
         }
-    }
+        for handle in handles {
+            handle.join().map_err(|_| {
+                pg_core::PgError::InvalidOp("non-bank update worker panicked".into())
+            })??;
+        }
+        Ok(())
+    })?;
     let non_bank_host_ms = non_bank_t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(starts) = non_bank_start_events {
         let ends = record_replica_events(runtime)?;
@@ -4162,38 +5351,62 @@ fn cuda_distributed_launch_replica_backward(
         None
     };
 
-    let zero_host_t0 = Instant::now();
-    let zero_start_event = if event_timing {
-        Some(
-            stream
+    let graph_handles_zero_grads =
+        !compute_step_loss && observer.is_none() && cuda_backward_graph_enabled();
+    let mut result = ReplicaBackwardLaunchResult::default();
+    if !graph_handles_zero_grads {
+        let zero_host_t0 = Instant::now();
+        let zero_start_event = if event_timing {
+            Some(
+                stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|e| {
+                        pg_core::PgError::InvalidOp(format!(
+                            "cuda zero-grads event record failed: {e:?}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+        zero_gpu_grads(
+            &replica.gpu_model.kernels,
+            &mut replica.gpu_grads,
+            &replica.gpu_model.config,
+        )?;
+
+        if let Some(start) = zero_start_event {
+            let end = stream
                 .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                 .map_err(|e| {
                     pg_core::PgError::InvalidOp(format!(
                         "cuda zero-grads event record failed: {e:?}"
                     ))
-                })?,
-        )
-    } else {
-        None
-    };
-    zero_gpu_grads(&replica.gpu_model.kernels, &mut replica.gpu_grads)?;
-
-    let mut result = ReplicaBackwardLaunchResult::default();
-    if let Some(start) = zero_start_event {
-        let end = stream
-            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| {
-                pg_core::PgError::InvalidOp(format!("cuda zero-grads event record failed: {e:?}"))
-            })?;
-        result.cuda_zero_grads_ms = start.elapsed_ms(&end).map_err(|e| {
-            pg_core::PgError::InvalidOp(format!("cuda zero-grads event elapsed failed: {e:?}"))
-        })? as f64;
-    } else {
-        result.cuda_zero_grads_ms = zero_host_t0.elapsed().as_secs_f64() * 1000.0;
+                })?;
+            result.cuda_zero_grads_ms = start.elapsed_ms(&end).map_err(|e| {
+                pg_core::PgError::InvalidOp(format!("cuda zero-grads event elapsed failed: {e:?}"))
+            })? as f64;
+        } else {
+            result.cuda_zero_grads_ms = zero_host_t0.elapsed().as_secs_f64() * 1000.0;
+        }
     }
 
     let compute_loss = compute_step_loss && rank_idx == 0;
+    let mut host_batch_flatten_calls = 0usize;
+    let mut host_batch_flatten_bytes = 0usize;
     if let Some(rank_batches) = rank_batches {
+        if record_strict_device_batch_enabled() {
+            return Err(pg_core::PgError::InvalidOp(
+                "record runtime requires device-resident batches; refusing per-rank host microbatch flatten in cuda_distributed_step".into(),
+            ));
+        }
+        host_batch_flatten_calls = 1;
+        host_batch_flatten_bytes = rank_batches
+            .iter()
+            .map(|(input_ids, targets)| {
+                (input_ids.len() + targets.len()) * std::mem::size_of::<u32>()
+            })
+            .sum();
         flatten_microbatches_into(
             rank_batches,
             &mut replica.host_input_ids,
@@ -4209,6 +5422,11 @@ fn cuda_distributed_launch_replica_backward(
         observer,
     )?;
     result.cuda_h2d_ms = local_timing.cuda_h2d_ms;
+    result.host_batch_flatten_calls = host_batch_flatten_calls;
+    result.host_to_device_batch_bytes =
+        host_batch_flatten_bytes + local_timing.host_to_device_batch_bytes;
+    result.device_batch_ready_steps = local_timing.device_batch_ready_steps;
+    result.device_batch_missing_steps = local_timing.device_batch_missing_steps;
     result.loss_count = usize::from(compute_loss);
 
     if let Some(start) = backward_start_event {
@@ -4224,6 +5442,29 @@ fn cuda_distributed_launch_replica_backward(
         result.cuda_backward_ms = backward_host_t0.elapsed().as_secs_f64() * 1000.0;
     }
     Ok(result)
+}
+
+#[cfg(feature = "cuda")]
+fn replica_backward_graph_ready(replica: &CudaSingleFastRuntime, runtime_seq_len: usize) -> bool {
+    !cuda_backward_graph_enabled()
+        || (replica.backward_graph.is_some()
+            && replica.backward_graph_seq_len == runtime_seq_len
+            && replica.backward_graph_warmup_steps_done >= cuda_backward_graph_warmup_steps())
+}
+
+#[cfg(feature = "cuda")]
+fn synchronize_distributed_replica_streams(
+    runtime: &CudaDistributedRuntime,
+    label: &str,
+) -> PgResult<()> {
+    for (rank, replica) in runtime.replicas.iter().enumerate() {
+        replica.gpu_model.gemm.stream().synchronize().map_err(|e| {
+            pg_core::PgError::InvalidOp(format!(
+                "{label}: rank {rank} stream synchronize failed: {e:?}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -4276,7 +5517,37 @@ fn cuda_distributed_step(
         }
     }
 
-    let replica_results = if use_backward_bucket_overlap {
+    let graph_setup_pending = cuda_backward_graph_enabled()
+        && !use_backward_bucket_overlap
+        && !compute_step_loss
+        && runtime
+            .replicas
+            .iter()
+            .any(|replica| !replica_backward_graph_ready(replica, runtime_seq_len));
+
+    let replica_results = if graph_setup_pending {
+        let mut results = Vec::with_capacity(runtime.replicas.len());
+        for rank_idx in 0..runtime.replicas.len() {
+            if !replica_backward_graph_ready(&runtime.replicas[rank_idx], runtime_seq_len) {
+                synchronize_distributed_replica_streams(
+                    runtime,
+                    "cuda backward graph setup isolation sync",
+                )?;
+            }
+            let rank_batches = batches.map(|all_batches| &all_batches[rank_idx]);
+            let result = cuda_distributed_launch_replica_backward(
+                &mut runtime.replicas[rank_idx],
+                rank_idx,
+                rank_batches,
+                compute_step_loss,
+                runtime_seq_len,
+                event_timing,
+                None,
+            )?;
+            results.push(result);
+        }
+        PgResult::Ok(results)?
+    } else if use_backward_bucket_overlap {
         let world_size = runtime.replicas.len();
         let bucket_layers = backward_nccl_bucket_layers();
         let num_layers = runtime
@@ -4390,6 +5661,10 @@ fn cuda_distributed_step(
         loss_count += result.loss_count;
         timing.cuda_zero_grads_ms += result.cuda_zero_grads_ms;
         timing.cuda_h2d_ms += result.cuda_h2d_ms;
+        timing.host_batch_flatten_calls += result.host_batch_flatten_calls;
+        timing.host_to_device_batch_bytes += result.host_to_device_batch_bytes;
+        timing.device_batch_ready_steps += result.device_batch_ready_steps;
+        timing.device_batch_missing_steps += result.device_batch_missing_steps;
         max_backward_ms = max_backward_ms.max(result.cuda_backward_ms);
         max_backward_bucket_flushes =
             max_backward_bucket_flushes.max(result.backward_bucket_flushes);
@@ -4465,7 +5740,17 @@ fn cuda_distributed_step(
 #[cfg(feature = "cuda")]
 fn download_gpu_f32(tensor: &pg_core::GpuTensor) -> PgResult<Vec<f32>> {
     let bytes = tensor.to_host_bytes()?;
-    Ok(bytemuck::cast_slice::<u8, f32>(&bytes).to_vec())
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "GPU f32 download returned {} bytes, not divisible by {}",
+            bytes.len(),
+            std::mem::size_of::<f32>()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 fn validate_executable_variant(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> {
@@ -4577,6 +5862,457 @@ fn json_str_field(name: &str, value: &str) -> String {
     format!("\"{}\":\"{}\"", name, escape_json_str(value))
 }
 
+fn json_f64_field(name: &str, value: f64) -> String {
+    if value.is_finite() {
+        format!("\"{}\":{:.6}", name, value)
+    } else {
+        format!("\"{}\":null", name)
+    }
+}
+
+fn json_opt_f64_field(name: &str, value: Option<f64>) -> String {
+    match value {
+        Some(v) if v.is_finite() => format!("\"{}\":{:.6}", name, v),
+        _ => format!("\"{}\":null", name),
+    }
+}
+
+fn json_opt_usize_field(name: &str, value: Option<usize>) -> String {
+    match value {
+        Some(v) => format!("\"{}\":{}", name, v),
+        None => format!("\"{}\":null", name),
+    }
+}
+
+fn json_opt_bool_field(name: &str, value: Option<bool>) -> String {
+    match value {
+        Some(v) => format!("\"{}\":{}", name, v),
+        None => format!("\"{}\":null", name),
+    }
+}
+
+fn json_opt_str_field(name: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("\"{}\":\"{}\"", name, escape_json_str(v)),
+        None => format!("\"{}\":null", name),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_artifact_audit_json(
+    run_spec: &RunSpec,
+    artifact_model_bytes: Option<usize>,
+    artifact_code_bytes: Option<usize>,
+    artifact_total_bytes: Option<usize>,
+    artifact_budget_ok: Option<bool>,
+    artifact_model_sha256: Option<&str>,
+    artifact_code_sha256: Option<&str>,
+    caseops_byte_sidecar_sha256: Option<&str>,
+) -> String {
+    let mut fields = Vec::with_capacity(16);
+    fields.push(json_str_field("event", "record_artifact_audit"));
+    fields.push(json_opt_usize_field(
+        "artifact_model_bytes",
+        artifact_model_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "artifact_code_bytes",
+        artifact_code_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "artifact_total_bytes",
+        artifact_total_bytes,
+    ));
+    fields.push(format!(
+        "\"artifact_total_limit\":{}",
+        run_spec.quant.target_artifact_bytes
+    ));
+    fields.push(format!(
+        "\"artifact_budget_known\":{}",
+        artifact_model_bytes.is_some() && artifact_code_bytes.is_some()
+    ));
+    fields.push(json_opt_bool_field(
+        "artifact_budget_ok",
+        artifact_budget_ok,
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_model_sha256",
+        artifact_model_sha256,
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_code_sha256",
+        artifact_code_sha256,
+    ));
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_sha256",
+        caseops_byte_sidecar_sha256,
+    ));
+    fields.push("\"strict_decimal_bytes\":true".to_string());
+    format!("{{{}}}", fields.join(","))
+}
+
+/// Emit the full [`VariantResult`] as a single-line JSON object.
+///
+/// Used by `deploy/run_record_ab.py` to do step-time A/B deltas without
+/// having to regex-parse the legacy `key=value` lines that `main.rs` prints.
+/// Look for the line prefixed with `run_timing_json=` in stdout.
+pub fn run_timing_json(result: &VariantResult) -> String {
+    let mut fields: Vec<String> = Vec::with_capacity(96);
+    fields.push(json_str_field("event", "run_timing"));
+    fields.push(json_str_field("run_name", &result.run_name));
+    fields.push(json_str_field("mode", &format!("{:?}", result.mode)));
+    fields.push(json_str_field(
+        "train_backend",
+        &format!("{:?}", result.train_backend),
+    ));
+    fields.push(json_str_field(
+        "variant_fingerprint",
+        &result.variant_fingerprint,
+    ));
+    fields.push(json_str_field(
+        "attention_backend",
+        &result.attention_backend,
+    ));
+    fields.push(json_str_field(
+        "distributed_optimizer_backend",
+        &result.distributed_optimizer_backend,
+    ));
+    fields.push(json_str_field(
+        "eval_adaptation_backend",
+        &result.eval_adaptation_backend,
+    ));
+    fields.push(json_str_field("timing_backend", &result.timing_backend));
+    fields.push(format!("\"steps_completed\":{}", result.steps_completed));
+    fields.push(format!("\"timing_steps\":{}", result.timing_steps));
+    fields.push(format!("\"rank\":{}", result.rank));
+    fields.push(format!("\"world_size\":{}", result.world_size));
+    fields.push(format!("\"seq_len\":{}", result.seq_len));
+    fields.push(format!(
+        "\"global_batch_tokens\":{}",
+        result.global_batch_tokens
+    ));
+    fields.push(format!(
+        "\"local_microbatches_per_step\":{}",
+        result.local_microbatches_per_step
+    ));
+    fields.push(format!(
+        "\"tokens_seen_global\":{}",
+        result.tokens_seen_global
+    ));
+    fields.push(format!("\"distributed_sync\":{}", result.distributed_sync));
+    fields.push(format!(
+        "\"frontier_record_ready\":{}",
+        result.frontier_record_ready
+    ));
+    fields.push(format!(
+        "\"leaderboard_algorithm_ready\":{}",
+        result.leaderboard_algorithm_ready
+    ));
+    fields.push(format!("\"record_shape\":{}", result.record_shape));
+    fields.push(format!(
+        "\"record_attention_grade\":{}",
+        result.record_attention_grade
+    ));
+    fields.push(format!(
+        "\"microbatch_serial_loop\":{}",
+        result.microbatch_serial_loop
+    ));
+    fields.push(json_str_field(
+        "bank_update_backend",
+        &result.bank_update_backend,
+    ));
+    fields.push(json_str_field(
+        "train_data_source",
+        &result.train_data_source,
+    ));
+    fields.push(json_str_field("bpb_byte_source", &result.bpb_byte_source));
+    fields.push(json_opt_str_field(
+        "proxy_metric_source",
+        result.proxy_metric_source.as_deref(),
+    ));
+    fields.push(format!("\"train_loss\":{:.6}", result.train_loss));
+    fields.push(json_str_field(
+        "train_loss_source",
+        &result.train_loss_source,
+    ));
+    fields.push(json_opt_f64_field("proxy_bpb", result.proxy_bpb));
+    fields.push(json_opt_f64_field("eval_loss", result.eval_loss));
+    fields.push(json_opt_f64_field("final_bpb", result.final_bpb));
+    fields.push(json_opt_usize_field("eval_tokens", result.eval_tokens));
+    fields.push(json_opt_usize_field(
+        "artifact_bytes",
+        result.artifact_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "submission_code_bytes",
+        result.submission_code_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "submission_total_bytes",
+        result.submission_total_bytes,
+    ));
+    fields.push(json_opt_bool_field(
+        "artifact_budget_ok",
+        result.artifact_budget_ok,
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_model_sha256",
+        result.artifact_model_sha256.as_deref(),
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_code_sha256",
+        result.artifact_code_sha256.as_deref(),
+    ));
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_sha256",
+        result.caseops_byte_sidecar_sha256.as_deref(),
+    ));
+    fields.push(format!(
+        "\"host_batch_flatten_calls\":{}",
+        result.host_batch_flatten_calls
+    ));
+    fields.push(format!(
+        "\"host_to_device_batch_bytes\":{}",
+        result.host_to_device_batch_bytes
+    ));
+    fields.push(format!(
+        "\"device_batch_ready_steps\":{}",
+        result.device_batch_ready_steps
+    ));
+    fields.push(format!(
+        "\"device_batch_missing_steps\":{}",
+        result.device_batch_missing_steps
+    ));
+    fields.push(format!(
+        "\"device_to_host_scalar_reads\":{}",
+        result.device_to_host_scalar_reads
+    ));
+    fields.push(json_f64_field("ms_per_step", result.ms_per_step));
+    fields.push(json_f64_field(
+        "wallclock_seconds",
+        result.wallclock_seconds,
+    ));
+    fields.push(json_f64_field(
+        "timing_measured_ms_per_step",
+        result.timing_measured_ms_per_step,
+    ));
+    let timing_steps_f = result.timing_steps.max(1) as f64;
+    let per_step = |total: f64| -> f64 {
+        if result.timing_steps == 0 {
+            0.0
+        } else {
+            total / timing_steps_f
+        }
+    };
+    let pairs: &[(&str, f64)] = &[
+        ("timing_data_sampling_ms", result.timing_data_sampling_ms),
+        ("timing_train_step_ms", result.timing_train_step_ms),
+        (
+            "timing_cuda_zero_grads_ms",
+            result.timing_cuda_zero_grads_ms,
+        ),
+        ("timing_cuda_h2d_ms", result.timing_cuda_h2d_ms),
+        ("timing_cuda_backward_ms", result.timing_cuda_backward_ms),
+        (
+            "timing_cuda_backward_forward_ms",
+            result.timing_cuda_backward_forward_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_embed_ms",
+            result.timing_cuda_backward_forward_embed_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_encoder_ms",
+            result.timing_cuda_backward_forward_encoder_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_encoder_layer_max_ms",
+            result.timing_cuda_backward_forward_encoder_layer_max_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_decoder_ms",
+            result.timing_cuda_backward_forward_decoder_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_decoder_layer_max_ms",
+            result.timing_cuda_backward_forward_decoder_layer_max_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_logits_ms",
+            result.timing_cuda_backward_forward_logits_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_block_pre_attn_ms",
+            result.timing_cuda_backward_forward_block_pre_attn_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_block_attention_ms",
+            result.timing_cuda_backward_forward_block_attention_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_block_post_attn_ms",
+            result.timing_cuda_backward_forward_block_post_attn_ms,
+        ),
+        (
+            "timing_cuda_backward_forward_block_mlp_ms",
+            result.timing_cuda_backward_forward_block_mlp_ms,
+        ),
+        (
+            "timing_cuda_backward_block_recompute_ms",
+            result.timing_cuda_backward_block_recompute_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_ms",
+            result.timing_cuda_backward_block_mlp_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_residual_ms",
+            result.timing_cuda_backward_block_mlp_residual_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_down_ms",
+            result.timing_cuda_backward_block_mlp_down_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_act_ms",
+            result.timing_cuda_backward_block_mlp_act_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_up_ms",
+            result.timing_cuda_backward_block_mlp_up_ms,
+        ),
+        (
+            "timing_cuda_backward_block_mlp_norm_ms",
+            result.timing_cuda_backward_block_mlp_norm_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attn_out_ms",
+            result.timing_cuda_backward_block_attn_out_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attn_out_residual_ms",
+            result.timing_cuda_backward_block_attn_out_residual_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attn_out_proj_ms",
+            result.timing_cuda_backward_block_attn_out_proj_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attn_out_gate_xsa_ms",
+            result.timing_cuda_backward_block_attn_out_gate_xsa_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attention_ms",
+            result.timing_cuda_backward_block_attention_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attention_sdpa_ms",
+            result.timing_cuda_backward_block_attention_sdpa_ms,
+        ),
+        (
+            "timing_cuda_backward_block_attention_xsa_accum_ms",
+            result.timing_cuda_backward_block_attention_xsa_accum_ms,
+        ),
+        (
+            "timing_cuda_backward_block_qkv_ms",
+            result.timing_cuda_backward_block_qkv_ms,
+        ),
+        (
+            "timing_cuda_backward_block_qkv_rope_ms",
+            result.timing_cuda_backward_block_qkv_rope_ms,
+        ),
+        (
+            "timing_cuda_backward_block_qkv_proj_ms",
+            result.timing_cuda_backward_block_qkv_proj_ms,
+        ),
+        (
+            "timing_cuda_backward_block_qkv_ve_ms",
+            result.timing_cuda_backward_block_qkv_ve_ms,
+        ),
+        (
+            "timing_cuda_backward_block_qkv_norm_resid_ms",
+            result.timing_cuda_backward_block_qkv_norm_resid_ms,
+        ),
+        (
+            "timing_cuda_backward_output_ms",
+            result.timing_cuda_backward_output_ms,
+        ),
+        (
+            "timing_cuda_backward_decoder_ms",
+            result.timing_cuda_backward_decoder_ms,
+        ),
+        (
+            "timing_cuda_backward_encoder_ms",
+            result.timing_cuda_backward_encoder_ms,
+        ),
+        (
+            "timing_cuda_backward_tail_ms",
+            result.timing_cuda_backward_tail_ms,
+        ),
+        (
+            "timing_cuda_non_bank_sync_ms",
+            result.timing_cuda_non_bank_sync_ms,
+        ),
+        (
+            "timing_cuda_bank_update_ms",
+            result.timing_cuda_bank_update_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_pack_ms",
+            result.timing_cuda_bank_update_stage_pack_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_grad_collectives_ms",
+            result.timing_cuda_bank_update_stage_grad_collectives_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_scale_ms",
+            result.timing_cuda_bank_update_stage_scale_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_norm_ms",
+            result.timing_cuda_bank_update_stage_norm_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_clip_ms",
+            result.timing_cuda_bank_update_stage_clip_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_muon_ms",
+            result.timing_cuda_bank_update_stage_muon_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_param_gather_ms",
+            result.timing_cuda_bank_update_stage_param_gather_ms,
+        ),
+        (
+            "timing_cuda_bank_update_stage_copy_back_ms",
+            result.timing_cuda_bank_update_stage_copy_back_ms,
+        ),
+        (
+            "timing_cuda_non_bank_update_ms",
+            result.timing_cuda_non_bank_update_ms,
+        ),
+        (
+            "timing_post_train_sync_ms",
+            result.timing_post_train_sync_ms,
+        ),
+        (
+            "timing_artifact_export_ms",
+            result.timing_artifact_export_ms,
+        ),
+        ("timing_eval_ms", result.timing_eval_ms),
+    ];
+    for (name, total) in pairs {
+        fields.push(json_f64_field(name, *total));
+        fields.push(json_f64_field(
+            &format!("{}_per_step", name),
+            per_step(*total),
+        ));
+    }
+    format!("{{{}}}", fields.join(","))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_path_audit_json(
     run_spec: &RunSpec,
@@ -4612,7 +6348,7 @@ fn record_path_audit_json(
         "\"effective_global_batch_tokens\":{}",
         batch_plan.microbatch_tokens * local_batch * world_size.max(1)
     ));
-    let record_max_ms = record_max_ms_per_step_for_submission();
+    let record_max_ms = record_max_ms_per_step_for_submission(run_spec);
     fields.push(format!("\"record_max_ms_per_step\":{record_max_ms:.3}"));
     let target_steps_per_600s = if record_max_ms > 0.0 {
         600_000.0 / record_max_ms
@@ -4737,6 +6473,14 @@ fn record_path_audit_json(
         sharded_parallel_muon && sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit()
     ));
     fields.push(format!(
+        "\"sharded_parallel_muon_local_graph\":{}",
+        sharded_parallel_muon && sharded_parallel_muon_local_graph_enabled()
+    ));
+    fields.push(format!(
+        "\"sharded_parallel_muon_pre_norm_graph\":{}",
+        sharded_parallel_muon && sharded_parallel_muon_pre_norm_graph_enabled()
+    ));
+    fields.push(format!(
         "\"sharded_parallel_muon_host_scalar_sync\":{}",
         false
     ));
@@ -4834,6 +6578,10 @@ fn record_path_audit_json(
     ));
     fields.push(format!("\"matrix_lr\":{}", run_spec.train.matrix_lr));
     fields.push(format!("\"min_lr_scale\":{}", run_spec.train.min_lr_scale));
+    fields.push(format!(
+        "\"grad_clip_norm\":{}",
+        run_spec.train.grad_clip_norm
+    ));
     fields.push(format!("\"warmup_steps\":{}", run_spec.train.warmup_steps));
     fields.push(format!(
         "\"warmdown_iters\":{}",
@@ -5043,6 +6791,30 @@ fn record_path_audit_json(
         "\"bf16_attention_backward_bhsd_do\":{}",
         bf16_attention_backward_bhsd_do_enabled_for_audit(run_spec)
     ));
+    fields.push(json_str_field(
+        "record_profile",
+        &format!("{:?}", run_spec.runtime.record_profile),
+    ));
+    fields.push(json_str_field(
+        "backward_chain_profile",
+        &format!("{:?}", run_spec.runtime.backward_chain_profile),
+    ));
+    fields.push(json_str_field(
+        "cuda_graph_profile",
+        &format!("{:?}", run_spec.runtime.cuda_graph_profile),
+    ));
+    fields.push(json_str_field(
+        "nccl_overlap_mode",
+        &format!("{:?}", run_spec.runtime.nccl_overlap_mode),
+    ));
+    fields.push(format!(
+        "\"device_batch_required\":{}",
+        run_spec.runtime.require_device_batch
+    ));
+    fields.push(format!(
+        "\"runtime_token_ring_full_schedule\":{}",
+        run_spec.runtime.token_ring_full_schedule
+    ));
     fields.push(format!(
         "\"bf16_backward_chain_requested\":{}",
         bf16_backward_chain_requested_for_audit()
@@ -5098,6 +6870,10 @@ fn record_path_audit_json(
     fields.push(json_str_field(
         "muon_newton_schulz_profile",
         &muon_ns_profile_for_audit(),
+    ));
+    fields.push(format!(
+        "\"muon_newton_schulz_steps\":{}",
+        muon_ns_steps_for_audit(run_spec)
     ));
     fields.push(format!(
         "\"polar_express_newton_schulz\":{}",
@@ -5393,20 +7169,84 @@ fn record_path_audit_json(
         "\"tokenizer_vocab_configured\":{}",
         run_spec.eval.tokenizer_vocab_path.is_some()
     ));
+    fields.push(format!(
+        "\"ttt_seq_len\":{}",
+        run_spec
+            .eval
+            .ttt_seq_len
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string())
+    ));
+    fields.push(json_str_field(
+        "ttt_mask",
+        &format!("{:?}", run_spec.eval.ttt_mask),
+    ));
+    fields.push(format!(
+        "\"asym_logit_enabled\":{}",
+        run_spec.model.asym_logit.enabled
+    ));
+    fields.push(format!(
+        "\"ngram_tilt_enabled\":{}",
+        run_spec.eval.ngram_tilt.enabled
+    ));
+    fields.push(format!(
+        "\"ngram_token_only\":{}",
+        ngram_tilt_token_only_for_audit(run_spec)
+    ));
+    fields.push(format!(
+        "\"ngram_precompute_inside_eval_timer\":{}",
+        run_spec.eval.ngram_tilt.precompute_inside_eval_timer
+    ));
+    fields.push(format!(
+        "\"score_first_ttt_verified\":{}",
+        run_spec.eval.legal_score_first
+            && (!run_spec.eval.qttt
+                || run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased)
+    ));
+    fields.push(format!(
+        "\"train_shards\":{}",
+        run_spec
+            .train
+            .train_data_pattern
+            .as_deref()
+            .and_then(|pattern| simple_glob_paths(pattern).ok())
+            .map(|paths| paths.len())
+            .unwrap_or(0)
+    ));
+    fields.push(format!("\"val_docs\":{}", 50_000));
+    fields.push("\"val_tokens\":null".to_string());
+    fields.push(format!(
+        "\"canonical_caseops_dataset\":{}",
+        run_spec.eval.caseops_byte_sidecar_pattern.is_some()
+    ));
+    let caseops_sidecar_sha256 = run_spec
+        .eval
+        .caseops_byte_sidecar_pattern
+        .as_deref()
+        .and_then(|pattern| sha256_file_set(pattern).ok().flatten());
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_sha256",
+        caseops_sidecar_sha256.as_deref(),
+    ));
     let audit_code_bytes = current_executable_bytes();
-    fields.push("\"artifact_model_bytes\":null".to_string());
+    fields.push(format!(
+        "\"artifact_total_limit\":{}",
+        run_spec.quant.target_artifact_bytes
+    ));
     fields.push(format!(
         "\"artifact_code_bytes\":{}",
         audit_code_bytes
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "null".to_string())
     ));
-    fields.push("\"artifact_total_bytes\":null".to_string());
     fields.push(format!(
         "\"artifact_code_bytes_known\":{}",
         audit_code_bytes.is_some()
     ));
+    fields.push("\"artifact_model_bytes_known\":false".to_string());
+    fields.push("\"artifact_total_bytes_known\":false".to_string());
     fields.push("\"artifact_budget_known\":false".to_string());
+    fields.push("\"strict_decimal_bytes\":true".to_string());
     format!("{{{}}}", fields.join(","))
 }
 
@@ -5685,6 +7525,26 @@ fn sharded_parallel_muon_fused_global_clip_enabled_for_audit() -> bool {
 fn sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit() -> bool {
     matches!(
         std::env::var("PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn sharded_parallel_muon_phase_timing_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_PHASE_TIMING")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn sharded_parallel_muon_parallel_local_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SHARDED_MUON_PARALLEL_LOCAL")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str(),
@@ -6037,6 +7897,14 @@ fn muon_ns_profile_for_audit() -> String {
         .or_else(|_| std::env::var("PG_MUON_NS_PROFILE"))
         .unwrap_or_else(|_| "polar_express".to_string())
         .to_ascii_lowercase()
+}
+
+fn muon_ns_steps_for_audit(run_spec: &RunSpec) -> usize {
+    std::env::var("PG_GPU_MUON_NS_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|steps| *steps > 0)
+        .unwrap_or(run_spec.train.to_train_config().newton_schulz_steps)
 }
 
 fn polar_express_muon_enabled_for_audit() -> bool {
@@ -6459,6 +8327,23 @@ fn record_require_gpu_data_sampler_for_audit() -> bool {
     )
 }
 
+/// Phase 0 runtime gate: when enabled, any time the H2D host-copy fallback
+/// fires inside [`cuda_fast_accumulate_runtime_grads`] we return an error
+/// instead of silently uploading from `host_input_ids` / `host_targets`. This
+/// catches code-path regressions that reintroduce host sampling on the record
+/// hot path (closes the spirit of the P1-7 finding without committing the
+/// behavior change required by Phase 4a).
+#[cfg(feature = "cuda")]
+fn record_strict_device_batch_enabled() -> bool {
+    matches!(
+        std::env::var("PG_RECORD_REQUIRE_DEVICE_BATCH")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn gpu_resident_synthetic_record_sampler_configured_for_audit(run_spec: &RunSpec) -> bool {
     run_spec.train.backend == TrainBackend::CudaDistributed
         && run_spec.train.train_data_pattern.is_none()
@@ -6653,8 +8538,6 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     } else if chunked_bf16_output_ce_cache_enabled_for_audit(run_spec) {
         if output_path_materializes_full_logits_for_audit(run_spec) {
             gaps.push("PG_GPU_CHUNKED_OUTPUT_CE_CACHE is enabled, but output_ce_chunk_tokens covers the full local batch, so the output path still materializes a full [batch_tokens, vocab] BF16 scratch tensor");
-        } else {
-            gaps.push("PG_GPU_CHUNKED_OUTPUT_CE_CACHE avoids persistent full logits and avoids tiled-CE GEMM recompute, but it is still a bounded scratch-cache bridge rather than the final no-cache fused output projection + softcapped CE/backward kernel");
         }
     } else if !tiled_output_cross_entropy_enabled_for_audit(run_spec) {
         gaps.push("current GPU output path still materializes full [batch_tokens, vocab] logits; the remaining record cut is a real fused output projection + softcapped CE/backward kernel or the chunked BF16 CE cache bridge");
@@ -6666,12 +8549,10 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     if gpu_host_scalar_updates_enabled_for_audit() {
         gaps.push("PG_GPU_HOST_SCALAR_UPDATES=1 enables legacy per-step host scalar mirror synchronization; record mode should keep trainable scalar params device-resident and sync them only for export");
     }
-    if !backward_nccl_bucket_overlap_validated_for_audit() {
-        if backward_nccl_bucket_overlap_enabled_for_audit() {
-            gaps.push("backward NCCL bucket overlap is implemented and opt-in, but it has not passed the record-readiness timing gate; keep it experimental until H100 A/B shows a step-time win");
-        } else {
-            gaps.push("distributed bank communication is still launched after full backward; final record runtime still needs bucketed reduce-scatter overlap with backward");
-        }
+    if backward_nccl_bucket_overlap_enabled_for_audit()
+        && !backward_nccl_bucket_overlap_validated_for_audit()
+    {
+        gaps.push("backward NCCL bucket overlap is implemented and opt-in, but it has not passed the record-readiness timing gate; keep it experimental until H100 A/B shows a step-time win");
     }
     if run_spec.model.smear_gate && run_spec.model.smear_gate_boundary_token_id.is_none() {
         gaps.push("SmearGate must be BOS/document-boundary masked before record-shaped frontier runs; unmasked previous-token mixing can leak across packed documents");
@@ -6681,7 +8562,7 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     } else if gpu_token_ring_sampler_configured_for_audit(run_spec)
         && gpu_token_ring_full_schedule_enabled_for_audit()
     {
-        gaps.push("record data path preloads a full compact per-rank token schedule to GPU and removes per-step input/target H2D copies; final shard-resident offset generation is still a memory-footprint/tuning concern, not a per-step copy blocker");
+        // Full-schedule token ring is the accepted <=120ms record-readiness data path.
     } else if gpu_token_ring_sampler_configured_for_audit(run_spec) {
         gaps.push("record data path uses a GPU token-ring sampler to remove per-step input/target H2D copies, but full-schedule preload is not enabled, so host ring refills can still block CUDA graph capture");
     } else {
@@ -6709,6 +8590,62 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
 
 fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     let mut gaps = Vec::new();
+    match run_spec.runtime.record_profile {
+        RecordProfile::Baseline => {}
+        RecordProfile::Frontier2014Clean => {
+            if run_spec.model.train_seq_len < 3072 || run_spec.model.eval_seq_len < 3072 {
+                gaps.push("frontier_2014_clean requires 3072-token final train/eval context");
+            }
+            if run_spec.train.seq_schedule.len() < 3 {
+                gaps.push("frontier_2014_clean requires the 1024/2048/3072 progressive train context schedule");
+            }
+            if run_spec.eval.ttt_seq_len != Some(3072) {
+                gaps.push("frontier_2014_clean requires eval.ttt_seq_len=3072");
+            }
+            if run_spec.eval.ttt_mask != TttMask::NoQv {
+                gaps.push("frontier_2014_clean requires no_qv TTT masking");
+            }
+            if run_spec.eval.phased_ttt_phases != 1 {
+                gaps.push("frontier_2014_clean requires one score-first TTT phase");
+            }
+        }
+        RecordProfile::Frontier2135Audit => {
+            if (run_spec.model.qk_gain_init - 5.0).abs() > f32::EPSILON {
+                gaps.push("frontier_2135_audit requires qk_gain_init=5.0");
+            }
+            if run_spec.model.bigram.enabled {
+                gaps.push(
+                    "frontier_2135_audit inherits the PR2130 stack and must not enable BigramHash",
+                );
+            }
+            if run_spec.model.eval_seq_len < 2560 || run_spec.eval.ttt_seq_len != Some(2560) {
+                gaps.push("frontier_2135_audit requires 2560-token eval/TTT context");
+            }
+            if run_spec.quant.gptq_calibration_batches != 32 {
+                gaps.push("frontier_2135_audit requires GPTQ calibration batches=32");
+            }
+            if !run_spec.model.asym_logit.enabled {
+                gaps.push("frontier_2135_audit requires AsymLogit enabled");
+            }
+            if !run_spec.eval.ngram_tilt.enabled {
+                gaps.push("frontier_2135_audit requires token-only n-gram tilt enabled");
+            }
+            if !ngram_tilt_token_only_for_audit(run_spec) {
+                gaps.push("frontier_2135_audit requires token-only n-gram tilt with within/word/agreement channels disabled");
+            }
+        }
+    }
+    if matches!(
+        run_spec.runtime.record_profile,
+        RecordProfile::Frontier2014Clean | RecordProfile::Frontier2135Audit
+    ) {
+        if run_spec.runtime.backward_chain_profile != BackwardChainProfile::Bf16DirectCompact {
+            gaps.push("frontier record targets require runtime.backward_chain_profile=bf16_direct_compact");
+        }
+        if !run_spec.runtime.require_device_batch || !run_spec.runtime.token_ring_full_schedule {
+            gaps.push("frontier record targets require device-batch and full-schedule token-ring runtime ownership");
+        }
+    }
     if !run_spec.model.caseops.enabled || !run_spec.model.caseops.byte_sidecar {
         gaps.push("PR1787/PR1797 algorithm target requires CaseOps with byte sidecar");
     }
@@ -6736,13 +8673,24 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     gaps
 }
 
+fn ngram_tilt_token_only_for_audit(run_spec: &RunSpec) -> bool {
+    !run_spec.eval.ngram_tilt.enabled
+        || (run_spec.eval.ngram_tilt.token_boost != 0.0
+            && run_spec.eval.ngram_tilt.within_boost == 0.0
+            && run_spec.eval.ngram_tilt.word_boost == 0.0
+            && run_spec.eval.ngram_tilt.agree_add_boost == 0.0)
+}
+
 fn allow_frontier_record_gaps_for_development() -> bool {
     std::env::var("PG_ALLOW_FRONTIER_RECORD_GAPS")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-fn record_max_ms_per_step_for_submission() -> f64 {
+fn record_max_ms_per_step_for_submission(run_spec: &RunSpec) -> f64 {
+    if let Some(max_ms) = run_spec.runtime.max_ms_per_step {
+        return max_ms;
+    }
     std::env::var("PG_RECORD_MAX_MS_PER_STEP")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
@@ -7013,9 +8961,78 @@ fn step_batch_plan(
     model_config: &pg_model::ModelConfig,
     world_size: usize,
 ) -> PgResult<StepBatchPlan> {
+    step_batch_plan_with_seq_len(
+        run_spec,
+        mode,
+        model_config,
+        world_size,
+        run_spec.train.seq_len,
+    )
+}
+
+fn step_batch_plan_for_train_step(
+    run_spec: &RunSpec,
+    mode: RunMode,
+    model_config: &pg_model::ModelConfig,
+    world_size: usize,
+    step: usize,
+    total_steps: usize,
+) -> PgResult<StepBatchPlan> {
+    let seq_len = active_train_seq_len_for_step(run_spec, step, total_steps);
+    step_batch_plan_with_seq_len(run_spec, mode, model_config, world_size, seq_len)
+}
+
+fn active_train_seq_len_for_step(run_spec: &RunSpec, step: usize, total_steps: usize) -> usize {
+    if run_spec.train.seq_schedule.is_empty() || total_steps == 0 {
+        return run_spec.train.seq_len;
+    }
+    let progress = (step + 1) as f32 / total_steps.max(1) as f32;
+    let mut entries = run_spec.train.seq_schedule.clone();
+    entries.sort_by(|a, b| a.frac.total_cmp(&b.frac));
+    entries
+        .iter()
+        .find(|entry| progress <= entry.frac)
+        .map(|entry| entry.seq_len)
+        .or_else(|| entries.last().map(|entry| entry.seq_len))
+        .unwrap_or(run_spec.train.seq_len)
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn active_recurrence_for_train_step(
+    run_spec: &RunSpec,
+    step: usize,
+    total_steps: usize,
+    elapsed_seconds: f32,
+    max_wallclock_seconds: f32,
+) -> bool {
+    if !run_spec.model.recurrence.enabled {
+        return false;
+    }
+    let threshold = run_spec.model.recurrence.enable_at_frac;
+    if threshold <= 0.0 {
+        return true;
+    }
+    let progress = if max_wallclock_seconds > 0.0 {
+        elapsed_seconds / max_wallclock_seconds
+    } else if total_steps > 0 {
+        (step + 1) as f32 / total_steps as f32
+    } else {
+        0.0
+    };
+    progress >= threshold
+}
+
+fn step_batch_plan_with_seq_len(
+    run_spec: &RunSpec,
+    mode: RunMode,
+    model_config: &pg_model::ModelConfig,
+    world_size: usize,
+    requested_seq_len: usize,
+) -> PgResult<StepBatchPlan> {
     let sequence_tokens = run_spec
         .train
         .seq_len
+        .min(requested_seq_len)
         .min(model_config.train_seq_len)
         .max(1);
     let microbatch_tokens = match mode {
@@ -7109,6 +9126,49 @@ fn current_executable_bytes() -> Option<usize> {
         .ok()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len() as usize)
+}
+
+fn current_executable_sha256() -> Option<String> {
+    if let Ok(value) = std::env::var("PG_SUBMISSION_CODE_SHA256") {
+        return Some(value);
+    }
+    if let Ok(path) = std::env::var("PG_SUBMISSION_CODE_DIR") {
+        return directory_regular_file_sha256(std::path::Path::new(&path)).ok();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| sha256_file(&path).ok())
+}
+
+fn directory_regular_file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        return sha256_file(path).map_err(|err| std::io::Error::other(err.to_string()));
+    }
+    let mut paths = Vec::new();
+    collect_regular_files(path, &mut paths)?;
+    paths.sort();
+    let mut state = Sha256State::new();
+    for file in paths {
+        state.update(file.to_string_lossy().as_bytes());
+        state.update(b"\0");
+        let digest = sha256_file(&file).map_err(|err| std::io::Error::other(err.to_string()))?;
+        state.update(digest.as_bytes());
+        state.update(b"\0");
+    }
+    Ok(hex_digest(state.finalize()))
+}
+
+fn collect_regular_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        out.push(path.to_path_buf());
+    } else if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            collect_regular_files(&entry?.path(), out)?;
+        }
+    }
+    Ok(())
 }
 
 fn directory_regular_file_bytes(path: &std::path::Path) -> std::io::Result<usize> {
@@ -7746,6 +9806,83 @@ mod tests {
     }
 
     #[test]
+    fn train_seq_schedule_changes_microbatch_shape_without_changing_tokens() {
+        let mut spec = RunSpec::default();
+        spec.train.seq_len = 3072;
+        spec.model.train_seq_len = 3072;
+        spec.train.batch_tokens = 786_432;
+        spec.train.seq_schedule = vec![
+            pg_model::TrainSeqScheduleEntry {
+                frac: 0.10,
+                seq_len: 1024,
+            },
+            pg_model::TrainSeqScheduleEntry {
+                frac: 0.70,
+                seq_len: 2048,
+            },
+            pg_model::TrainSeqScheduleEntry {
+                frac: 1.00,
+                seq_len: 3072,
+            },
+        ];
+        let config = spec.model.to_model_config();
+
+        let early =
+            step_batch_plan_for_train_step(&spec, RunMode::Record, &config, 8, 0, 100).unwrap();
+        assert_eq!(early.microbatch_tokens, 1024);
+        assert_eq!(early.global_batch_tokens, 786_432);
+        assert_eq!(early.local_microbatches_per_step, 96);
+
+        let middle =
+            step_batch_plan_for_train_step(&spec, RunMode::Record, &config, 8, 10, 100).unwrap();
+        assert_eq!(middle.microbatch_tokens, 2048);
+        assert_eq!(middle.local_microbatches_per_step, 48);
+
+        let late =
+            step_batch_plan_for_train_step(&spec, RunMode::Record, &config, 8, 70, 100).unwrap();
+        assert_eq!(late.microbatch_tokens, 3072);
+        assert_eq!(late.local_microbatches_per_step, 32);
+    }
+
+    #[test]
+    fn runtime_bf16_direct_compact_profile_owns_mlp_down_dx() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let keys = [
+            "PG_GPU_BF16_BACKWARD_CHAIN",
+            "PG_GPU_BF16_BACKWARD_CHAIN_STRICT",
+            "PG_GPU_BF16_MLP_DOWN_DX",
+        ];
+        let old = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let mut spec = RunSpec::default();
+        spec.runtime.backward_chain_profile = BackwardChainProfile::Bf16DirectCompact;
+        apply_runtime_profile_env(&spec, RunMode::RecordShapedProxy).unwrap();
+
+        assert_eq!(
+            std::env::var("PG_GPU_BF16_BACKWARD_CHAIN").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("PG_GPU_BF16_BACKWARD_CHAIN_STRICT").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(std::env::var("PG_GPU_BF16_MLP_DOWN_DX").as_deref(), Ok("1"));
+
+        for (key, value) in old {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    #[test]
     fn record_audit_json_declares_record_shape_and_backends() {
         let _guard = env_lock().lock().expect("env lock poisoned");
         let sampler_keys = [
@@ -7858,7 +9995,14 @@ mod tests {
             json.contains("\"leaderboard_algorithm_ready\":false"),
             "{json}"
         );
-        assert!(json.contains("\"artifact_model_bytes\":null"), "{json}");
+        assert!(
+            json.contains("\"artifact_model_bytes_known\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"artifact_total_bytes_known\":false"),
+            "{json}"
+        );
         for (key, value) in old_sampler_env {
             match value {
                 Some(value) => unsafe { std::env::set_var(key, value) },
@@ -9167,6 +11311,30 @@ mod tests {
             gaps.iter().any(|gap| gap.contains("SmearGate must be BOS")),
             "unmasked SmearGate must be a frontier record gap: {gaps:?}"
         );
+    }
+
+    #[test]
+    fn recurrence_activation_uses_wallclock_fraction_when_budgeted() {
+        let mut spec = RunSpec::default();
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.enable_at_frac = 0.35;
+
+        assert!(!active_recurrence_for_train_step(
+            &spec, 100, 24, 60.0, 600.0
+        ));
+        assert!(active_recurrence_for_train_step(
+            &spec, 100, 24, 211.0, 600.0
+        ));
+    }
+
+    #[test]
+    fn recurrence_activation_falls_back_to_iteration_fraction_without_wallclock() {
+        let mut spec = RunSpec::default();
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.enable_at_frac = 0.35;
+
+        assert!(!active_recurrence_for_train_step(&spec, 33, 100, 0.0, 0.0));
+        assert!(active_recurrence_for_train_step(&spec, 34, 100, 0.0, 0.0));
     }
 
     #[test]

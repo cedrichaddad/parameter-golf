@@ -149,6 +149,50 @@ pub enum CompressionMode {
     Pergroup,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackwardChainProfile {
+    #[default]
+    Off,
+    Bf16Direct,
+    Bf16DirectCompact,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaGraphProfile {
+    #[default]
+    Off,
+    BackwardNoLoss,
+    RecordStepNoLoss,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NcclOverlapMode {
+    #[default]
+    Off,
+    BucketedMeasured,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordProfile {
+    #[default]
+    Baseline,
+    Frontier2014Clean,
+    Frontier2135Audit,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TttMask {
+    #[default]
+    None,
+    NoQv,
+    KOff,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BigramSpec {
@@ -209,6 +253,7 @@ pub struct RecurrenceSpec {
     pub enabled: bool,
     pub start_layer: usize,
     pub repeat_layers: usize,
+    pub enable_at_frac: f32,
 }
 
 impl Default for RecurrenceSpec {
@@ -217,6 +262,7 @@ impl Default for RecurrenceSpec {
             enabled: false,
             start_layer: 0,
             repeat_layers: 0,
+            enable_at_frac: 0.0,
         }
     }
 }
@@ -289,6 +335,112 @@ impl Default for SparseAttnGateSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct AsymLogitSpec {
+    pub enabled: bool,
+    pub softcap_pos: f32,
+    pub softcap_neg: f32,
+    pub init: f32,
+}
+
+impl Default for AsymLogitSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            softcap_pos: 30.0,
+            softcap_neg: 30.0,
+            init: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TrainSeqScheduleEntry {
+    pub frac: f32,
+    pub seq_len: usize,
+}
+
+impl Default for TrainSeqScheduleEntry {
+    fn default() -> Self {
+        Self {
+            frac: 1.0,
+            seq_len: 2048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ShortDocScoreFirstEntry {
+    pub max_doc_tokens: usize,
+    pub stride: usize,
+}
+
+impl Default for ShortDocScoreFirstEntry {
+    fn default() -> Self {
+        Self {
+            max_doc_tokens: 0,
+            stride: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NgramTiltSpec {
+    pub enabled: bool,
+    pub token_order: usize,
+    pub token_threshold: f32,
+    pub token_boost: f32,
+    pub within_boost: f32,
+    pub word_boost: f32,
+    pub agree_add_boost: f32,
+    pub precompute_inside_eval_timer: bool,
+}
+
+impl Default for NgramTiltSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_order: 0,
+            token_threshold: 0.0,
+            token_boost: 0.0,
+            within_boost: 0.0,
+            word_boost: 0.0,
+            agree_add_boost: 0.0,
+            precompute_inside_eval_timer: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuntimeSpec {
+    pub record_profile: RecordProfile,
+    pub backward_chain_profile: BackwardChainProfile,
+    pub require_device_batch: bool,
+    pub token_ring_full_schedule: bool,
+    pub cuda_graph_profile: CudaGraphProfile,
+    pub nccl_overlap_mode: NcclOverlapMode,
+    pub max_ms_per_step: Option<f64>,
+}
+
+impl Default for RuntimeSpec {
+    fn default() -> Self {
+        Self {
+            record_profile: RecordProfile::Baseline,
+            backward_chain_profile: BackwardChainProfile::Off,
+            require_device_batch: false,
+            token_ring_full_schedule: false,
+            cuda_graph_profile: CudaGraphProfile::Off,
+            nccl_overlap_mode: NcclOverlapMode::Off,
+            max_ms_per_step: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ModelSpec {
     pub family: VariantFamily,
     pub attention_backend: AttentionBackend,
@@ -311,6 +463,7 @@ pub struct ModelSpec {
     pub attn_out_gate: AttnOutGateSpec,
     pub caseops: CaseOpsSpec,
     pub sparse_attn_gate: SparseAttnGateSpec,
+    pub asym_logit: AsymLogitSpec,
     pub rope: RopeSpec,
     pub smear_gate: bool,
     pub smear_gate_boundary_token_id: Option<u32>,
@@ -350,6 +503,7 @@ impl ModelSpec {
             attn_out_gate: AttnOutGateSpec::default(),
             caseops: CaseOpsSpec::default(),
             sparse_attn_gate: SparseAttnGateSpec::default(),
+            asym_logit: AsymLogitSpec::default(),
             rope: RopeSpec::default(),
             smear_gate: true,
             smear_gate_boundary_token_id: Some(1),
@@ -477,6 +631,8 @@ pub struct TrainSpec {
     pub distributed_optimizer_backend: DistributedOptimizerBackend,
     pub batch_tokens: usize,
     pub seq_len: usize,
+    pub grad_clip_norm: f32,
+    pub seq_schedule: Vec<TrainSeqScheduleEntry>,
     pub train_data_pattern: Option<String>,
     pub validation_data_pattern: Option<String>,
     pub rank: usize,
@@ -511,6 +667,8 @@ impl Default for TrainSpec {
             distributed_optimizer_backend: DistributedOptimizerBackend::AllReduceReplicatedMuon,
             batch_tokens: 524_288,
             seq_len: 2048,
+            grad_clip_norm: 0.3,
+            seq_schedule: Vec::new(),
             train_data_pattern: None,
             validation_data_pattern: None,
             rank: 0,
@@ -568,7 +726,7 @@ impl TrainSpec {
             min_lr_scale: self.min_lr_scale,
             max_wallclock_seconds: self.max_wallclock_seconds,
             train_batch_tokens: self.batch_tokens,
-            grad_clip_norm: 0.3,
+            grad_clip_norm: self.grad_clip_norm,
             ema_decay: self.ema_decay,
             swa_enabled: true,
             swa_every: 50,
@@ -663,6 +821,10 @@ pub struct EvalSpec {
     pub phased_ttt_phases: usize,
     pub phased_ttt_weight_decay: f32,
     pub ttt_beta2: f32,
+    pub ttt_seq_len: Option<usize>,
+    pub ttt_mask: TttMask,
+    pub short_doc_score_first_schedule: Vec<ShortDocScoreFirstEntry>,
+    pub ngram_tilt: NgramTiltSpec,
     pub chunk_tokens: usize,
     pub tokenizer_vocab_path: Option<String>,
     pub caseops_byte_sidecar_pattern: Option<String>,
@@ -682,6 +844,10 @@ impl Default for EvalSpec {
             phased_ttt_phases: 3,
             phased_ttt_weight_decay: 1.0,
             ttt_beta2: 0.99,
+            ttt_seq_len: None,
+            ttt_mask: TttMask::None,
+            short_doc_score_first_schedule: Vec::new(),
+            ngram_tilt: NgramTiltSpec::default(),
             chunk_tokens: 32_768,
             tokenizer_vocab_path: None,
             caseops_byte_sidecar_pattern: None,
@@ -698,6 +864,7 @@ pub struct RunSpec {
     pub train: TrainSpec,
     pub quant: QuantSpec,
     pub eval: EvalSpec,
+    pub runtime: RuntimeSpec,
     pub mode: RunMode,
     pub allow_unsupported_variants: bool,
 }
@@ -716,6 +883,7 @@ impl RunSpec {
             train: TrainSpec::default(),
             quant: QuantSpec::default(),
             eval: EvalSpec::default(),
+            runtime: RuntimeSpec::default(),
             mode: RunMode::Smoke,
             allow_unsupported_variants: false,
         }
