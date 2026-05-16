@@ -7,7 +7,8 @@ use pg_model::backward::GradBuffers;
 use pg_model::{
     AttentionBackend, BackwardChainProfile, CudaGraphProfile, DistributedOptimizerBackend,
     EvalAdaptationBackend, ExecutionPlan, ForwardBuffer, GptModel, ModelComputePrecision,
-    NcclOverlapMode, OutputCeBackend, RecordProfile, RunMode, RunSpec, TrainBackend, TttMask,
+    NcclOverlapMode, OutputCeBackend, RecordProfile, RecurrentBackwardProfile, RunMode, RunSpec,
+    TrainBackend, TttMask,
 };
 use pg_optim::adamw::{AdamW, AdamWState};
 use pg_optim::ema::{Ema, Swa};
@@ -242,6 +243,10 @@ pub struct VariantResult {
     pub wallclock_seconds: f64,
     pub timing_steps: usize,
     pub timing_measured_ms_per_step: f64,
+    pub timing_recurrent_active_steps: usize,
+    pub timing_recurrent_inactive_steps: usize,
+    pub timing_recurrent_active_ms: f64,
+    pub timing_recurrent_inactive_ms: f64,
     pub host_batch_flatten_calls: usize,
     pub host_to_device_batch_bytes: usize,
     pub device_batch_ready_steps: usize,
@@ -376,6 +381,10 @@ struct RunTiming {
     post_train_sync_ms: f64,
     artifact_export_ms: f64,
     eval_ms: f64,
+    recurrent_active_steps: usize,
+    recurrent_inactive_steps: usize,
+    recurrent_active_ms: f64,
+    recurrent_inactive_ms: f64,
     host_batch_flatten_calls: usize,
     host_to_device_batch_bytes: usize,
     device_batch_ready_steps: usize,
@@ -568,6 +577,31 @@ fn apply_string_runtime_env(
     Ok(())
 }
 
+fn apply_usize_runtime_env(
+    name: &str,
+    expected: usize,
+    record_authoritative: bool,
+) -> PgResult<()> {
+    if record_authoritative {
+        if let Ok(actual) = std::env::var(name) {
+            let actual_value = actual.parse::<usize>().map_err(|_| {
+                pg_core::PgError::InvalidOp(format!(
+                    "record mode runtime profile owns {name}; env requested non-usize {actual:?}, spec requires {expected}"
+                ))
+            })?;
+            if actual_value != expected {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record mode runtime profile owns {name}; env requested {actual_value}, spec requires {expected}"
+                )));
+            }
+        }
+        set_env_var(name, &expected.to_string());
+    } else if std::env::var_os(name).is_none() {
+        set_env_var(name, &expected.to_string());
+    }
+    Ok(())
+}
+
 fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> {
     if !is_record_shaped_mode(mode) {
         return Ok(());
@@ -659,6 +693,77 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
     apply_bool_runtime_env(
         "PG_GPU_TOKEN_RING_FULL_SCHEDULE",
         run_spec.runtime.token_ring_full_schedule,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_BIGRAM_EMBED_MERGE",
+        run_spec.runtime.bigram_embedding_merge,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_COMBINED_QKV_ROPE_TAIL_BWD",
+        run_spec.runtime.combined_qkv_rope_tail_backward,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_GRAPH_SIDE_GEMM_CAPTURE",
+        run_spec.runtime.graph_side_gemm_capture,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SHARDED_MUON_LOCAL_GRAPH",
+        run_spec.runtime.sharded_muon_local_graph,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH",
+        run_spec.runtime.sharded_muon_pre_norm_graph,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SHARDED_MUON_FUSED_GLOBAL_CLIP",
+        run_spec.runtime.sharded_muon_fused_global_clip,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER",
+        run_spec.runtime.sharded_muon_bf16_shadow_all_gather,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_RECURRENT_PASS1_STRAIGHT_THROUGH",
+        matches!(
+            run_spec.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Pass1StraightThrough
+        ),
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_RECURRENT_ALL_STRAIGHT_THROUGH",
+        matches!(
+            run_spec.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::AllStraightThrough
+        ),
+        record_authoritative,
+    )?;
+    apply_usize_runtime_env(
+        "PG_GPU_RECURRENT_STRAIGHT_THROUGH_LAYERS",
+        run_spec.runtime.recurrent_straight_through_layers,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SKIP_RECURRENT_BANK_GRADS",
+        run_spec.runtime.skip_recurrent_bank_grads,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_SKIP_RECURRENT_PASS1_BANK_GRADS",
+        run_spec.runtime.skip_recurrent_pass1_bank_grads,
+        record_authoritative,
+    )?;
+    apply_usize_runtime_env(
+        "PG_GPU_MUON_NS_STEPS",
+        run_spec.train.muon_newton_schulz_steps.max(1),
         record_authoritative,
     )?;
     apply_bool_runtime_env(
@@ -2103,15 +2208,15 @@ impl VariantRunner {
                 step,
                 max_steps,
             )?;
+            let recurrence_active = active_recurrence_for_train_step(
+                &self.run_spec,
+                step,
+                train_config.total_iterations,
+                elapsed,
+                train_config.max_wallclock_seconds,
+            );
             #[cfg(feature = "cuda")]
             {
-                let recurrence_active = active_recurrence_for_train_step(
-                    &self.run_spec,
-                    step,
-                    train_config.total_iterations,
-                    elapsed,
-                    train_config.max_wallclock_seconds,
-                );
                 if let Some(runtime) = cuda_single_fast_runtime.as_mut() {
                     set_cuda_runtime_recurrence_active(runtime, recurrence_active);
                 }
@@ -2557,8 +2662,16 @@ impl VariantRunner {
             }
             if measure_step {
                 timing.train_step_ms += train_t0.elapsed().as_secs_f64() * 1000.0;
-                timing_measured_wallclock_ms += step_wall_t0.elapsed().as_secs_f64() * 1000.0;
+                let step_wall_ms = step_wall_t0.elapsed().as_secs_f64() * 1000.0;
+                timing_measured_wallclock_ms += step_wall_ms;
                 timing_steps += 1;
+                if recurrence_active {
+                    timing.recurrent_active_steps += 1;
+                    timing.recurrent_active_ms += step_wall_ms;
+                } else {
+                    timing.recurrent_inactive_steps += 1;
+                    timing.recurrent_inactive_ms += step_wall_ms;
+                }
             }
             steps_completed = step + 1;
         }
@@ -2847,6 +2960,10 @@ impl VariantRunner {
             wallclock_seconds,
             timing_steps,
             timing_measured_ms_per_step,
+            timing_recurrent_active_steps: timing.recurrent_active_steps,
+            timing_recurrent_inactive_steps: timing.recurrent_inactive_steps,
+            timing_recurrent_active_ms: timing.recurrent_active_ms,
+            timing_recurrent_inactive_ms: timing.recurrent_inactive_ms,
             host_batch_flatten_calls: timing.host_batch_flatten_calls,
             host_to_device_batch_bytes: timing.host_to_device_batch_bytes,
             device_batch_ready_steps: timing.device_batch_ready_steps,
@@ -6096,6 +6213,38 @@ pub fn run_timing_json(result: &VariantResult) -> String {
         "timing_measured_ms_per_step",
         result.timing_measured_ms_per_step,
     ));
+    fields.push(format!(
+        "\"timing_recurrent_active_steps\":{}",
+        result.timing_recurrent_active_steps
+    ));
+    fields.push(format!(
+        "\"timing_recurrent_inactive_steps\":{}",
+        result.timing_recurrent_inactive_steps
+    ));
+    fields.push(json_f64_field(
+        "timing_recurrent_active_ms",
+        result.timing_recurrent_active_ms,
+    ));
+    fields.push(json_f64_field(
+        "timing_recurrent_inactive_ms",
+        result.timing_recurrent_inactive_ms,
+    ));
+    fields.push(json_f64_field(
+        "timing_recurrent_active_ms_per_step",
+        if result.timing_recurrent_active_steps == 0 {
+            0.0
+        } else {
+            result.timing_recurrent_active_ms / result.timing_recurrent_active_steps as f64
+        },
+    ));
+    fields.push(json_f64_field(
+        "timing_recurrent_inactive_ms_per_step",
+        if result.timing_recurrent_inactive_steps == 0 {
+            0.0
+        } else {
+            result.timing_recurrent_inactive_ms / result.timing_recurrent_inactive_steps as f64
+        },
+    ));
     let timing_steps_f = result.timing_steps.max(1) as f64;
     let per_step = |total: f64| -> f64 {
         if result.timing_steps == 0 {
@@ -6800,6 +6949,39 @@ fn record_path_audit_json(
         &format!("{:?}", run_spec.runtime.backward_chain_profile),
     ));
     fields.push(json_str_field(
+        "recurrent_backward_profile",
+        &format!("{:?}", run_spec.runtime.recurrent_backward_profile),
+    ));
+    fields.push(format!(
+        "\"runtime_recurrent_straight_through_layers\":{}",
+        run_spec.runtime.recurrent_straight_through_layers
+    ));
+    fields.push(format!(
+        "\"runtime_skip_recurrent_bank_grads\":{}",
+        run_spec.runtime.skip_recurrent_bank_grads
+    ));
+    fields.push(format!(
+        "\"runtime_skip_recurrent_pass1_bank_grads\":{}",
+        run_spec.runtime.skip_recurrent_pass1_bank_grads
+    ));
+    fields.push(format!(
+        "\"recurrent_pass1_forward_bf16_cache\":{}",
+        run_spec.model.recurrence.enabled
+            && run_spec.runtime.backward_chain_profile != BackwardChainProfile::Off
+    ));
+    fields.push(json_str_field(
+        "recurrent_pass1_forward_cache_semantics",
+        "bf16_prepack_no_f32_backward_acts_when_st",
+    ));
+    fields.push(format!(
+        "\"recurrence_active_required\":{}",
+        run_spec.runtime.recurrence_active_required
+    ));
+    fields.push(format!(
+        "\"recurrent_active_steps_min\":{}",
+        run_spec.runtime.recurrent_active_steps_min
+    ));
+    fields.push(json_str_field(
         "cuda_graph_profile",
         &format!("{:?}", run_spec.runtime.cuda_graph_profile),
     ));
@@ -6814,6 +6996,66 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"runtime_token_ring_full_schedule\":{}",
         run_spec.runtime.token_ring_full_schedule
+    ));
+    fields.push(format!(
+        "\"runtime_bigram_embedding_merge\":{}",
+        run_spec.runtime.bigram_embedding_merge
+    ));
+    fields.push(format!(
+        "\"runtime_combined_qkv_rope_tail_backward\":{}",
+        run_spec.runtime.combined_qkv_rope_tail_backward
+    ));
+    fields.push(format!(
+        "\"runtime_graph_side_gemm_capture\":{}",
+        run_spec.runtime.graph_side_gemm_capture
+    ));
+    fields.push(format!(
+        "\"runtime_sharded_muon_local_graph\":{}",
+        run_spec.runtime.sharded_muon_local_graph
+    ));
+    fields.push(format!(
+        "\"runtime_sharded_muon_pre_norm_graph\":{}",
+        run_spec.runtime.sharded_muon_pre_norm_graph
+    ));
+    fields.push(format!(
+        "\"runtime_sharded_muon_fused_global_clip\":{}",
+        run_spec.runtime.sharded_muon_fused_global_clip
+    ));
+    fields.push(format!(
+        "\"runtime_sharded_muon_bf16_shadow_all_gather\":{}",
+        run_spec.runtime.sharded_muon_bf16_shadow_all_gather
+    ));
+    fields.push(json_str_field(
+        "gpu_lora_targets",
+        &run_spec.eval.ttt_lora_targets.label(),
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_lm_head\":{}",
+        run_spec.eval.ttt_lora_targets.lm_head
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_q\":{}",
+        run_spec.eval.ttt_lora_targets.q
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_k\":{}",
+        run_spec.eval.ttt_lora_targets.k
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_v\":{}",
+        run_spec.eval.ttt_lora_targets.v
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_o\":{}",
+        run_spec.eval.ttt_lora_targets.o
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_mlp\":{}",
+        run_spec.eval.ttt_lora_targets.mlp
+    ));
+    fields.push(format!(
+        "\"gpu_lora_targets_runtime_supported\":{}",
+        run_spec.eval.ttt_lora_targets.rust_gpu_runtime_supported()
     ));
     fields.push(format!(
         "\"bf16_backward_chain_requested\":{}",
@@ -8605,13 +8847,40 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
             if run_spec.eval.ttt_mask != TttMask::NoQv {
                 gaps.push("frontier_2014_clean requires no_qv TTT masking");
             }
+            if run_spec.eval.ttt_lora_targets
+                != pg_model::spec::TttLoraTargetsSpec::upstream_pr2014_no_qv()
+            {
+                gaps.push("frontier_2014_clean requires upstream no_qv LoRA targets: lm_head,k,o,mlp enabled and q/v disabled");
+            }
             if run_spec.eval.phased_ttt_phases != 1 {
                 gaps.push("frontier_2014_clean requires one score-first TTT phase");
+            }
+            if !run_spec.model.bigram.enabled {
+                gaps.push("frontier_2014_clean requires BigramHash enabled");
+            }
+            if run_spec.model.bigram.enabled && !run_spec.runtime.bigram_embedding_merge {
+                gaps.push("frontier_2014_clean requires runtime.bigram_embedding_merge=true so BigramHash does not add an unfused forward pass");
             }
         }
         RecordProfile::Frontier2135Audit => {
             if (run_spec.model.qk_gain_init - 5.0).abs() > f32::EPSILON {
                 gaps.push("frontier_2135_audit requires qk_gain_init=5.0");
+            }
+            if (run_spec.model.recurrence.enable_at_frac - 0.35).abs() > 1e-6 {
+                gaps.push("frontier_2135_audit requires recurrence enable_at_frac=0.35; late recurrence is a speed probe, not a quality record target");
+            }
+            if run_spec.model.recurrence.enable_at_step != Some(1748) {
+                gaps.push("frontier_2135_audit requires recurrence enable_at_step=1748 so active-recurrence timing and BPB evidence are reproducible");
+            }
+            if run_spec.model.recurrence.start_layer != 3
+                || run_spec.model.recurrence.repeat_layers != 3
+            {
+                gaps.push("frontier_2135_audit requires recurrence over layers 3-5");
+            }
+            if run_spec.model.parallel_residual.start_layer != 8 {
+                gaps.push(
+                    "frontier_2135_audit requires decoder-only parallel residual from layer 8",
+                );
             }
             if run_spec.model.bigram.enabled {
                 gaps.push(
@@ -8620,6 +8889,22 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
             }
             if run_spec.model.eval_seq_len < 2560 || run_spec.eval.ttt_seq_len != Some(2560) {
                 gaps.push("frontier_2135_audit requires 2560-token eval/TTT context");
+            }
+            if run_spec.eval.ttt_mask != TttMask::KOff {
+                gaps.push("frontier_2135_audit requires K-off TTT masking");
+            }
+            if run_spec.eval.ttt_lora_targets
+                != pg_model::spec::TttLoraTargetsSpec::upstream_pr2135()
+            {
+                gaps.push("frontier_2135_audit requires upstream PR2135 LoRA targets: lm_head,q,v,o,mlp enabled and k disabled");
+            }
+            if run_spec
+                .eval
+                .lora_lr
+                .map(|value| (value - 0.00008).abs() > 1e-9)
+                .unwrap_or(true)
+            {
+                gaps.push("frontier_2135_audit requires eval.lora_lr=8e-5; using the training matrix LR for LoRA-TTT is not PR2135-compatible");
             }
             if run_spec.quant.gptq_calibration_batches != 32 {
                 gaps.push("frontier_2135_audit requires GPTQ calibration batches=32");
@@ -8634,6 +8919,9 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
                 gaps.push("frontier_2135_audit requires token-only n-gram tilt with within/word/agreement channels disabled");
             }
         }
+        RecordProfile::Frontier2135SpeedProbe => {
+            gaps.push("frontier_2135_speed_probe is diagnostic only and is not a leaderboard-quality record target");
+        }
     }
     if matches!(
         run_spec.runtime.record_profile,
@@ -8644,6 +8932,35 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         }
         if !run_spec.runtime.require_device_batch || !run_spec.runtime.token_ring_full_schedule {
             gaps.push("frontier record targets require device-batch and full-schedule token-ring runtime ownership");
+        }
+        if !run_spec.runtime.recurrence_active_required {
+            gaps.push("frontier record targets require runtime.recurrence_active_required=true so speed-only inactive-recurrence runs cannot pass as quality records");
+        }
+        if run_spec.runtime.recurrent_active_steps_min == 0 {
+            gaps.push("frontier record targets require runtime.recurrent_active_steps_min>0");
+        }
+        if run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased
+            && !run_spec.eval.ttt_lora_targets.rust_gpu_runtime_supported()
+        {
+            gaps.push("Rust GPU LoRA-TTT currently implements q-only adapters; requested frontier LoRA targets are not yet implemented in the Rust runtime");
+        }
+        if pg_quant::layout::compiled_layout_for_quant_spec(&run_spec.quant).is_none() {
+            gaps.push(
+                "frontier record targets require QuantSpec to match a compiled quantization layout",
+            );
+        }
+        if matches!(
+            run_spec.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Pass1StraightThrough
+                | RecurrentBackwardProfile::AllStraightThrough
+        ) {
+            gaps.push("frontier record targets cannot use straight-through recurrent backward without separate BPB validation; keep it as a speed probe");
+        }
+        if run_spec.runtime.skip_recurrent_pass1_bank_grads {
+            gaps.push("frontier record targets cannot skip recurrent pass-1 bank gradients without separate BPB validation; keep it as a speed probe");
+        }
+        if run_spec.runtime.skip_recurrent_bank_grads {
+            gaps.push("frontier record targets cannot skip recurrent bank gradients without separate BPB validation; keep it as a speed probe");
         }
     }
     if !run_spec.model.caseops.enabled || !run_spec.model.caseops.byte_sidecar {
@@ -9007,6 +9324,9 @@ fn active_recurrence_for_train_step(
 ) -> bool {
     if !run_spec.model.recurrence.enabled {
         return false;
+    }
+    if let Some(enable_at_step) = run_spec.model.recurrence.enable_at_step {
+        return step + 1 >= enable_at_step;
     }
     let threshold = run_spec.model.recurrence.enable_at_frac;
     if threshold <= 0.0 {
@@ -11335,6 +11655,106 @@ mod tests {
 
         assert!(!active_recurrence_for_train_step(&spec, 33, 100, 0.0, 0.0));
         assert!(active_recurrence_for_train_step(&spec, 34, 100, 0.0, 0.0));
+    }
+
+    #[test]
+    fn recurrence_activation_prefers_explicit_step_gate() {
+        let mut spec = RunSpec::default();
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.enable_at_frac = 0.35;
+        spec.model.recurrence.enable_at_step = Some(1748);
+
+        assert!(!active_recurrence_for_train_step(
+            &spec, 1746, 4994, 300.0, 600.0
+        ));
+        assert!(active_recurrence_for_train_step(
+            &spec, 1747, 4994, 0.0, 600.0
+        ));
+    }
+
+    #[test]
+    fn frontier2135_quality_profile_rejects_speed_only_recurrence() {
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135Audit;
+        spec.runtime.backward_chain_profile = BackwardChainProfile::Bf16DirectCompact;
+        spec.runtime.require_device_batch = true;
+        spec.runtime.token_ring_full_schedule = true;
+        spec.runtime.recurrence_active_required = true;
+        spec.runtime.recurrent_active_steps_min = 2000;
+        spec.model.qk_gain_init = 5.0;
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.start_layer = 3;
+        spec.model.recurrence.repeat_layers = 3;
+        spec.model.recurrence.enable_at_frac = 0.35;
+        spec.model.recurrence.enable_at_step = Some(1748);
+        spec.model.parallel_residual.enabled = true;
+        spec.model.parallel_residual.split_attention_mlp = true;
+        spec.model.parallel_residual.start_layer = 8;
+        spec.model.bigram.enabled = false;
+        spec.model.eval_seq_len = 2560;
+        spec.eval.ttt_seq_len = Some(2560);
+        spec.eval.ttt_mask = TttMask::KOff;
+        spec.eval.ttt_lora_targets = pg_model::spec::TttLoraTargetsSpec::upstream_pr2135();
+        spec.eval.adaptation_backend = EvalAdaptationBackend::GpuLoraPhased;
+        spec.eval.lora_lr = Some(0.00008);
+        spec.quant.gptq_calibration_batches = 32;
+        spec.quant.matrix_bits = 6;
+        spec.quant.mlp_bits = 6;
+        spec.quant.embed_bits = 7;
+        spec.model.asym_logit.enabled = true;
+        spec.eval.ngram_tilt.enabled = true;
+        spec.eval.ngram_tilt.token_boost = 1.0;
+        spec.eval.ngram_tilt.within_boost = 0.0;
+        spec.eval.ngram_tilt.word_boost = 0.0;
+        spec.eval.ngram_tilt.agree_add_boost = 0.0;
+        spec.model.caseops.enabled = true;
+        spec.model.caseops.byte_sidecar = true;
+        spec.eval.caseops_byte_sidecar_pattern = Some("/tmp/bytes_*.bin".into());
+        spec.model.sparse_attn_gate.enabled = true;
+        spec.model.sparse_attn_gate.width = 12;
+        spec.model.smear_gate = true;
+        spec.model.smear_gate_boundary_token_id = Some(1);
+        spec.quant.lqer.enabled = true;
+
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            gaps.is_empty(),
+            "fully specified frontier_2135 audit profile should have no algorithm gaps: {gaps:?}"
+        );
+
+        spec.runtime.recurrent_backward_profile = RecurrentBackwardProfile::Pass1StraightThrough;
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("straight-through recurrent backward")),
+            "pass1 straight-through recurrence must be marked as a speed probe until BPB validates it: {gaps:?}"
+        );
+
+        spec.runtime.recurrent_backward_profile = RecurrentBackwardProfile::Full;
+        spec.runtime.skip_recurrent_bank_grads = true;
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("skip recurrent bank gradients")),
+            "skipping recurrent bank gradients must stay marked as a speed probe until BPB validates it: {gaps:?}"
+        );
+
+        spec.runtime.skip_recurrent_bank_grads = false;
+        spec.runtime.skip_recurrent_pass1_bank_grads = true;
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("skip recurrent pass-1 bank gradients")),
+            "skipping pass-1 recurrent bank gradients must stay marked as a speed probe until BPB validates it: {gaps:?}"
+        );
+
+        spec.runtime.skip_recurrent_pass1_bank_grads = false;
+        spec.model.recurrence.enable_at_frac = 0.999;
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("late recurrence")),
+            "late-recurrence speed probes must not pass as frontier_2135 quality targets: {gaps:?}"
+        );
     }
 
     #[test]

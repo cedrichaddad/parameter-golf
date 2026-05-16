@@ -20,8 +20,13 @@ RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https:
 # failures during H100 validation image rebuilds.
 RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev ca-certificates && \
     export RUSTUP_INIT_SKIP_PATH_CHECK=yes && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain stable
+    for attempt in 1 2 3 4 5; do \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable && break; \
+        rm -rf /root/.rustup/downloads/*.partial; \
+        if [ "$attempt" = "5" ]; then exit 1; fi; \
+        sleep $((attempt * 5)); \
+    done
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install NCCL/cuDNN matching the CUDA 12.8 base image. Falling through to the
@@ -41,14 +46,10 @@ RUN curl -L https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.22.0.t
 
 WORKDIR /build
 
-# Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-
-# Fetch dependencies in the image, but compile pg-train inside the Modal worker.
-# This keeps image finalization short during rapid CUDA iteration; the timing
-# harness measures only the subprocess training step, not the pre-run compile.
-RUN cargo fetch
+# The repository is mounted into /build by Modal at function startup and
+# compiled into a persistent /build/target volume. Do not copy source or run
+# `cargo fetch` in the image: doing so invalidates the whole CUDA/Rust base
+# image on every kernel edit and makes H100 iteration hostage to image rebuilds.
 
 # === Runtime stage ===
 # Use the builder image as the runtime while iterating so the remote function

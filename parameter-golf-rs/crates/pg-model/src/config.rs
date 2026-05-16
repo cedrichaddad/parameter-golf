@@ -21,11 +21,14 @@ pub struct ModelConfig {
     // Attention modifications
     pub xsa_last_n: usize, // XSA on last N layers
     pub logit_softcap: f32,
+    pub logit_softcap_pos: f32,
+    pub logit_softcap_neg: f32,
     pub qk_gain_init: f32,
     pub recurrence_enabled: bool,
     pub recurrence_start_layer: usize,
     pub recurrence_repeat_layers: usize,
     pub parallel_residual: bool,
+    pub parallel_residual_start_layer: usize,
     pub attn_out_gate_enabled: bool,
     pub attn_out_gate_width: usize,
     pub sparse_attn_gate_enabled: bool,
@@ -80,11 +83,14 @@ impl ModelConfig {
 
             xsa_last_n: 4,
             logit_softcap: 30.0,
+            logit_softcap_pos: 30.0,
+            logit_softcap_neg: 30.0,
             qk_gain_init: 1.5,
             recurrence_enabled: false,
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            parallel_residual_start_layer: 0,
             attn_out_gate_enabled: false,
             attn_out_gate_width: 24,
             sparse_attn_gate_enabled: false,
@@ -119,6 +125,10 @@ impl ModelConfig {
         self.recurrence_enabled
             && layer >= self.recurrence_start_layer
             && layer < self.recurrence_start_layer + self.recurrence_repeat_layers
+    }
+
+    pub fn parallel_residual_enabled_for_layer(&self, layer: usize) -> bool {
+        self.parallel_residual && layer >= self.parallel_residual_start_layer
     }
 
     /// Number of encoder layers (first half, for U-Net).

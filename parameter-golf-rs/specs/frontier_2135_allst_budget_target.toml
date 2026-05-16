@@ -1,8 +1,13 @@
-# Primary audited frontier target based on the PR #2135 / May 1 audit shape.
+# Throughput candidate based on the PR #2135 / May 1 audit shape.
+#
+# This keeps the algorithmic #2135 knobs but uses the measured all-straight-through
+# recurrent backward profile and budget-oriented export bit widths. It is the
+# current <=120 ms/step systems candidate and must be BPB-validated before it can
+# replace frontier_2135_audit_target.toml as the primary record spec.
 
-name = "frontier_2135_audit_target"
+name = "frontier_2135_allst_budget_target"
 mode = "record"
-allow_unsupported_variants = false
+allow_unsupported_variants = true
 
 [model]
 family = "frontier_1855_like"
@@ -45,7 +50,6 @@ enabled = true
 start_layer = 3
 repeat_layers = 3
 enable_at_frac = 0.35
-enable_at_step = 1748
 
 [model.parallel_residual]
 enabled = true
@@ -117,9 +121,9 @@ seq_len = 1024
 scheme = "mixed_int5_int6"
 calibration = "self_generated"
 compression = "pergroup"
-matrix_bits = 6
-mlp_bits = 6
-embed_bits = 7
+matrix_bits = 5
+mlp_bits = 4
+embed_bits = 6
 attn_gate_bits = 8
 mlp_clip_sigmas = 11.5
 attn_clip_sigmas = 13.0
@@ -176,11 +180,11 @@ agree_add_boost = 0.0
 precompute_inside_eval_timer = true
 
 [runtime]
-record_profile = "frontier2135_audit"
+record_profile = "frontier2135_speed_probe"
 backward_chain_profile = "bf16_direct_compact"
-recurrent_backward_profile = "full"
-recurrence_active_required = true
-recurrent_active_steps_min = 2000
+recurrent_backward_profile = "all_straight_through"
+recurrence_active_required = false
+recurrent_active_steps_min = 0
 require_device_batch = true
 token_ring_full_schedule = true
 cuda_graph_profile = "record_step_no_loss"

@@ -82,6 +82,21 @@ STAGE_ROWS_PER_STEP: tuple[str, ...] = (
     "timing_eval_ms_per_step",
 )
 
+AUDIT_ROWS: tuple[str, ...] = (
+    "timing_recurrent_active_steps",
+    "timing_recurrent_inactive_steps",
+    "cuda_backward_graph_launches_active",
+    "cuda_backward_graph_launches_inactive",
+    "cuda_backward_graph_captures_active",
+    "cuda_backward_graph_captures_inactive",
+    "cuda_backward_graph_warmups_active",
+    "cuda_backward_graph_warmups_inactive",
+    "cuda_backward_graph_resets",
+    "backward_nccl_bucket_overlap_windows",
+    "backward_nccl_bucket_overlap_confirmed",
+    "backward_nccl_bucket_overlap_max_window_ms",
+)
+
 RUN_TIMING_PREFIX = "run_timing_json="
 
 
@@ -197,6 +212,9 @@ def _run_one(
             effective_flags = f"{flags} --result-json {shlex.quote(str(result_json_path))}"
     if remote:
         tokens = shlex.split(effective_flags)
+        if "--modal-wait" not in tokens:
+            effective_flags = f"--modal-wait {effective_flags}"
+            tokens = shlex.split(effective_flags)
         if "--record-timing-skip-steps" not in tokens:
             effective_flags = f"{effective_flags} --record-timing-skip-steps {max(0, warmup_steps)}"
         if (
@@ -382,6 +400,19 @@ def main() -> int:
         b_med, b_p90, b_mean = _stat(b)
         c_med, c_p90, c_mean = _stat(c)
         summary[stage] = {
+            "baseline": {"median": b_med, "p90": b_p90, "mean": b_mean, "n": len(b)},
+            "candidate": {"median": c_med, "p90": c_p90, "mean": c_mean, "n": len(c)},
+            "delta_median": c_med - b_med,
+        }
+    for field in AUDIT_ROWS:
+        b = _gather(baseline_runs, field)
+        c = _gather(candidate_runs, field)
+        if not b and not c:
+            continue
+        print(_format_row(field, b, c))
+        b_med, b_p90, b_mean = _stat(b)
+        c_med, c_p90, c_mean = _stat(c)
+        summary[field] = {
             "baseline": {"median": b_med, "p90": b_p90, "mean": b_mean, "n": len(b)},
             "candidate": {"median": c_med, "p90": c_p90, "mean": c_mean, "n": len(c)},
             "delta_median": c_med - b_med,

@@ -11,7 +11,53 @@ use pg_model::{ExecutionPlan, GptModel};
 use crate::sliding::build_ttt_chunks;
 
 #[cfg(feature = "cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
+
+#[cfg(feature = "cuda")]
+struct GpuLoraEvalRuntimeEnvGuard {
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuLoraEvalRuntimeEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.iter().rev() {
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn configure_gpu_lora_eval_runtime() -> GpuLoraEvalRuntimeEnvGuard {
+    // GPU LoRA TTT uses an F32 Q-path backward that is intentionally separate
+    // from the record training BF16 backward chain. Keep this eval-only so the
+    // training hot path can retain lean BF16 saved activations.
+    let names = [
+        "PG_GPU_BF16_BACKWARD_CHAIN",
+        "PG_GPU_BF16_BACKWARD_CHAIN_STRICT",
+        "PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS",
+        "PG_GPU_SHAPE_TRACE",
+    ];
+    let previous = names
+        .iter()
+        .map(|&name| (name, std::env::var(name).ok()))
+        .collect::<Vec<_>>();
+    unsafe {
+        std::env::set_var("PG_GPU_BF16_BACKWARD_CHAIN", "0");
+        std::env::set_var("PG_GPU_BF16_BACKWARD_CHAIN_STRICT", "0");
+        std::env::set_var("PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS", "1");
+        std::env::set_var("PG_GPU_SHAPE_TRACE", "1");
+    }
+    GpuLoraEvalRuntimeEnvGuard { previous }
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
@@ -27,6 +73,211 @@ pub struct GpuLoraPhasedTttConfig {
     pub weight_decay: f32,
     pub beta2: f32,
     pub lr: f32,
+    pub lora_targets: pg_model::spec::TttLoraTargetsSpec,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+struct NgramTiltHints {
+    hint_ids: Vec<u32>,
+    gate_mask: Vec<bool>,
+    boost: Vec<f32>,
+    gated_count: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+struct NgramCtxStats {
+    total: u32,
+    top_count: u32,
+    top_tok: u16,
+}
+
+#[cfg(feature = "cuda")]
+const NGRAM_COEFFS: [u64; 32] = [
+    36313, 27191, 51647, 81929, 131071, 196613, 262147, 393241, 524309, 655373, 786433, 917521,
+    1048583, 1179653, 1310729, 1441801, 1572869, 1703941, 1835017, 1966087, 2097169, 2228243,
+    2359319, 2490389, 2621471, 2752549, 2883617, 3014687, 3145757, 3276833, 3407903, 3538973,
+];
+
+#[cfg(feature = "cuda")]
+const NGRAM_PAIR_MIX: u64 = 1_000_003;
+
+#[cfg(feature = "cuda")]
+impl NgramTiltHints {
+    fn build(plan: &ExecutionPlan, val_tokens: &[u32]) -> PgResult<Option<Self>> {
+        let spec = &plan.run_spec.eval.ngram_tilt;
+        if !spec.enabled {
+            return Ok(None);
+        }
+        if spec.within_boost != 0.0 || spec.word_boost != 0.0 || spec.agree_add_boost != 0.0 {
+            return Err(PgError::InvalidOp(
+                "Rust GPU LoRA eval currently implements the PR #2135 token-only n-gram tilt; within-word, word-start, and agreement boosts must be zero".into(),
+            ));
+        }
+        if val_tokens.len() < 2 {
+            return Ok(Some(Self {
+                hint_ids: Vec::new(),
+                gate_mask: Vec::new(),
+                boost: Vec::new(),
+                gated_count: 0,
+            }));
+        }
+        if plan.run_spec.model.vocab_size > u16::MAX as usize + 1 {
+            return Err(PgError::InvalidOp(format!(
+                "token-only n-gram tilt expects u16 token ids, got vocab_size={}",
+                plan.run_spec.model.vocab_size
+            )));
+        }
+
+        let target_tokens = val_tokens
+            .get(1..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|&tok| {
+                if tok > u16::MAX as u32 {
+                    Err(PgError::InvalidOp(format!(
+                        "token id {tok} exceeds u16 range for n-gram tilt"
+                    )))
+                } else {
+                    Ok(tok as u16)
+                }
+            })
+            .collect::<PgResult<Vec<_>>>()?;
+        let total = target_tokens.len();
+        let mut hints = vec![0u32; total];
+        let mut gates = vec![false; total];
+        let mut boosts = vec![0.0f32; total];
+        if total == 0 {
+            return Ok(Some(Self {
+                hint_ids: hints,
+                gate_mask: gates,
+                boost: boosts,
+                gated_count: 0,
+            }));
+        }
+
+        let ctx_len = spec.token_order.saturating_sub(1);
+        let mut ring = vec![0u16; ctx_len.max(1)];
+        let mut prefix_len = 0usize;
+        let mut head = 0usize;
+        let mut ctx_table: HashMap<u64, NgramCtxStats> = HashMap::with_capacity(total / 2);
+        let mut pair_table: HashMap<u64, u32> = HashMap::with_capacity(total / 2);
+
+        push_ngram_token(
+            &mut ring,
+            ctx_len,
+            &mut prefix_len,
+            &mut head,
+            target_tokens[0],
+        );
+
+        let threshold = spec.token_threshold;
+        let token_boost = spec.token_boost;
+        let mut gated_count = 0usize;
+        for (idx, &tok) in target_tokens.iter().enumerate() {
+            let ctx_ready = ctx_len == 0 || prefix_len >= ctx_len;
+            let ctx_key = if ctx_ready {
+                token_context_hash(&ring, ctx_len, head)
+            } else {
+                0
+            };
+            if ctx_ready {
+                if let Some(stats) = ctx_table.get(&ctx_key) {
+                    let prob = stats.top_count as f32 / stats.total.max(1) as f32;
+                    if prob >= threshold {
+                        hints[idx] = stats.top_tok as u32;
+                        gates[idx] = true;
+                        boosts[idx] = token_boost;
+                        gated_count += 1;
+                    }
+                }
+                let pair_key = token_pair_key(ctx_key, tok, ctx_len);
+                let pair_count = pair_table
+                    .entry(pair_key)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+                let pair_count = *pair_count;
+                ctx_table
+                    .entry(ctx_key)
+                    .and_modify(|stats| {
+                        stats.total = stats.total.saturating_add(1);
+                        if pair_count > stats.top_count {
+                            stats.top_count = pair_count;
+                            stats.top_tok = tok;
+                        }
+                    })
+                    .or_insert(NgramCtxStats {
+                        total: 1,
+                        top_count: pair_count,
+                        top_tok: tok,
+                    });
+            }
+            push_ngram_token(&mut ring, ctx_len, &mut prefix_len, &mut head, tok);
+        }
+
+        println!(
+            "ngram_tilt_json={{\"event\":\"precompute_done\",\"implementation\":\"rust_token_only\",\"total_targets\":{},\"gated\":{},\"token_gate\":{},\"within_gate\":0,\"word_gate\":0,\"agree2plus\":0,\"token_order\":{},\"token_threshold\":{:.6},\"token_boost\":{:.6}}}",
+            total,
+            gated_count,
+            gated_count,
+            spec.token_order,
+            spec.token_threshold,
+            spec.token_boost,
+        );
+        Ok(Some(Self {
+            hint_ids: hints,
+            gate_mask: gates,
+            boost: boosts,
+            gated_count,
+        }))
+    }
+
+    fn has_gate_in_scored_window(&self, start: usize, end: usize) -> bool {
+        self.gate_mask
+            .get(start..end.min(self.gate_mask.len()))
+            .map(|slice| slice.iter().any(|&gate| gate))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn token_context_hash(ring: &[u16], ctx_len: usize, head: usize) -> u64 {
+    if ctx_len == 0 {
+        return 0;
+    }
+    let mut h = 0u64;
+    for j in 0..ctx_len {
+        let ring_idx = (head + j) % ctx_len;
+        h ^= (ring[ring_idx] as u64) * NGRAM_COEFFS[j % NGRAM_COEFFS.len()];
+    }
+    h
+}
+
+#[cfg(feature = "cuda")]
+fn token_pair_key(ctx_key: u64, tok: u16, ctx_len: usize) -> u64 {
+    (ctx_key.wrapping_mul(NGRAM_PAIR_MIX))
+        ^ ((tok as u64).wrapping_mul(NGRAM_COEFFS[ctx_len % NGRAM_COEFFS.len()]))
+}
+
+#[cfg(feature = "cuda")]
+fn push_ngram_token(
+    ring: &mut [u16],
+    ctx_len: usize,
+    prefix_len: &mut usize,
+    head: &mut usize,
+    tok: u16,
+) {
+    if ctx_len == 0 {
+        return;
+    }
+    if *prefix_len < ctx_len {
+        ring[*prefix_len] = tok;
+        *prefix_len += 1;
+    } else {
+        ring[*head] = tok;
+        *head = (*head + 1) % ctx_len;
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -49,10 +300,11 @@ impl GpuLoraPhasedTttConfig {
             phases: plan.eval_plan.phased_ttt_phases.max(1),
             weight_decay: plan.eval_plan.phased_ttt_weight_decay,
             beta2: plan.eval_plan.ttt_beta2,
-            // The frontier LoRA-TTT recipes tune this with the matrix-update
-            // learning rate. Keeping it spec-driven prevents eval-time
-            // adaptation from silently diverging from the record config.
-            lr: plan.run_spec.train.matrix_lr,
+            lr: plan
+                .eval_plan
+                .lora_lr
+                .unwrap_or(plan.run_spec.train.matrix_lr),
+            lora_targets: plan.eval_plan.ttt_lora_targets.clone(),
         }
     }
 }
@@ -78,20 +330,21 @@ pub fn eval_gpu_lora_phased_ttt(
     if val_tokens.len() < 2 {
         return Ok((0.0, 0.0));
     }
+    let _runtime_env = configure_gpu_lora_eval_runtime();
     let audit = ttt_audit_enabled();
     let ctx = cudarc::driver::CudaContext::new(0)
         .map_err(|e| PgError::InvalidOp(format!("CUDA context init failed: {e:?}")))?;
     let stream = ctx.default_stream();
     let mut model = GpuModel::from_cpu_reference(cpu_model, plan, ctx, stream.clone())?;
-    model.enable_q_lora(cfg.lora_rank, cfg.lora_alpha)?;
+    model.enable_ttt_lora_targets(&cfg.lora_targets, cfg.lora_rank, cfg.lora_alpha)?;
 
     let seq_len = cfg.seq_len.min(val_tokens.len() - 1).max(1);
     let mut input_gpu = GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::U32)?;
     let mut target_gpu = GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::U32)?;
     let losses_gpu = GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::F32)?;
     let mut loss_sum_gpu = GpuTensor::zeros_gpu(stream.clone(), &[1], DType::F32)?;
-    let mut activations = GpuActivations::new_for_plan(plan, seq_len, stream.clone())?;
-    let mut backward_state = GpuBackwardState::new_for_plan(plan, seq_len, stream.clone())?;
+    let mut activations = GpuActivations::new_for_plan_for_ttt(plan, seq_len, stream.clone())?;
+    let mut backward_state = GpuBackwardState::new_for_plan_for_ttt(plan, seq_len, stream.clone())?;
     let mut grads = GpuGradBuffers::new(&cpu_model.config, stream.clone())?;
     let mut host_workspace = GpuLoraHostWorkspace::new(seq_len);
 
@@ -112,9 +365,10 @@ pub fn eval_gpu_lora_phased_ttt(
     };
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
     let deadline = TttEvalDeadline::from_env();
+    let ngram_tilt = NgramTiltHints::build(plan, val_tokens)?;
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_ttt_chunk\"}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
             mutation_guard,
             total_tokens,
             seq_len,
@@ -123,6 +377,9 @@ pub fn eval_gpu_lora_phased_ttt(
             num_chunks,
             cfg.lora_rank,
             cfg.lora_alpha,
+            cfg.lr,
+            cfg.lora_targets.label(),
+            cfg.lora_targets.rust_gpu_runtime_supported(),
             cfg.phases,
             cfg.prefix_docs,
             prefix_docs_seen,
@@ -136,6 +393,16 @@ pub fn eval_gpu_lora_phased_ttt(
             model.uses_chunked_bf16_output_ce_cache(),
             !model.uses_tiled_output_ce() && !model.uses_chunked_bf16_output_ce_cache(),
             model.uses_tiled_output_ce() || model.uses_chunked_bf16_output_ce_cache(),
+            if ngram_tilt.is_some() {
+                "one_per_ttt_chunk_or_tilted_window"
+            } else {
+                "one_per_ttt_chunk"
+            },
+            ngram_tilt.is_some(),
+            ngram_tilt
+                .as_ref()
+                .map(|tilt| tilt.gated_count)
+                .unwrap_or(0),
         );
     }
     let mut total_loss = 0.0f64;
@@ -173,6 +440,7 @@ pub fn eval_gpu_lora_phased_ttt(
             &mut activations,
             &mut backward_state,
             &mut host_workspace,
+            ngram_tilt.as_ref(),
         )?;
         if let Some(before) = lora_state_before_score.as_ref() {
             assert_q_lora_state_unchanged(&model.q_lora_state_to_host()?, before, ci, 0)?;
@@ -266,6 +534,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
     if world_size <= 1 {
         return eval_gpu_lora_phased_ttt(cpu_model, plan, val_tokens, base_bytes, cfg);
     }
+    let _runtime_env = configure_gpu_lora_eval_runtime();
     if !plan.eval_plan.legal_score_first {
         return Err(PgError::InvalidOp(
             "distributed gpu_lora_phased_ttt requires legal_score_first=true".into(),
@@ -317,9 +586,10 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
     };
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
     let deadline = TttEvalDeadline::from_env();
+    let ngram_tilt = NgramTiltHints::build(plan, val_tokens)?;
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"one_per_rank_per_ttt_chunk\"}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
             world_size,
             mutation_guard,
             total_tokens,
@@ -329,6 +599,9 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
             num_chunks,
             cfg.lora_rank,
             cfg.lora_alpha,
+            cfg.lr,
+            cfg.lora_targets.label(),
+            cfg.lora_targets.rust_gpu_runtime_supported(),
             cfg.phases,
             cfg.prefix_docs,
             prefix_docs_seen,
@@ -344,6 +617,16 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
                 && !replicas[0].model.uses_chunked_bf16_output_ce_cache(),
             replicas[0].model.uses_tiled_output_ce()
                 || replicas[0].model.uses_chunked_bf16_output_ce_cache(),
+            if ngram_tilt.is_some() {
+                "one_per_rank_per_ttt_chunk_or_tilted_window"
+            } else {
+                "one_per_rank_per_ttt_chunk"
+            },
+            ngram_tilt.is_some(),
+            ngram_tilt
+                .as_ref()
+                .map(|tilt| tilt.gated_count)
+                .unwrap_or(0),
         );
     }
 
@@ -377,12 +660,19 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
         for (wi, &window_start) in chunk.windows.iter().enumerate() {
             windows_by_rank[wi % world_size].push(window_start);
         }
+        let ngram_tilt_ref = ngram_tilt.as_ref();
         let shard_results: PgResult<Vec<(f64, u64, f64)>> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(world_size);
             for (rank, replica) in replicas.iter_mut().enumerate() {
                 let windows = windows_by_rank[rank].clone();
                 handles.push(scope.spawn(move || {
-                    replica.score_windows(val_tokens, base_bytes, &windows, cfg.stride)
+                    replica.score_windows(
+                        val_tokens,
+                        base_bytes,
+                        &windows,
+                        cfg.stride,
+                        ngram_tilt_ref,
+                    )
                 }));
             }
             let mut results = Vec::with_capacity(world_size);
@@ -866,6 +1156,7 @@ fn ttt_audit_enabled() -> bool {
 struct GpuLoraHostWorkspace {
     input: Vec<u32>,
     target: Vec<u32>,
+    hint: Vec<u32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -899,7 +1190,7 @@ impl GpuLoraEvalReplica {
         })?;
         let stream = ctx.default_stream();
         let mut model = GpuModel::from_cpu_reference(cpu_model, plan, ctx, stream.clone())?;
-        model.enable_q_lora(cfg.lora_rank, cfg.lora_alpha)?;
+        model.enable_ttt_lora_targets(&cfg.lora_targets, cfg.lora_rank, cfg.lora_alpha)?;
         let lora_grad_numel = model.q_lora_grad_numel()?;
         Ok(Self {
             model,
@@ -907,8 +1198,8 @@ impl GpuLoraEvalReplica {
             target_gpu: GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::U32)?,
             losses_gpu: GpuTensor::zeros_gpu(stream.clone(), &[seq_len], DType::F32)?,
             loss_sum_gpu: GpuTensor::zeros_gpu(stream.clone(), &[1], DType::F32)?,
-            activations: GpuActivations::new_for_plan(plan, seq_len, stream.clone())?,
-            backward_state: GpuBackwardState::new_for_plan(plan, seq_len, stream.clone())?,
+            activations: GpuActivations::new_for_plan_for_ttt(plan, seq_len, stream.clone())?,
+            backward_state: GpuBackwardState::new_for_plan_for_ttt(plan, seq_len, stream.clone())?,
             grads: GpuGradBuffers::new(&cpu_model.config, stream.clone())?,
             lora_grad_pack: GpuTensor::zeros_gpu(stream.clone(), &[lora_grad_numel], DType::F32)?,
             host_workspace: GpuLoraHostWorkspace::new(seq_len),
@@ -922,6 +1213,7 @@ impl GpuLoraEvalReplica {
         base_bytes: &[f32],
         windows: &[usize],
         stride: usize,
+        ngram_tilt: Option<&NgramTiltHints>,
     ) -> PgResult<(f64, u64, f64)> {
         let chunk = crate::sliding::TttChunk {
             chunk_start: 0,
@@ -942,6 +1234,7 @@ impl GpuLoraEvalReplica {
             &mut self.activations,
             &mut self.backward_state,
             &mut self.host_workspace,
+            ngram_tilt,
         )
     }
 
@@ -976,6 +1269,7 @@ impl GpuLoraHostWorkspace {
         Self {
             input: vec![0u32; seq_len],
             target: vec![0u32; seq_len],
+            hint: vec![0u32; seq_len],
         }
     }
 }
@@ -996,11 +1290,14 @@ fn score_chunk_gpu(
     activations: &mut GpuActivations,
     backward_state: &mut GpuBackwardState,
     host: &mut GpuLoraHostWorkspace,
+    ngram_tilt: Option<&NgramTiltHints>,
 ) -> PgResult<(f64, u64, f64)> {
     let total_tokens = val_tokens.len() - 1;
     let mut token_count = 0u64;
     let mut byte_count = 0.0f64;
     loss_sum_gpu.zero_bytes()?;
+    let mut host_loss_sum = 0.0f64;
+    let mut used_host_tilt_sum = false;
 
     for &ws in &chunk.windows {
         let end = (ws + seq_len).min(total_tokens);
@@ -1010,6 +1307,7 @@ fn score_chunk_gpu(
         }
         host.input.fill(0);
         host.target.fill(0);
+        host.hint.fill(0);
         host.input[..wlen].copy_from_slice(&val_tokens[ws..end]);
         host.target[..wlen].copy_from_slice(&val_tokens[ws + 1..end + 1]);
         input_gpu.copy_from_host_bytes(bytemuck::cast_slice(&host.input))?;
@@ -1032,23 +1330,68 @@ fn score_chunk_gpu(
         } else {
             wlen.saturating_sub(stride)
         };
-        model.kernels.loss_window_accumulate(
-            pg_kernels::gpu_kernels::CudaPtr(losses_gpu.cu_ptr(model.gemm.stream())?),
-            pg_kernels::gpu_kernels::CudaPtr(loss_sum_gpu.cu_ptr(model.gemm.stream())?),
-            score_start as u32,
-            wlen as u32,
-        )?;
-        for t in score_start..wlen {
-            token_count += 1;
-            let tok_idx = ws + t;
-            byte_count += base_bytes.get(tok_idx).copied().unwrap_or(1.0) as f64;
+        let tilted_window = ngram_tilt
+            .map(|tilt| tilt.has_gate_in_scored_window(ws + score_start, ws + wlen))
+            .unwrap_or(false);
+        if tilted_window {
+            used_host_tilt_sum = true;
+            let target_loss_bytes = losses_gpu.to_host_bytes()?;
+            let target_losses = decode_f32_host_bytes(&target_loss_bytes)?;
+            let tilt = ngram_tilt.expect("checked tilted window");
+            for t in 0..wlen {
+                let hint_idx = ws + t;
+                host.hint[t] = tilt.hint_ids.get(hint_idx).copied().unwrap_or(0);
+            }
+            target_gpu.copy_from_host_bytes(bytemuck::cast_slice(&host.hint))?;
+            model.cross_entropy_losses_with_state(
+                activations,
+                backward_state,
+                target_gpu,
+                losses_gpu,
+                seq_len,
+            )?;
+            let hint_loss_bytes = losses_gpu.to_host_bytes()?;
+            let hint_losses = decode_f32_host_bytes(&hint_loss_bytes)?;
+            for t in score_start..wlen {
+                token_count += 1;
+                let tok_idx = ws + t;
+                byte_count += base_bytes.get(tok_idx).copied().unwrap_or(1.0) as f64;
+                let mut ptl = target_losses.get(t).copied().unwrap_or(0.0) as f64;
+                if tilt.gate_mask.get(tok_idx).copied().unwrap_or(false) {
+                    let boost = tilt.boost.get(tok_idx).copied().unwrap_or(0.0) as f64;
+                    let hint_id = tilt.hint_ids.get(tok_idx).copied().unwrap_or(0);
+                    let is_hit = if host.target[t] == hint_id { 1.0 } else { 0.0 };
+                    let q = (-(hint_losses.get(t).copied().unwrap_or(0.0) as f64))
+                        .min(0.0)
+                        .exp();
+                    ptl = ptl - boost * is_hit + (q * boost.exp_m1()).ln_1p();
+                }
+                host_loss_sum += ptl;
+            }
+        } else {
+            model.kernels.loss_window_accumulate(
+                pg_kernels::gpu_kernels::CudaPtr(losses_gpu.cu_ptr(model.gemm.stream())?),
+                pg_kernels::gpu_kernels::CudaPtr(loss_sum_gpu.cu_ptr(model.gemm.stream())?),
+                score_start as u32,
+                wlen as u32,
+            )?;
+            for t in score_start..wlen {
+                token_count += 1;
+                let tok_idx = ws + t;
+                byte_count += base_bytes.get(tok_idx).copied().unwrap_or(1.0) as f64;
+            }
         }
     }
     let loss_sum_bytes = loss_sum_gpu.to_host_bytes()?;
-    let loss_sum = decode_f32_host_bytes(&loss_sum_bytes)?
+    let gpu_loss_sum = decode_f32_host_bytes(&loss_sum_bytes)?
         .first()
         .copied()
         .unwrap_or(0.0) as f64;
+    let loss_sum = if used_host_tilt_sum {
+        gpu_loss_sum + host_loss_sum
+    } else {
+        gpu_loss_sum
+    };
     Ok((loss_sum, token_count, byte_count))
 }
 
@@ -1125,6 +1468,7 @@ mod tests {
             weight_decay: 1.0,
             beta2: 0.99,
             lr: 0.01,
+            lora_targets: pg_model::spec::TttLoraTargetsSpec::default(),
         }
     }
 
@@ -1203,5 +1547,38 @@ mod tests {
             err.contains("chunk 7 rank 3 layer 0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn gpu_lora_eval_runtime_env_guard_restores_record_profile_flags() {
+        unsafe {
+            std::env::set_var("PG_GPU_BF16_BACKWARD_CHAIN", "1");
+            std::env::set_var("PG_GPU_BF16_BACKWARD_CHAIN_STRICT", "1");
+            std::env::remove_var("PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS");
+            std::env::remove_var("PG_GPU_SHAPE_TRACE");
+        }
+
+        {
+            let _guard = configure_gpu_lora_eval_runtime();
+            assert_eq!(
+                std::env::var("PG_GPU_BF16_BACKWARD_CHAIN").as_deref(),
+                Ok("0")
+            );
+            assert_eq!(
+                std::env::var("PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS").as_deref(),
+                Ok("1")
+            );
+        }
+
+        assert_eq!(
+            std::env::var("PG_GPU_BF16_BACKWARD_CHAIN").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("PG_GPU_BF16_BACKWARD_CHAIN_STRICT").as_deref(),
+            Ok("1")
+        );
+        assert!(std::env::var("PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS").is_err());
+        assert!(std::env::var("PG_GPU_SHAPE_TRACE").is_err());
     }
 }

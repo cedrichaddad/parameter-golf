@@ -13,6 +13,9 @@ fn main() {
     let mut stride: Option<usize> = None;
     let mut tokenizer_vocab_path: Option<String> = None;
     let mut caseops_byte_sidecar_pattern: Option<String> = None;
+    let mut eval_adaptation_backend: Option<EvalAdaptationBackend> = None;
+    let mut phased_ttt_prefix_docs: Option<usize> = None;
+    let mut chunk_tokens: Option<usize> = None;
     let mut leaderboard_mode = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -23,6 +26,17 @@ fn main() {
             "--stride" => stride = args.next().and_then(|v| v.parse::<usize>().ok()),
             "--tokenizer-vocab" => tokenizer_vocab_path = args.next(),
             "--caseops-byte-sidecar" => caseops_byte_sidecar_pattern = args.next(),
+            "--phased-ttt-prefix-docs" => {
+                phased_ttt_prefix_docs = args.next().and_then(|v| v.parse::<usize>().ok())
+            }
+            "--chunk-tokens" => chunk_tokens = args.next().and_then(|v| v.parse::<usize>().ok()),
+            "--eval-adaptation" => {
+                eval_adaptation_backend = args.next().and_then(|value| {
+                    parse_eval_adaptation_backend(&value).or_else(|| {
+                        fail(&format!("unsupported --eval-adaptation {value:?}"));
+                    })
+                })
+            }
             "--leaderboard" => leaderboard_mode = true,
             "--builtin" => {
                 if let Some(name) = args.next() {
@@ -56,6 +70,16 @@ fn main() {
     if let Some(pattern) = caseops_byte_sidecar_pattern {
         run_spec.eval.caseops_byte_sidecar_pattern = Some(pattern);
     }
+    if let Some(value) = eval_adaptation_backend {
+        run_spec.eval.adaptation_backend = value;
+        run_spec.eval.qttt = value != EvalAdaptationBackend::None;
+    }
+    if let Some(value) = phased_ttt_prefix_docs {
+        run_spec.eval.phased_ttt_prefix_docs = value;
+    }
+    if let Some(value) = chunk_tokens {
+        run_spec.eval.chunk_tokens = value;
+    }
     validate_leaderboard_eval_request(&run_spec, artifact.as_ref(), max_tokens, leaderboard_mode);
     if leaderboard_mode {
         if let Some(path) = artifact.as_ref() {
@@ -84,6 +108,11 @@ fn main() {
     );
     println!("lora_rank={}", plan.eval_plan.lora_rank);
     println!("lora_alpha={:.3}", plan.eval_plan.lora_alpha);
+    if let Some(lora_lr) = plan.eval_plan.lora_lr {
+        println!("lora_lr={lora_lr:.9}");
+    } else {
+        println!("lora_lr=default_train_matrix_lr");
+    }
     println!(
         "phased_ttt_prefix_docs={}",
         plan.eval_plan.phased_ttt_prefix_docs
@@ -92,6 +121,14 @@ fn main() {
     println!(
         "phased_ttt_weight_decay={:.3}",
         plan.eval_plan.phased_ttt_weight_decay
+    );
+    println!(
+        "ttt_lora_targets={}",
+        plan.eval_plan.ttt_lora_targets.label()
+    );
+    println!(
+        "ttt_lora_targets_runtime_supported={}",
+        plan.eval_plan.ttt_lora_targets.rust_gpu_runtime_supported()
     );
     if let Some(bytes) = artifact_bytes {
         let code_bytes = current_executable_bytes();
@@ -187,13 +224,22 @@ fn main() {
             }
         );
         println!("eval_bpb={bpb:.6}");
+        let lora_lr_json = plan
+            .eval_plan
+            .lora_lr
+            .map(|value| format!("{value:.9}"))
+            .unwrap_or_else(|| "null".to_string());
+        let ngram_token_only = eval_ngram_tilt_token_only(&run_spec);
         println!(
-            "eval_audit_json={{\"leaderboard_mode\":{},\"full_validation\":{},\"eval_tokens\":{},\"legal_score_first\":{},\"eval_adaptation_backend\":\"{:?}\",\"bpb_kind\":\"{}\",\"placeholder_bpb\":{},\"artifact_budget_checked\":{},\"eval_wallclock_seconds\":{:.3},\"eval_max_wallclock_seconds\":{:.3}}}",
+            "eval_audit_json={{\"leaderboard_mode\":{},\"full_validation\":{},\"eval_tokens\":{},\"legal_score_first\":{},\"eval_adaptation_backend\":\"{:?}\",\"lora_lr\":{},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"bpb_kind\":\"{}\",\"placeholder_bpb\":{},\"artifact_budget_checked\":{},\"ngram_tilt_enabled\":{},\"ngram_token_only\":{},\"ngram_precompute_inside_eval_timer\":{},\"eval_wallclock_seconds\":{:.3},\"eval_max_wallclock_seconds\":{:.3}}}",
             leaderboard_mode,
             max_tokens.is_none(),
             tokens.len(),
             plan.eval_plan.legal_score_first,
             plan.eval_plan.adaptation_backend,
+            lora_lr_json,
+            plan.eval_plan.ttt_lora_targets.label(),
+            plan.eval_plan.ttt_lora_targets.rust_gpu_runtime_supported(),
             if run_spec.eval.caseops_byte_sidecar_pattern.is_some() {
                 "caseops_byte_sidecar"
             } else if run_spec.eval.tokenizer_vocab_path.is_some() {
@@ -204,6 +250,9 @@ fn main() {
             run_spec.eval.caseops_byte_sidecar_pattern.is_none()
                 && run_spec.eval.tokenizer_vocab_path.is_none(),
             artifact_bytes.is_some(),
+            run_spec.eval.ngram_tilt.enabled,
+            ngram_token_only,
+            run_spec.eval.ngram_tilt.precompute_inside_eval_timer,
             eval_wallclock_seconds,
             max_eval_wallclock_seconds,
         );
@@ -215,14 +264,11 @@ fn main() {
 
 fn eval_gpu_world_size(run_spec: &RunSpec, leaderboard_mode: bool) -> usize {
     if run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased {
-        if leaderboard_mode {
-            std::env::var("PG_EVAL_GPU_WORLD_SIZE")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1)
-        } else {
-            1
-        }
+        std::env::var("PG_EVAL_GPU_WORLD_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&world_size| world_size > 0)
+            .unwrap_or(if leaderboard_mode { 1 } else { 1 })
     } else {
         0
     }
@@ -233,6 +279,23 @@ fn leaderboard_eval_max_wallclock_seconds() -> f64 {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(600.0)
+}
+
+fn parse_eval_adaptation_backend(raw: &str) -> Option<EvalAdaptationBackend> {
+    match raw {
+        "none" => Some(EvalAdaptationBackend::None),
+        "cpu_q_only" => Some(EvalAdaptationBackend::CpuQOnly),
+        "gpu_lora_phased" => Some(EvalAdaptationBackend::GpuLoraPhased),
+        _ => None,
+    }
+}
+
+fn eval_ngram_tilt_token_only(run_spec: &RunSpec) -> bool {
+    !run_spec.eval.ngram_tilt.enabled
+        || (run_spec.eval.ngram_tilt.token_boost != 0.0
+            && run_spec.eval.ngram_tilt.within_boost == 0.0
+            && run_spec.eval.ngram_tilt.word_boost == 0.0
+            && run_spec.eval.ngram_tilt.agree_add_boost == 0.0)
 }
 
 fn validate_leaderboard_eval_request(

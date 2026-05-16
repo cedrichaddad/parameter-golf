@@ -487,7 +487,7 @@ impl GptModel {
             x_after_attn[i] = x_in[i] + bp.attn_scale[i % d] * proj_out[i];
         }
 
-        let mlp_input = if self.parallel_residual_enabled() {
+        let mlp_input = if self.parallel_residual_enabled_for_layer(layer) {
             x_in.clone()
         } else {
             x_after_attn.clone()
@@ -603,7 +603,7 @@ impl GptModel {
             1e-6,
         );
 
-        if !self.parallel_residual_enabled() {
+        if !self.parallel_residual_enabled_for_layer(layer) {
             for i in 0..t * d {
                 grad_x_after_attn[i] += grad_x_pre_mlp_norm[i];
             }
@@ -620,7 +620,7 @@ impl GptModel {
             grad_proj_out[i] = grad_x_after_attn[i] * bp.attn_scale[di];
             grads.block_attn_scale[layer][di] += grad_x_after_attn[i] * proj_out[i];
         }
-        if self.parallel_residual_enabled() {
+        if self.parallel_residual_enabled_for_layer(layer) {
             for i in 0..t * d {
                 grad_x_in[i] += grad_x_pre_mlp_norm[i];
             }
@@ -1248,12 +1248,13 @@ pub fn backward_output_loss(
 
     let mut grad_logits = vec![0.0f32; t * vocab];
     let grad_loss = 1.0 / t as f32;
-    pg_kernels::cross_entropy::cross_entropy_backward(
+    pg_kernels::cross_entropy::cross_entropy_backward_asym(
         &buf.logits[..t * vocab],
         targets,
         &mut grad_logits,
         vocab,
-        model.config.logit_softcap,
+        model.config.logit_softcap_pos,
+        model.config.logit_softcap_neg,
         grad_loss,
     );
 
@@ -1318,11 +1319,14 @@ mod tests {
             rope_dims: 2,
             xsa_last_n: 0,
             logit_softcap: 30.0,
+            logit_softcap_pos: 30.0,
+            logit_softcap_neg: 30.0,
             qk_gain_init: 1.0,
             recurrence_enabled: false,
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            parallel_residual_start_layer: 0,
             attn_out_gate_enabled: false,
             attn_out_gate_width: 24,
             sparse_attn_gate_enabled: false,

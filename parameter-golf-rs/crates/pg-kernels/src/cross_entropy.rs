@@ -18,8 +18,26 @@ pub fn cross_entropy_forward(
     vocab_size: usize,
     softcap: f32,
 ) {
+    cross_entropy_forward_asym(logits, targets, losses, vocab_size, softcap, softcap);
+}
+
+pub fn cross_entropy_forward_asym(
+    logits: &[f32],
+    targets: &[u32],
+    losses: &mut [f32],
+    vocab_size: usize,
+    softcap_pos: f32,
+    softcap_neg: f32,
+) {
     let num_tokens = targets.len();
-    let inv_cap = 1.0 / softcap;
+    let cap = |v: f32| {
+        let softcap = if v >= 0.0 { softcap_pos } else { softcap_neg };
+        if softcap > 0.0 {
+            softcap * (v / softcap).tanh()
+        } else {
+            v
+        }
+    };
 
     for t in 0..num_tokens {
         let offset = t * vocab_size;
@@ -30,7 +48,7 @@ pub fn cross_entropy_forward(
         // Find max for numerical stability (after softcap)
         let mut max_val = f32::NEG_INFINITY;
         for &v in row {
-            let capped = softcap * (v * inv_cap).tanh();
+            let capped = cap(v);
             if capped > max_val {
                 max_val = capped;
             }
@@ -39,13 +57,13 @@ pub fn cross_entropy_forward(
         // Compute log-sum-exp
         let mut sum_exp = 0.0f32;
         for &v in row {
-            let capped = softcap * (v * inv_cap).tanh();
+            let capped = cap(v);
             sum_exp += (capped - max_val).exp();
         }
         let log_sum_exp = max_val + sum_exp.ln();
 
         // Loss = -log(softmax[target]) = -(capped_target - log_sum_exp)
-        let capped_target = softcap * (row[target] * inv_cap).tanh();
+        let capped_target = cap(row[target]);
         losses[t] = log_sum_exp - capped_target;
     }
 }
@@ -61,9 +79,45 @@ pub fn cross_entropy_backward(
     softcap: f32,
     grad_loss: f32,
 ) {
+    cross_entropy_backward_asym(
+        logits,
+        targets,
+        grad_logits,
+        vocab_size,
+        softcap,
+        softcap,
+        grad_loss,
+    );
+}
+
+pub fn cross_entropy_backward_asym(
+    logits: &[f32],
+    targets: &[u32],
+    grad_logits: &mut [f32],
+    vocab_size: usize,
+    softcap_pos: f32,
+    softcap_neg: f32,
+    grad_loss: f32,
+) {
     let num_tokens = targets.len();
-    let inv_cap = 1.0 / softcap;
     let mut exps = vec![0.0f32; vocab_size]; // pre-allocated, reused across tokens
+    let cap = |v: f32| {
+        let softcap = if v >= 0.0 { softcap_pos } else { softcap_neg };
+        if softcap > 0.0 {
+            softcap * (v / softcap).tanh()
+        } else {
+            v
+        }
+    };
+    let cap_deriv = |v: f32| {
+        let softcap = if v >= 0.0 { softcap_pos } else { softcap_neg };
+        if softcap > 0.0 {
+            let t_val = (v / softcap).tanh();
+            1.0 - t_val * t_val
+        } else {
+            1.0
+        }
+    };
 
     for t in 0..num_tokens {
         let offset = t * vocab_size;
@@ -73,7 +127,7 @@ pub fn cross_entropy_backward(
         // Compute softmax of capped logits
         let mut max_val = f32::NEG_INFINITY;
         for &v in row {
-            let capped = softcap * (v * inv_cap).tanh();
+            let capped = cap(v);
             if capped > max_val {
                 max_val = capped;
             }
@@ -81,7 +135,7 @@ pub fn cross_entropy_backward(
 
         let mut sum_exp = 0.0f32;
         for (i, &v) in row.iter().enumerate() {
-            let capped = softcap * (v * inv_cap).tanh();
+            let capped = cap(v);
             exps[i] = (capped - max_val).exp();
             sum_exp += exps[i];
         }
@@ -91,9 +145,7 @@ pub fn cross_entropy_backward(
             let prob = exps[i] / sum_exp;
             let one_hot = if i == target { 1.0 } else { 0.0 };
             // d_softcap/d_x = 1 - tanh²(x/cap)
-            let t_val = (row[i] * inv_cap).tanh();
-            let d_softcap = 1.0 - t_val * t_val;
-            grad_logits[offset + i] = grad_loss * (prob - one_hot) * d_softcap;
+            grad_logits[offset + i] = grad_loss * (prob - one_hot) * cap_deriv(row[i]);
         }
     }
 }
@@ -178,5 +230,22 @@ mod tests {
                 (grad[i] - numerical).abs()
             );
         }
+    }
+
+    #[test]
+    fn test_asymmetric_softcap_changes_negative_logits() {
+        let vocab = 4;
+        let logits = vec![-40.0f32, -2.0, 1.0, 4.0];
+        let targets = vec![0u32];
+        let mut symmetric = vec![0.0f32];
+        let mut asymmetric = vec![0.0f32];
+
+        cross_entropy_forward(&logits, &targets, &mut symmetric, vocab, 30.0);
+        cross_entropy_forward_asym(&logits, &targets, &mut asymmetric, vocab, 30.0, 34.0);
+
+        assert!(
+            (symmetric[0] - asymmetric[0]).abs() > 1e-3,
+            "asymmetric negative softcap should affect loss"
+        );
     }
 }

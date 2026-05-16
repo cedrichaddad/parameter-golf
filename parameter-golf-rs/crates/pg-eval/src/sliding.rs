@@ -11,8 +11,9 @@ use pg_model::{ForwardBuffer, GptModel};
 /// Compute NLL with softcap applied to logits: cap * tanh(logit / cap).
 /// This matches the training loss which applies softcap inside cross_entropy_forward.
 #[inline]
-fn nll_with_softcap(logits: &[f32], target: usize, softcap: f32) -> f32 {
+fn nll_with_softcap(logits: &[f32], target: usize, softcap_pos: f32, softcap_neg: f32) -> f32 {
     let cap = |l: f32| {
+        let softcap = if l >= 0.0 { softcap_pos } else { softcap_neg };
         if softcap > 0.0 {
             softcap * (l / softcap).tanh()
         } else {
@@ -69,11 +70,12 @@ pub fn eval_sliding(
 
         // Compute per-token NLL with softcap
         let vocab = model.config.vocab_size;
-        let softcap = model.config.logit_softcap;
+        let softcap_pos = model.config.logit_softcap_pos;
+        let softcap_neg = model.config.logit_softcap_neg;
         for t in 0..wlen {
             let logits = &buf.logits[t * vocab..(t + 1) * vocab];
             let tgt = target[t] as usize;
-            let nll = nll_with_softcap(logits, tgt, softcap);
+            let nll = nll_with_softcap(logits, tgt, softcap_pos, softcap_neg);
 
             // Only score the "new" tokens (stride region)
             let s = if ws == 0 {
@@ -181,13 +183,14 @@ pub fn score_chunk(
         model.forward(input, &mut buf);
 
         let vocab = model.config.vocab_size;
-        let softcap = model.config.logit_softcap;
+        let softcap_pos = model.config.logit_softcap_pos;
+        let softcap_neg = model.config.logit_softcap_neg;
         let s = if ws == 0 { 0 } else { (wlen - stride).max(0) };
 
         for t in s..wlen {
             let logits = &buf.logits[t * vocab..(t + 1) * vocab];
             let tgt = target[t] as usize;
-            let nll = nll_with_softcap(logits, tgt, softcap);
+            let nll = nll_with_softcap(logits, tgt, softcap_pos, softcap_neg);
 
             loss_sum += nll as f64;
             token_count += 1;
@@ -290,11 +293,14 @@ mod tests {
             rope_dims: 2,
             xsa_last_n: 0,
             logit_softcap: 30.0,
+            logit_softcap_pos: 30.0,
+            logit_softcap_neg: 30.0,
             qk_gain_init: 1.0,
             recurrence_enabled: false,
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            parallel_residual_start_layer: 0,
             attn_out_gate_enabled: false,
             attn_out_gate_width: 24,
             sparse_attn_gate_enabled: false,

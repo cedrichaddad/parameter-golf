@@ -179,8 +179,8 @@ impl GptModel {
         self.config.sparse_attn_gate_enabled
     }
 
-    pub(crate) fn parallel_residual_enabled(&self) -> bool {
-        self.config.parallel_residual
+    pub(crate) fn parallel_residual_enabled_for_layer(&self, layer: usize) -> bool {
+        self.config.parallel_residual_enabled_for_layer(layer)
     }
 
     pub(crate) fn is_recurrent_layer(&self, layer: usize) -> bool {
@@ -610,7 +610,7 @@ impl GptModel {
             buf.x[i] = buf.x_in[i] + bp.attn_scale[dim_idx] * buf.proj_out[i];
         }
 
-        let mlp_input = if self.parallel_residual_enabled() {
+        let mlp_input = if self.parallel_residual_enabled_for_layer(layer) {
             &buf.x_in[..t * d]
         } else {
             &buf.x[..t * d]
@@ -653,7 +653,7 @@ impl GptModel {
         // 16. Residual: x = x + mlp_scale * mlp_out
         for i in 0..t * d {
             let dim_idx = i % d;
-            let base = if self.parallel_residual_enabled() {
+            let base = if self.parallel_residual_enabled_for_layer(layer) {
                 buf.x_in[i] + bp.attn_scale[dim_idx] * buf.proj_out[i]
             } else {
                 buf.x[i]
@@ -833,12 +833,13 @@ impl GptModel {
         let t = buf.tokens;
         let vocab = self.config.vocab_size;
         let mut losses = vec![0.0f32; t];
-        pg_kernels::cross_entropy::cross_entropy_forward(
+        pg_kernels::cross_entropy::cross_entropy_forward_asym(
             &buf.logits[..t * vocab],
             targets,
             &mut losses,
             vocab,
-            self.config.logit_softcap,
+            self.config.logit_softcap_pos,
+            self.config.logit_softcap_neg,
         );
         pg_kernels::cross_entropy::mean_loss(&losses)
     }
@@ -863,11 +864,14 @@ mod tests {
             rope_dims: 4,
             xsa_last_n: 1,
             logit_softcap: 30.0,
+            logit_softcap_pos: 30.0,
+            logit_softcap_neg: 30.0,
             qk_gain_init: 1.0,
             recurrence_enabled: false,
             recurrence_start_layer: 0,
             recurrence_repeat_layers: 0,
             parallel_residual: false,
+            parallel_residual_start_layer: 0,
             attn_out_gate_enabled: false,
             attn_out_gate_width: 24,
             sparse_attn_gate_enabled: false,

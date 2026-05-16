@@ -381,6 +381,7 @@ impl GpuTensor {
     }
 
     /// Reshape (only valid for contiguous tensors with matching numel).
+    #[track_caller]
     pub fn reshape(&self, new_shape: &[usize]) -> PgResult<Self> {
         if !self.is_contiguous() {
             return Err(PgError::InvalidOp(
@@ -389,6 +390,25 @@ impl GpuTensor {
         }
         let new_numel: usize = new_shape.iter().product();
         if new_numel != self.numel() {
+            if std::env::var("PG_GPU_SHAPE_TRACE")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "gpu_shape_trace reshape mismatch at {}:{} requested_shape={:?} current_shape={:?} current_numel={}",
+                    caller.file(),
+                    caller.line(),
+                    new_shape,
+                    self.shape,
+                    self.numel(),
+                );
+            }
             return Err(PgError::ShapeMismatch {
                 expected: new_shape.to_vec(),
                 got: self.shape.to_vec(),

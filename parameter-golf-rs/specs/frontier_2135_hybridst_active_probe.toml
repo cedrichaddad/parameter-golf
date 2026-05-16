@@ -1,8 +1,13 @@
-# Primary audited frontier target based on the PR #2135 / May 1 audit shape.
+# PR #2135 throughput/quality compromise candidate.
+#
+# Full recurrent backward misses the 120 ms record gate; all-straight-through
+# clears the gate but currently fails BPB badly. This profile keeps the same
+# audited #2135 algorithm/export knobs while using pass-1 straight-through
+# recurrent backward as the explicit middle point to validate.
 
-name = "frontier_2135_audit_target"
+name = "frontier_2135_hybridst3_active_probe"
 mode = "record"
-allow_unsupported_variants = false
+allow_unsupported_variants = true
 
 [model]
 family = "frontier_1855_like"
@@ -15,10 +20,6 @@ model_dim = 512
 num_heads = 8
 num_kv_heads = 4
 mlp_mult = 4.0
-# PR #2135 inherits PR #2130's public reproduction command. That command does
-# not override TRAIN_SEQ_LEN or TRAIN_BATCH_TOKENS, so the training hot path uses
-# the script defaults: 1024 context and 524,288 train tokens/step. Eval/TTT use
-# the explicit 2560 context below.
 train_seq_len = 1024
 eval_seq_len = 2560
 xsa_last_n = 11
@@ -44,8 +45,7 @@ layers = []
 enabled = true
 start_layer = 3
 repeat_layers = 3
-enable_at_frac = 0.35
-enable_at_step = 1748
+enable_at_frac = 0.0
 
 [model.parallel_residual]
 enabled = true
@@ -86,7 +86,7 @@ train_data_pattern = "/data/datasets/fineweb10B_sp8192/fineweb_train_*.bin"
 validation_data_pattern = "/data/datasets/fineweb10B_sp8192/fineweb_val_*.bin"
 rank = 0
 world_size = 8
-artifact_path = "/output/frontier_2135_audit_target.pgrs"
+artifact_path = "/output/frontier_2135_hybridst3_active_probe.pgrs"
 fast_bank_updates = false
 warmup_steps = 20
 total_iterations = 4994
@@ -117,9 +117,9 @@ seq_len = 1024
 scheme = "mixed_int5_int6"
 calibration = "self_generated"
 compression = "pergroup"
-matrix_bits = 6
-mlp_bits = 6
-embed_bits = 7
+matrix_bits = 5
+mlp_bits = 4
+embed_bits = 6
 attn_gate_bits = 8
 mlp_clip_sigmas = 11.5
 attn_clip_sigmas = 13.0
@@ -143,7 +143,6 @@ qttt = true
 adaptation_backend = "gpu_lora_phased"
 lora_rank = 80
 lora_alpha = 144.0
-lora_lr = 0.00008
 phased_ttt_prefix_docs = 2500
 phased_ttt_phases = 1
 phased_ttt_weight_decay = 2.0
@@ -176,17 +175,18 @@ agree_add_boost = 0.0
 precompute_inside_eval_timer = true
 
 [runtime]
-record_profile = "frontier2135_audit"
+record_profile = "frontier2135_speed_probe"
 backward_chain_profile = "bf16_direct_compact"
-recurrent_backward_profile = "full"
-recurrence_active_required = true
-recurrent_active_steps_min = 2000
+recurrent_backward_profile = "pass1_straight_through"
+recurrent_straight_through_layers = 3
+recurrence_active_required = false
+recurrent_active_steps_min = 0
 require_device_batch = true
 token_ring_full_schedule = true
 cuda_graph_profile = "record_step_no_loss"
 nccl_overlap_mode = "off"
 bigram_embedding_merge = false
-combined_qkv_rope_tail_backward = false
+combined_qkv_rope_tail_backward = true
 graph_side_gemm_capture = false
 sharded_muon_local_graph = true
 sharded_muon_pre_norm_graph = true

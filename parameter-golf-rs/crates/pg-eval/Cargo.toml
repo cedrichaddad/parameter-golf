@@ -19,5 +19,5 @@ bytemuck = { workspace = true }
 cudarc = { workspace = true, optional = true }
 
 [[bin]]
-name = "run"
+name = "pg-eval"
 path = "src/bin/run.rs"

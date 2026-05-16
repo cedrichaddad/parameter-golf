@@ -7,6 +7,7 @@ members = [
     "crates/pg-optim",
     "crates/pg-data",
     "crates/pg-quant",
+    "crates/pg-quant-macros",
     "crates/pg-eval",
     "crates/pg-compat",
     "crates/pg-train",

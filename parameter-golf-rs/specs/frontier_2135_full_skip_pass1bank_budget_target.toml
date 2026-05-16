@@ -1,8 +1,13 @@
-# Primary audited frontier target based on the PR #2135 / May 1 audit shape.
+# PR #2135 throughput/quality compromise candidate.
+#
+# This keeps full recurrent activation-gradient propagation but skips the
+# duplicate pass-1 recurrent weight-gradient contribution. It is a measured
+# middle point between the quality audit target and the straight-through speed
+# probes; BPB must validate it before it can be treated as record-quality.
 
-name = "frontier_2135_audit_target"
+name = "frontier_2135_full_skip_pass1bank_budget_target"
 mode = "record"
-allow_unsupported_variants = false
+allow_unsupported_variants = true
 
 [model]
 family = "frontier_1855_like"
@@ -15,10 +20,6 @@ model_dim = 512
 num_heads = 8
 num_kv_heads = 4
 mlp_mult = 4.0
-# PR #2135 inherits PR #2130's public reproduction command. That command does
-# not override TRAIN_SEQ_LEN or TRAIN_BATCH_TOKENS, so the training hot path uses
-# the script defaults: 1024 context and 524,288 train tokens/step. Eval/TTT use
-# the explicit 2560 context below.
 train_seq_len = 1024
 eval_seq_len = 2560
 xsa_last_n = 11
@@ -86,7 +87,7 @@ train_data_pattern = "/data/datasets/fineweb10B_sp8192/fineweb_train_*.bin"
 validation_data_pattern = "/data/datasets/fineweb10B_sp8192/fineweb_val_*.bin"
 rank = 0
 world_size = 8
-artifact_path = "/output/frontier_2135_audit_target.pgrs"
+artifact_path = "/output/frontier_2135_full_skip_pass1bank_budget_target.pgrs"
 fast_bank_updates = false
 warmup_steps = 20
 total_iterations = 4994
@@ -117,9 +118,9 @@ seq_len = 1024
 scheme = "mixed_int5_int6"
 calibration = "self_generated"
 compression = "pergroup"
-matrix_bits = 6
-mlp_bits = 6
-embed_bits = 7
+matrix_bits = 5
+mlp_bits = 4
+embed_bits = 6
 attn_gate_bits = 8
 mlp_clip_sigmas = 11.5
 attn_clip_sigmas = 13.0
@@ -176,9 +177,11 @@ agree_add_boost = 0.0
 precompute_inside_eval_timer = true
 
 [runtime]
-record_profile = "frontier2135_audit"
+record_profile = "frontier2135_speed_probe"
 backward_chain_profile = "bf16_direct_compact"
 recurrent_backward_profile = "full"
+recurrent_straight_through_layers = 0
+skip_recurrent_pass1_bank_grads = true
 recurrence_active_required = true
 recurrent_active_steps_min = 2000
 require_device_batch = true
@@ -186,7 +189,7 @@ token_ring_full_schedule = true
 cuda_graph_profile = "record_step_no_loss"
 nccl_overlap_mode = "off"
 bigram_embedding_merge = false
-combined_qkv_rope_tail_backward = false
+combined_qkv_rope_tail_backward = true
 graph_side_gemm_capture = false
 sharded_muon_local_graph = true
 sharded_muon_pre_norm_graph = true

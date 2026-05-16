@@ -482,15 +482,38 @@ impl GpuActivations {
         tokens: usize,
         stream: Arc<CudaStream>,
     ) -> PgResult<Self> {
+        Self::new_for_plan_with_lm_head_lora(plan, tokens, stream, false)
+    }
+
+    pub fn new_for_plan_for_ttt(
+        plan: &ExecutionPlan,
+        tokens: usize,
+        stream: Arc<CudaStream>,
+    ) -> PgResult<Self> {
+        Self::new_for_plan_with_lm_head_lora(
+            plan,
+            tokens,
+            stream,
+            plan.eval_plan.ttt_lora_targets.lm_head,
+        )
+    }
+
+    fn new_for_plan_with_lm_head_lora(
+        plan: &ExecutionPlan,
+        tokens: usize,
+        stream: Arc<CudaStream>,
+        lm_head_lora: bool,
+    ) -> PgResult<Self> {
         let config = plan.run_spec.model.to_model_config();
-        let materialize_logits = matches!(
-            selected_output_ce_backend_for_config(
-                &config,
-                plan.run_spec.model.compute_precision,
-                Some(plan.run_spec.model.output_ce_backend),
-            ),
-            GpuOutputCeBackend::FullLogits
-        );
+        let materialize_logits = lm_head_lora
+            || matches!(
+                selected_output_ce_backend_for_config(
+                    &config,
+                    plan.run_spec.model.compute_precision,
+                    Some(plan.run_spec.model.output_ce_backend),
+                ),
+                GpuOutputCeBackend::FullLogits
+            );
         let logits_dtype = if materialize_logits
             && gpu_bf16_logits_eligible_for_config(&config, plan.run_spec.model.compute_precision)
         {
@@ -812,6 +835,7 @@ struct GpuLayerForwardCache {
 impl GpuLayerForwardCache {
     fn new_with_options(
         config: &ModelConfig,
+        layer: usize,
         tokens: usize,
         stream: Arc<CudaStream>,
         lean_bf16_direct: bool,
@@ -842,7 +866,8 @@ impl GpuLayerForwardCache {
         let save_x_in = !lean_bf16_direct
             || !gpu_recompute_residual_mix_norm_inputs_enabled()
             || gpu_bf16_norm_grad_path_env_enabled();
-        let save_x_after_attn = !lean_bf16_direct || !config.parallel_residual;
+        let save_x_after_attn =
+            !lean_bf16_direct || !config.parallel_residual_enabled_for_layer(layer);
         let save_ve_cache = !lean_bf16_direct || needs_ve_cache;
         Ok(Self {
             lean_bf16_direct: lean_bf16_direct,
@@ -935,10 +960,12 @@ impl GpuForwardCache {
         let saved_layers = save_mask
             .iter()
             .copied()
-            .map(|save| {
+            .enumerate()
+            .map(|(layer, save)| {
                 if save {
                     GpuLayerForwardCache::new_with_options(
                         config,
+                        layer,
                         tokens,
                         stream.clone(),
                         lean_bf16_direct_layers,
@@ -958,6 +985,7 @@ impl GpuForwardCache {
                 if save && config.is_recurrent_layer(layer) {
                     GpuLayerForwardCache::new_with_options(
                         config,
+                        layer,
                         tokens,
                         stream.clone(),
                         lean_bf16_direct_layers,
@@ -1075,6 +1103,7 @@ fn gpu_lean_bf16_saved_layer_cache_enabled(
                 .as_str(),
             "0" | "false" | "no" | "off"
         )
+        && !gpu_q_lora_full_f32_saved_acts_enabled()
 }
 
 #[cfg(feature = "cuda")]
@@ -1089,6 +1118,16 @@ fn gpu_env_enabled(name: &str, default: bool) -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_q_lora_full_f32_saved_acts_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_Q_LORA_FULL_F32_SAVED_ACTS", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_shape_trace_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_SHAPE_TRACE", false)
+}
+
+#[cfg(feature = "cuda")]
 fn gpu_cuda_graph_capture_debug_enabled() -> bool {
     gpu_env_enabled("PG_CUDA_GRAPH_CAPTURE_DEBUG", false)
 }
@@ -1096,6 +1135,11 @@ fn gpu_cuda_graph_capture_debug_enabled() -> bool {
 #[cfg(feature = "cuda")]
 fn gpu_cuda_graph_disable_cudnn_sdpa_enabled() -> bool {
     gpu_env_enabled("PG_CUDA_GRAPH_DISABLE_CUDNN_SDPA", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_bigram_embedding_merge_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_BIGRAM_EMBED_MERGE", false)
 }
 
 #[cfg(feature = "cuda")]
@@ -1136,6 +1180,39 @@ fn gpu_bank_grad_dw_beta(first_layer_contribution: bool) -> f32 {
     } else {
         1.0
     }
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_skip_recurrent_pass1_bank_grads_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_SKIP_RECURRENT_PASS1_BANK_GRADS", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_skip_recurrent_bank_grads_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_SKIP_RECURRENT_BANK_GRADS", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_recurrent_pass1_straight_through_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_RECURRENT_PASS1_STRAIGHT_THROUGH", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_recurrent_all_straight_through_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_RECURRENT_ALL_STRAIGHT_THROUGH", false)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_recurrent_straight_through_layers() -> usize {
+    std::env::var("PG_GPU_RECURRENT_STRAIGHT_THROUGH_LAYERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_skip_bank_dw(dw_beta: f32) -> bool {
+    dw_beta.is_nan()
 }
 
 #[cfg(feature = "cuda")]
@@ -1249,6 +1326,11 @@ fn gpu_q_gain_backward_chunk_tokens() -> usize {
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_combined_qkv_rope_tail_backward_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_COMBINED_QKV_ROPE_TAIL_BWD", false)
+}
+
+#[cfg(feature = "cuda")]
 fn gpu_chunked_residual_mix_backward_enabled() -> bool {
     matches!(
         std::env::var("PG_GPU_CHUNKED_RESIDUAL_MIX_BWD")
@@ -1257,6 +1339,11 @@ fn gpu_chunked_residual_mix_backward_enabled() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_skip_residual_mix_grad_enabled() -> bool {
+    gpu_env_enabled("PG_GPU_SKIP_RESIDUAL_MIX_GRAD", false)
 }
 
 #[cfg(feature = "cuda")]
@@ -1491,6 +1578,17 @@ fn gpu_fast_mlp_act_backward_enabled() -> bool {
     matches!(
         std::env::var("PG_GPU_FAST_MLP_ACT_BWD")
             .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_sparse_xsa_warphead_forward_enabled() -> bool {
+    matches!(
+        std::env::var("PG_GPU_SPARSE_XSA_WARPHEAD_FWD")
+            .unwrap_or_else(|_| "0".to_string())
             .to_ascii_lowercase()
             .as_str(),
         "1" | "true" | "yes" | "on"
@@ -2115,16 +2213,39 @@ impl GpuBackwardState {
         tokens: usize,
         stream: Arc<CudaStream>,
     ) -> PgResult<Self> {
+        Self::new_for_plan_with_lm_head_lora(plan, tokens, stream, false)
+    }
+
+    pub fn new_for_plan_for_ttt(
+        plan: &ExecutionPlan,
+        tokens: usize,
+        stream: Arc<CudaStream>,
+    ) -> PgResult<Self> {
+        Self::new_for_plan_with_lm_head_lora(
+            plan,
+            tokens,
+            stream,
+            plan.eval_plan.ttt_lora_targets.lm_head,
+        )
+    }
+
+    fn new_for_plan_with_lm_head_lora(
+        plan: &ExecutionPlan,
+        tokens: usize,
+        stream: Arc<CudaStream>,
+        lm_head_lora: bool,
+    ) -> PgResult<Self> {
         let config = plan.run_spec.model.to_model_config();
         let cache = GpuForwardCache::new_for_plan(plan, tokens, stream.clone())?;
-        let materialize_logits = matches!(
-            selected_output_ce_backend_for_config(
-                &config,
-                plan.run_spec.model.compute_precision,
-                Some(plan.run_spec.model.output_ce_backend),
-            ),
-            GpuOutputCeBackend::FullLogits
-        );
+        let materialize_logits = lm_head_lora
+            || matches!(
+                selected_output_ce_backend_for_config(
+                    &config,
+                    plan.run_spec.model.compute_precision,
+                    Some(plan.run_spec.model.output_ce_backend),
+                ),
+                GpuOutputCeBackend::FullLogits
+            );
         Self::new_with_cache(
             &config,
             tokens,
@@ -2470,9 +2591,12 @@ pub struct GpuQProjectionLora {
     pub rank: usize,
     pub alpha: f32,
     pub scale: f32,
-    /// A matrices are stored row-major as [rank, model_dim].
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub slots: usize,
+    /// A matrices are stored row-major as [rank, input_dim].
     pub a: Vec<GpuTensor>,
-    /// B matrices are stored row-major as [model_dim, rank].
+    /// B matrices are stored row-major as [output_dim, rank].
     pub b: Vec<GpuTensor>,
     pub grad_a: Vec<GpuTensor>,
     pub grad_b: Vec<GpuTensor>,
@@ -2489,60 +2613,82 @@ pub struct GpuQProjectionLoraHostState {
 
 #[cfg(feature = "cuda")]
 impl GpuQProjectionLora {
-    fn new(
-        config: &ModelConfig,
+    fn new_slots(
         stream: Arc<CudaStream>,
+        slots: usize,
+        input_dim: usize,
+        output_dim: usize,
         rank: usize,
         alpha: f32,
+        salt: u64,
     ) -> PgResult<Self> {
-        if rank == 0 || rank > config.model_dim {
+        if rank == 0 || rank > input_dim {
             return Err(pg_core::PgError::InvalidOp(format!(
-                "LoRA rank must be in 1..={}, got {rank}",
-                config.model_dim
+                "LoRA rank must be in 1..={input_dim}, got {rank}"
             )));
         }
-        let d = config.model_dim;
         let scale = alpha / rank as f32;
         let zeros = |shape: &[usize]| GpuTensor::zeros_gpu(stream.clone(), shape, DType::F32);
 
-        let mut a = Vec::with_capacity(config.num_layers);
-        let mut b = Vec::with_capacity(config.num_layers);
-        let mut grad_a = Vec::with_capacity(config.num_layers);
-        let mut grad_b = Vec::with_capacity(config.num_layers);
-        for layer in 0..config.num_layers {
-            let mut a_host = vec![0.0f32; rank * d];
+        let mut a = Vec::with_capacity(slots);
+        let mut b = Vec::with_capacity(slots);
+        let mut grad_a = Vec::with_capacity(slots);
+        let mut grad_b = Vec::with_capacity(slots);
+        for slot in 0..slots {
+            let mut a_host = vec![0.0f32; rank * input_dim];
             // Warm-start A deterministically and keep B at zero. This matches the
             // frontier LoRA-TTT convention: first update moves B, later updates
             // can move both factors without perturbing score-before-update logits.
             for r in 0..rank {
-                for col in 0..d {
-                    let x = (layer as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                for col in 0..input_dim {
+                    let x = salt
+                        ^ (slot as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
                         ^ (r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
                         ^ (col as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
                     let centered = ((x >> 40) as f32 / 16_777_216.0) - 0.5;
-                    a_host[r * d + col] = centered * 0.01;
+                    a_host[r * input_dim + col] = centered * 0.01;
                 }
             }
             a.push(GpuTensor::from_host_data_gpu(
                 stream.clone(),
                 bytemuck::cast_slice(&a_host),
-                &[rank, d],
+                &[rank, input_dim],
                 DType::F32,
             )?);
-            b.push(zeros(&[d, rank])?);
-            grad_a.push(zeros(&[rank, d])?);
-            grad_b.push(zeros(&[d, rank])?);
+            b.push(zeros(&[output_dim, rank])?);
+            grad_a.push(zeros(&[rank, input_dim])?);
+            grad_b.push(zeros(&[output_dim, rank])?);
         }
 
         Ok(Self {
             rank,
             alpha,
             scale,
+            input_dim,
+            output_dim,
+            slots,
             a,
             b,
             grad_a,
             grad_b,
         })
+    }
+
+    fn new_q(
+        config: &ModelConfig,
+        stream: Arc<CudaStream>,
+        rank: usize,
+        alpha: f32,
+    ) -> PgResult<Self> {
+        Self::new_slots(
+            stream,
+            config.num_layers,
+            config.model_dim,
+            config.model_dim,
+            rank,
+            alpha,
+            0x51_4c_4f_52_41,
+        )
     }
 }
 
@@ -2564,6 +2710,11 @@ pub struct GpuModel {
     pub cudnn_frontend_attention: Option<pg_kernels::flash_attn::CudnnFrontendAttention>,
     pub fused_output_ce: Option<pg_kernels::output_ce::FusedOutputCe>,
     pub q_lora: Option<GpuQProjectionLora>,
+    pub k_lora: Option<GpuQProjectionLora>,
+    pub v_lora: Option<GpuQProjectionLora>,
+    pub o_lora: Option<GpuQProjectionLora>,
+    pub mlp_lora: Option<GpuQProjectionLora>,
+    pub lm_head_lora: Option<GpuQProjectionLora>,
     pub _ctx: Arc<CudaContext>,
 }
 
@@ -2626,6 +2777,11 @@ impl GpuModel {
             cudnn_frontend_attention,
             fused_output_ce,
             q_lora: None,
+            k_lora: None,
+            v_lora: None,
+            o_lora: None,
+            mlp_lora: None,
+            lm_head_lora: None,
             _ctx: ctx,
         })
     }
@@ -2889,9 +3045,10 @@ impl GpuModel {
     }
 
     fn use_output_ce_no_full_logits(&self) -> bool {
-        self.use_tiled_output_ce()
-            || self.use_chunked_bf16_output_ce_cache()
-            || self.use_fused_exact_output_ce()
+        self.lm_head_lora.is_none()
+            && (self.use_tiled_output_ce()
+                || self.use_chunked_bf16_output_ce_cache()
+                || self.use_fused_exact_output_ce())
     }
 
     fn use_fused_residual_mix_norm(&self) -> bool {
@@ -2951,6 +3108,7 @@ impl GpuModel {
     fn use_bf16_residual_projection_output(&self) -> bool {
         self.use_bf16_primary_forward_gemm()
             && self.use_bf16_backward_gemm()
+            && self.mlp_lora.is_none()
             && matches!(
                 std::env::var("PG_GPU_BF16_RESIDUAL_PROJ_OUTPUT")
                     .unwrap_or_default()
@@ -2963,6 +3121,7 @@ impl GpuModel {
     fn use_bf16_attention_projection_output(&self) -> bool {
         self.use_bf16_primary_forward_gemm()
             && self.use_bf16_backward_gemm()
+            && self.o_lora.is_none()
             && matches!(
                 std::env::var("PG_GPU_BF16_ATTN_PROJ_OUTPUT")
                     .unwrap_or_default()
@@ -2990,7 +3149,7 @@ impl GpuModel {
         self.use_bf16_attention_backward_tail()
             && self.use_fused_qkv_projection()
             && self.use_bf16_qkv_dx_output()
-            && self.q_lora.is_none()
+            && !self.any_qkv_lora_enabled()
             && self.config.ve_layers.is_empty()
             && (gpu_bf16_backward_chain_requested()
                 || matches!(
@@ -3036,8 +3195,8 @@ impl GpuModel {
         )
     }
 
-    fn use_fused_parallel_attn_residual_rms_norm(&self) -> bool {
-        self.parallel_residual_enabled()
+    fn use_fused_parallel_attn_residual_rms_norm(&self, layer: usize) -> bool {
+        self.parallel_residual_enabled_for_layer(layer)
             && self.use_fused_attention_residual_from_base()
             && !matches!(
                 std::env::var("PG_GPU_FUSED_PARALLEL_ATTN_RESID_RMS")
@@ -3112,7 +3271,7 @@ impl GpuModel {
     fn use_skip_f32_attention_saved_acts(&self) -> bool {
         self.use_cudnn_saved_bf16_attention()
             && gpu_direct_saved_activations_enabled()
-            && self.q_lora.is_none()
+            && !self.any_lora_enabled()
             // The BF16 direct path covers XSA-all frontier blocks. Gated
             // variants still keep their F32 gate inputs/values, but do not
             // need full F32 q/k/v/attention copies once XSA spans all layers.
@@ -3480,6 +3639,7 @@ impl GpuModel {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         let stream = self.gemm.stream();
+        let skip_dw = gpu_skip_bank_dw(dw_beta);
         if self.use_bf16_backward_gemm() {
             self.kernels.f32_to_bf16(
                 CudaPtr(dy.cu_ptr(stream)?),
@@ -3493,19 +3653,21 @@ impl GpuModel {
                     (tokens * in_dim) as u32,
                 )?;
             }
-            if self.try_overlap_linear_backward_gemms_to_f32(
-                dy_bf16,
-                x_bf16,
-                weight_bf16,
-                dx,
-                dw,
-                tokens,
-                out_dim,
-                in_dim,
-                dx_beta,
-                dw_beta,
-                LinearBackwardOverlapRole::Generic,
-            )? {
+            if !skip_dw
+                && self.try_overlap_linear_backward_gemms_to_f32(
+                    dy_bf16,
+                    x_bf16,
+                    weight_bf16,
+                    dx,
+                    dw,
+                    tokens,
+                    out_dim,
+                    in_dim,
+                    dx_beta,
+                    dw_beta,
+                    LinearBackwardOverlapRole::Generic,
+                )?
+            {
                 return Ok(());
             }
             unsafe {
@@ -3519,6 +3681,9 @@ impl GpuModel {
                     1.0,
                     dx_beta,
                 )?;
+                if skip_dw {
+                    return Ok(());
+                }
                 self.gemm.linear_backward_weight_bf16_to_f32(
                     dy_bf16.cu_ptr(stream)?,
                     x_bf16.cu_ptr(stream)?,
@@ -3542,6 +3707,9 @@ impl GpuModel {
                     1.0,
                     dx_beta,
                 )?;
+                if skip_dw {
+                    return Ok(());
+                }
                 self.gemm.linear_backward_weight_f32(
                     dy.cu_ptr(stream)?,
                     x.cu_ptr(stream)?,
@@ -3890,34 +4058,39 @@ impl GpuModel {
             ));
         }
         let stream = self.gemm.stream();
-        if self.try_defer_linear_backward_weight_gemm_to_side_f32(
-            dy_bf16,
-            x_bf16,
-            weight_bf16,
-            dx,
-            dw,
-            tokens,
-            out_dim,
-            in_dim,
-            dx_beta,
-            dw_beta,
-            role,
-        )? {
+        let skip_dw = gpu_skip_bank_dw(dw_beta);
+        if !skip_dw
+            && self.try_defer_linear_backward_weight_gemm_to_side_f32(
+                dy_bf16,
+                x_bf16,
+                weight_bf16,
+                dx,
+                dw,
+                tokens,
+                out_dim,
+                in_dim,
+                dx_beta,
+                dw_beta,
+                role,
+            )?
+        {
             return Ok(());
         }
-        if self.try_overlap_linear_backward_gemms_to_f32(
-            dy_bf16,
-            x_bf16,
-            weight_bf16,
-            dx,
-            dw,
-            tokens,
-            out_dim,
-            in_dim,
-            dx_beta,
-            dw_beta,
-            role,
-        )? {
+        if !skip_dw
+            && self.try_overlap_linear_backward_gemms_to_f32(
+                dy_bf16,
+                x_bf16,
+                weight_bf16,
+                dx,
+                dw,
+                tokens,
+                out_dim,
+                in_dim,
+                dx_beta,
+                dw_beta,
+                role,
+            )?
+        {
             return Ok(());
         }
         unsafe {
@@ -3931,6 +4104,9 @@ impl GpuModel {
                 1.0,
                 dx_beta,
             )?;
+            if skip_dw {
+                return Ok(());
+            }
             self.gemm.linear_backward_weight_bf16_to_f32(
                 dy_bf16.cu_ptr(stream)?,
                 x_bf16.cu_ptr(stream)?,
@@ -4060,6 +4236,7 @@ impl GpuModel {
         attn_norm_override: Option<&GpuTensor>,
         attn_norm_bf16_override: Option<&GpuTensor>,
         tokens: usize,
+        bank_dw_beta: f32,
     ) -> PgResult<bool> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -4071,7 +4248,10 @@ impl GpuModel {
         let d = self.config.model_dim;
         let kv = self.config.kv_dim();
         let n = self.config.num_layers;
-        let attn_norm = attn_norm_override.unwrap_or(&buf.attn_norm);
+        let attn_norm_handle = attn_norm_override
+            .cloned()
+            .unwrap_or_else(|| buf.attn_norm.clone());
+        let attn_norm = &attn_norm_handle;
 
         let attn_norm_bf16 = if let Some(attn_norm_bf16) = attn_norm_bf16_override {
             attn_norm_bf16
@@ -4107,10 +4287,10 @@ impl GpuModel {
                     d + 2 * kv,
                     d,
                     0.0,
-                    0.0,
+                    bank_dw_beta,
                     LinearBackwardOverlapRole::Qkv,
                 )?;
-                if self.q_lora.is_some() {
+                if self.any_qkv_lora_enabled() {
                     self.kernels.bf16_to_f32(
                         CudaPtr(block_cache.grad_attn_norm_bf16.cu_ptr(stream)?),
                         CudaPtr(grad_attn_norm.cu_ptr(stream)?),
@@ -4128,7 +4308,7 @@ impl GpuModel {
                     d + 2 * kv,
                     d,
                     0.0,
-                    0.0,
+                    bank_dw_beta,
                     LinearBackwardOverlapRole::Qkv,
                 )?;
             }
@@ -4155,19 +4335,29 @@ impl GpuModel {
                 d + 2 * kv,
                 d,
                 0.0,
-                0.0,
+                bank_dw_beta,
             )?;
         }
-        self.kernels.unpack_qkv_weight_grad(
-            CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
-            CudaPtr(grads.qo_bank.cu_ptr(stream)?),
-            CudaPtr(grads.kv_bank.cu_ptr(stream)?),
-            layer as u32,
-            n as u32,
-            d as u32,
-            kv as u32,
+        if !gpu_skip_bank_dw(bank_dw_beta) {
+            self.kernels.unpack_qkv_weight_grad(
+                CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
+                CudaPtr(grads.qo_bank.cu_ptr(stream)?),
+                CudaPtr(grads.kv_bank.cu_ptr(stream)?),
+                layer as u32,
+                n as u32,
+                d as u32,
+                kv as u32,
+            )?;
+        }
+        self.backward_qkv_loras(
+            layer,
+            attn_norm,
+            grad_q_proj,
+            grad_k_proj,
+            grad_v_projection,
+            grad_attn_norm,
+            buf,
         )?;
-        self.backward_q_lora(layer, grad_q_proj, grad_attn_norm, buf)?;
         Ok(true)
     }
 
@@ -4187,6 +4377,7 @@ impl GpuModel {
         attn_norm_override: Option<&GpuTensor>,
         attn_norm_bf16_override: Option<&GpuTensor>,
         tokens: usize,
+        bank_dw_beta: f32,
     ) -> PgResult<bool> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -4235,24 +4426,123 @@ impl GpuModel {
             d + 2 * kv,
             d,
             0.0,
-            0.0,
+            bank_dw_beta,
             LinearBackwardOverlapRole::Qkv,
         )?;
-        self.kernels.unpack_qkv_weight_grad(
-            CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
-            CudaPtr(grads.qo_bank.cu_ptr(stream)?),
-            CudaPtr(grads.kv_bank.cu_ptr(stream)?),
-            layer as u32,
-            n as u32,
-            d as u32,
-            kv as u32,
-        )?;
+        if !gpu_skip_bank_dw(bank_dw_beta) {
+            self.kernels.unpack_qkv_weight_grad(
+                CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
+                CudaPtr(grads.qo_bank.cu_ptr(stream)?),
+                CudaPtr(grads.kv_bank.cu_ptr(stream)?),
+                layer as u32,
+                n as u32,
+                d as u32,
+                kv as u32,
+            )?;
+        }
         Ok(true)
     }
 
     pub fn enable_q_lora(&mut self, rank: usize, alpha: f32) -> PgResult<()> {
         let stream = self.gemm.stream().clone();
-        self.q_lora = Some(GpuQProjectionLora::new(&self.config, stream, rank, alpha)?);
+        self.q_lora = Some(GpuQProjectionLora::new_q(
+            &self.config,
+            stream,
+            rank,
+            alpha,
+        )?);
+        Ok(())
+    }
+
+    pub fn enable_ttt_lora_targets(
+        &mut self,
+        targets: &crate::spec::TttLoraTargetsSpec,
+        rank: usize,
+        alpha: f32,
+    ) -> PgResult<()> {
+        let stream = self.gemm.stream().clone();
+        let d = self.config.model_dim;
+        let kv = self.config.kv_dim();
+        let n = self.config.num_layers;
+        self.q_lora = if targets.q {
+            Some(GpuQProjectionLora::new_slots(
+                stream.clone(),
+                n,
+                d,
+                d,
+                rank,
+                alpha,
+                0x51_5f_4c_4f_52_41,
+            )?)
+        } else {
+            None
+        };
+        self.k_lora = if targets.k {
+            Some(GpuQProjectionLora::new_slots(
+                stream.clone(),
+                n,
+                d,
+                kv,
+                rank,
+                alpha,
+                0x4b_5f_4c_4f_52_41,
+            )?)
+        } else {
+            None
+        };
+        self.v_lora = if targets.v {
+            Some(GpuQProjectionLora::new_slots(
+                stream.clone(),
+                n,
+                d,
+                kv,
+                rank,
+                alpha,
+                0x56_5f_4c_4f_52_41,
+            )?)
+        } else {
+            None
+        };
+        self.o_lora = if targets.o {
+            Some(GpuQProjectionLora::new_slots(
+                stream.clone(),
+                n,
+                d,
+                d,
+                rank,
+                alpha,
+                0x4f_5f_4c_4f_52_41,
+            )?)
+        } else {
+            None
+        };
+        self.mlp_lora = if targets.mlp {
+            Some(GpuQProjectionLora::new_slots(
+                stream.clone(),
+                n,
+                d,
+                d,
+                rank,
+                alpha,
+                0x4d_4c_50_5f_4c_4f_52_41,
+            )?)
+        } else {
+            None
+        };
+        self.lm_head_lora = if targets.lm_head {
+            Some(GpuQProjectionLora::new_slots(
+                stream,
+                1,
+                d,
+                self.config.vocab_size,
+                rank,
+                alpha,
+                0x4c_4d_48_45_41_44,
+            )?)
+        } else {
+            None
+        };
+        self.zero_q_lora_grads()?;
         Ok(())
     }
 
@@ -4260,49 +4550,117 @@ impl GpuModel {
         self.q_lora.is_some()
     }
 
-    pub fn q_lora_state_to_host(&self) -> PgResult<GpuQProjectionLoraHostState> {
-        let lora = self.q_lora.as_ref().ok_or_else(|| {
-            pg_core::PgError::InvalidOp("q_lora_state_to_host requires enabled LoRA".into())
-        })?;
-        let mut a = Vec::with_capacity(lora.a.len());
-        let mut b = Vec::with_capacity(lora.b.len());
-        for layer in 0..self.config.num_layers {
-            a.push(lora.a[layer].to_host_bytes()?);
-            b.push(lora.b[layer].to_host_bytes()?);
+    fn any_lora_enabled(&self) -> bool {
+        self.q_lora.is_some()
+            || self.k_lora.is_some()
+            || self.v_lora.is_some()
+            || self.o_lora.is_some()
+            || self.mlp_lora.is_some()
+            || self.lm_head_lora.is_some()
+    }
+
+    fn any_qkv_lora_enabled(&self) -> bool {
+        self.q_lora.is_some() || self.k_lora.is_some() || self.v_lora.is_some()
+    }
+
+    fn for_each_lora_adapter<F>(&self, mut f: F) -> PgResult<()>
+    where
+        F: FnMut(&GpuQProjectionLora) -> PgResult<()>,
+    {
+        for adapter in [
+            self.q_lora.as_ref(),
+            self.k_lora.as_ref(),
+            self.v_lora.as_ref(),
+            self.o_lora.as_ref(),
+            self.mlp_lora.as_ref(),
+            self.lm_head_lora.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            f(adapter)?;
         }
-        Ok(GpuQProjectionLoraHostState {
-            rank: lora.rank,
-            alpha: lora.alpha,
-            a,
-            b,
-        })
+        Ok(())
+    }
+
+    pub fn q_lora_state_to_host(&self) -> PgResult<GpuQProjectionLoraHostState> {
+        if !self.any_lora_enabled() {
+            return Err(pg_core::PgError::InvalidOp(
+                "q_lora_state_to_host requires enabled LoRA".into(),
+            ));
+        }
+        let mut rank = 0usize;
+        let mut alpha = 0.0f32;
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        self.for_each_lora_adapter(|lora| {
+            if rank == 0 {
+                rank = lora.rank;
+                alpha = lora.alpha;
+            }
+            for slot in 0..lora.slots {
+                a.push(lora.a[slot].to_host_bytes()?);
+                b.push(lora.b[slot].to_host_bytes()?);
+            }
+            Ok(())
+        })?;
+        Ok(GpuQProjectionLoraHostState { rank, alpha, a, b })
     }
 
     pub fn copy_q_lora_state_from_host(
         &mut self,
         state: &GpuQProjectionLoraHostState,
     ) -> PgResult<()> {
-        let lora = self.q_lora.as_mut().ok_or_else(|| {
-            pg_core::PgError::InvalidOp("copy_q_lora_state_from_host requires enabled LoRA".into())
-        })?;
-        if lora.rank != state.rank || (lora.alpha - state.alpha).abs() > f32::EPSILON {
-            return Err(pg_core::PgError::InvalidOp(format!(
-                "LoRA state shape mismatch: model rank/alpha={} / {:.6}, state rank/alpha={} / {:.6}",
-                lora.rank, lora.alpha, state.rank, state.alpha
-            )));
+        if !self.any_lora_enabled() {
+            return Err(pg_core::PgError::InvalidOp(
+                "copy_q_lora_state_from_host requires enabled LoRA".into(),
+            ));
         }
-        if state.a.len() != self.config.num_layers || state.b.len() != self.config.num_layers {
+        let expected_slots = [
+            self.q_lora.as_ref(),
+            self.k_lora.as_ref(),
+            self.v_lora.as_ref(),
+            self.o_lora.as_ref(),
+            self.mlp_lora.as_ref(),
+            self.lm_head_lora.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|lora| lora.slots)
+        .sum::<usize>();
+        if state.a.len() != expected_slots || state.b.len() != expected_slots {
             return Err(pg_core::PgError::InvalidOp(format!(
-                "LoRA state layer count mismatch: got A={} B={} expected {}",
+                "LoRA state slot count mismatch: got A={} B={} expected {}",
                 state.a.len(),
                 state.b.len(),
-                self.config.num_layers
+                expected_slots
             )));
         }
-        for layer in 0..self.config.num_layers {
-            lora.a[layer].copy_from_host_bytes(&state.a[layer])?;
-            lora.b[layer].copy_from_host_bytes(&state.b[layer])?;
-        }
+        let mut offset = 0usize;
+        let mut copy_adapter = |name: &str,
+                                lora: Option<&mut GpuQProjectionLora>|
+         -> PgResult<()> {
+            if let Some(lora) = lora {
+                if lora.rank != state.rank || (lora.alpha - state.alpha).abs() > f32::EPSILON {
+                    return Err(pg_core::PgError::InvalidOp(format!(
+                        "LoRA {name} state shape mismatch: model rank/alpha={} / {:.6}, state rank/alpha={} / {:.6}",
+                        lora.rank, lora.alpha, state.rank, state.alpha
+                    )));
+                }
+                for slot in 0..lora.slots {
+                    lora.a[slot].copy_from_host_bytes(&state.a[offset])?;
+                    lora.b[slot].copy_from_host_bytes(&state.b[offset])?;
+                    offset += 1;
+                }
+            }
+            Ok(())
+        };
+        copy_adapter("q", self.q_lora.as_mut())?;
+        copy_adapter("k", self.k_lora.as_mut())?;
+        copy_adapter("v", self.v_lora.as_mut())?;
+        copy_adapter("o", self.o_lora.as_mut())?;
+        copy_adapter("mlp", self.mlp_lora.as_mut())?;
+        copy_adapter("lm_head", self.lm_head_lora.as_mut())?;
         self.zero_q_lora_grads()?;
         Ok(())
     }
@@ -4310,32 +4668,37 @@ impl GpuModel {
     pub fn zero_q_lora_grads(&self) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
-            for layer in 0..self.config.num_layers {
+        let stream = self.gemm.stream();
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
                 self.kernels.scale_inplace(
-                    CudaPtr(lora.grad_a[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_a[slot].cu_ptr(stream)?),
                     0.0,
-                    lora.grad_a[layer].numel() as u32,
+                    lora.grad_a[slot].numel() as u32,
                 )?;
                 self.kernels.scale_inplace(
-                    CudaPtr(lora.grad_b[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_b[slot].cu_ptr(stream)?),
                     0.0,
-                    lora.grad_b[layer].numel() as u32,
+                    lora.grad_b[slot].numel() as u32,
                 )?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn q_lora_grad_numel(&self) -> PgResult<usize> {
-        let lora = self.q_lora.as_ref().ok_or_else(|| {
-            pg_core::PgError::InvalidOp("q_lora_grad_numel requires enabled LoRA".into())
-        })?;
         let mut total = 0usize;
-        for layer in 0..self.config.num_layers {
-            total += lora.grad_a[layer].numel();
-            total += lora.grad_b[layer].numel();
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
+                total += lora.grad_a[slot].numel();
+                total += lora.grad_b[slot].numel();
+            }
+            Ok(())
+        })?;
+        if total == 0 {
+            return Err(pg_core::PgError::InvalidOp(
+                "q_lora_grad_numel requires enabled LoRA".into(),
+            ));
         }
         Ok(total)
     }
@@ -4348,22 +4711,21 @@ impl GpuModel {
                 got: packed.shape().to_vec(),
             });
         }
-        let lora = self.q_lora.as_ref().ok_or_else(|| {
-            pg_core::PgError::InvalidOp("pack_q_lora_grads requires enabled LoRA".into())
-        })?;
         let mut offset = 0usize;
-        for layer in 0..self.config.num_layers {
-            let a_len = lora.grad_a[layer].numel();
-            let dst = packed.slice_range(offset, offset + a_len)?;
-            self.copy_tensor(&lora.grad_a[layer], &dst)?;
-            offset += a_len;
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
+                let a_len = lora.grad_a[slot].numel();
+                let dst = packed.slice_range(offset, offset + a_len)?;
+                self.copy_tensor_flat_f32(&lora.grad_a[slot], &dst)?;
+                offset += a_len;
 
-            let b_len = lora.grad_b[layer].numel();
-            let dst = packed.slice_range(offset, offset + b_len)?;
-            self.copy_tensor(&lora.grad_b[layer], &dst)?;
-            offset += b_len;
-        }
-        Ok(())
+                let b_len = lora.grad_b[slot].numel();
+                let dst = packed.slice_range(offset, offset + b_len)?;
+                self.copy_tensor_flat_f32(&lora.grad_b[slot], &dst)?;
+                offset += b_len;
+            }
+            Ok(())
+        })
     }
 
     pub fn unpack_q_lora_grads(&self, packed: &GpuTensor) -> PgResult<()> {
@@ -4374,82 +4736,83 @@ impl GpuModel {
                 got: packed.shape().to_vec(),
             });
         }
-        let lora = self.q_lora.as_ref().ok_or_else(|| {
-            pg_core::PgError::InvalidOp("unpack_q_lora_grads requires enabled LoRA".into())
-        })?;
         let mut offset = 0usize;
-        for layer in 0..self.config.num_layers {
-            let a_len = lora.grad_a[layer].numel();
-            let src = packed.slice_range(offset, offset + a_len)?;
-            self.copy_tensor(&src, &lora.grad_a[layer])?;
-            offset += a_len;
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
+                let a_len = lora.grad_a[slot].numel();
+                let src = packed.slice_range(offset, offset + a_len)?;
+                self.copy_tensor_flat_f32(&src, &lora.grad_a[slot])?;
+                offset += a_len;
 
-            let b_len = lora.grad_b[layer].numel();
-            let src = packed.slice_range(offset, offset + b_len)?;
-            self.copy_tensor(&src, &lora.grad_b[layer])?;
-            offset += b_len;
-        }
-        Ok(())
+                let b_len = lora.grad_b[slot].numel();
+                let src = packed.slice_range(offset, offset + b_len)?;
+                self.copy_tensor_flat_f32(&src, &lora.grad_b[slot])?;
+                offset += b_len;
+            }
+            Ok(())
+        })
     }
 
     pub fn scale_q_lora_grads(&self, alpha: f32) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
-            for layer in 0..self.config.num_layers {
+        let stream = self.gemm.stream();
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
                 self.kernels.scale_inplace(
-                    CudaPtr(lora.grad_a[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_a[slot].cu_ptr(stream)?),
                     alpha,
-                    lora.grad_a[layer].numel() as u32,
+                    lora.grad_a[slot].numel() as u32,
                 )?;
                 self.kernels.scale_inplace(
-                    CudaPtr(lora.grad_b[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_b[slot].cu_ptr(stream)?),
                     alpha,
-                    lora.grad_b[layer].numel() as u32,
+                    lora.grad_b[slot].numel() as u32,
                 )?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn reset_q_lora_b(&self) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
+        let stream = self.gemm.stream();
+        self.for_each_lora_adapter(|lora| {
             for b in &lora.b {
                 self.kernels
                     .scale_inplace(CudaPtr(b.cu_ptr(stream)?), 0.0, b.numel() as u32)?;
             }
-            self.zero_q_lora_grads()?;
-        }
+            Ok(())
+        })?;
+        self.zero_q_lora_grads()?;
         Ok(())
     }
 
     pub fn step_q_lora_sgd(&self, lr: f32, weight_decay: f32) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
-        if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
-            for layer in 0..self.config.num_layers {
+        let stream = self.gemm.stream();
+        self.for_each_lora_adapter(|lora| {
+            for slot in 0..lora.slots {
                 self.kernels.decay_sgd_step(
-                    CudaPtr(lora.a[layer].cu_ptr(stream)?),
-                    CudaPtr(lora.grad_a[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.a[slot].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_a[slot].cu_ptr(stream)?),
                     lr,
                     weight_decay,
-                    lora.a[layer].numel() as u32,
+                    lora.a[slot].numel() as u32,
                 )?;
                 self.kernels.decay_sgd_step(
-                    CudaPtr(lora.b[layer].cu_ptr(stream)?),
-                    CudaPtr(lora.grad_b[layer].cu_ptr(stream)?),
+                    CudaPtr(lora.b[slot].cu_ptr(stream)?),
+                    CudaPtr(lora.grad_b[slot].cu_ptr(stream)?),
                     lr,
                     weight_decay,
-                    lora.b[layer].numel() as u32,
+                    lora.b[slot].numel() as u32,
                 )?;
             }
-            self.zero_q_lora_grads()?;
-        }
+            Ok(())
+        })?;
+        self.zero_q_lora_grads()?;
         Ok(())
     }
 
@@ -4461,12 +4824,26 @@ impl GpuModel {
         }
     }
 
-    fn parallel_residual_enabled(&self) -> bool {
-        self.config.parallel_residual
+    fn parallel_residual_enabled_for_layer(&self, layer: usize) -> bool {
+        self.config.parallel_residual_enabled_for_layer(layer)
     }
 
     fn is_recurrent_layer(&self, layer: usize) -> bool {
         self.recurrence_active.get() && self.config.is_recurrent_layer(layer)
+    }
+
+    fn recurrent_layer_uses_straight_through_backward(&self, layer: usize) -> bool {
+        if !self.is_recurrent_layer(layer) {
+            return false;
+        }
+        if gpu_recurrent_all_straight_through_enabled() {
+            return true;
+        }
+        let st_layers =
+            gpu_recurrent_straight_through_layers().min(self.config.recurrence_repeat_layers);
+        st_layers > 0
+            && layer >= self.config.recurrence_start_layer
+            && layer < self.config.recurrence_start_layer + st_layers
     }
 
     pub fn set_recurrence_active(&self, active: bool) {
@@ -4803,10 +5180,23 @@ impl GpuModel {
         )
     }
 
+    #[track_caller]
     fn copy_tensor(&self, src: &GpuTensor, dst: &GpuTensor) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         if src.shape() != dst.shape() {
+            if gpu_shape_trace_enabled() {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "gpu_shape_trace copy_tensor mismatch at {}:{} src_shape={:?} dst_shape={:?} src_dtype={:?} dst_dtype={:?}",
+                    caller.file(),
+                    caller.line(),
+                    src.shape(),
+                    dst.shape(),
+                    src.dtype(),
+                    dst.dtype(),
+                );
+            }
             return Err(pg_core::PgError::ShapeMismatch {
                 expected: src.shape().to_vec(),
                 got: dst.shape().to_vec(),
@@ -4821,10 +5211,23 @@ impl GpuModel {
         )
     }
 
+    #[track_caller]
     fn copy_bf16_tensor(&self, src: &GpuTensor, dst: &GpuTensor) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         if src.shape() != dst.shape() {
+            if gpu_shape_trace_enabled() {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "gpu_shape_trace copy_bf16_tensor mismatch at {}:{} src_shape={:?} dst_shape={:?} src_dtype={:?} dst_dtype={:?}",
+                    caller.file(),
+                    caller.line(),
+                    src.shape(),
+                    dst.shape(),
+                    src.dtype(),
+                    dst.dtype(),
+                );
+            }
             return Err(pg_core::PgError::ShapeMismatch {
                 expected: src.shape().to_vec(),
                 got: dst.shape().to_vec(),
@@ -4844,10 +5247,61 @@ impl GpuModel {
         )
     }
 
+    #[track_caller]
+    fn copy_tensor_flat_f32(&self, src: &GpuTensor, dst: &GpuTensor) -> PgResult<()> {
+        use pg_kernels::gpu_kernels::CudaPtr;
+
+        if src.dtype() != DType::F32 || dst.dtype() != DType::F32 {
+            return Err(PgError::InvalidOp(format!(
+                "copy_tensor_flat_f32 requires F32 tensors, got src={:?} dst={:?}",
+                src.dtype(),
+                dst.dtype()
+            )));
+        }
+        if src.numel() != dst.numel() {
+            if gpu_shape_trace_enabled() {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "gpu_shape_trace copy_tensor_flat_f32 mismatch at {}:{} src_shape={:?} dst_shape={:?} src_numel={} dst_numel={}",
+                    caller.file(),
+                    caller.line(),
+                    src.shape(),
+                    dst.shape(),
+                    src.numel(),
+                    dst.numel(),
+                );
+            }
+            return Err(pg_core::PgError::ShapeMismatch {
+                expected: vec![src.numel()],
+                got: vec![dst.numel()],
+            });
+        }
+
+        let stream = self.gemm.stream();
+        self.kernels.copy_fwd(
+            CudaPtr(src.cu_ptr(stream)?),
+            CudaPtr(dst.cu_ptr(stream)?),
+            src.numel() as u32,
+        )
+    }
+
+    #[track_caller]
     fn add_inplace(&self, dst: &GpuTensor, src: &GpuTensor, alpha: f32) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
         if dst.shape() != src.shape() {
+            if gpu_shape_trace_enabled() {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "gpu_shape_trace add_inplace mismatch at {}:{} dst_shape={:?} src_shape={:?} dst_dtype={:?} src_dtype={:?}",
+                    caller.file(),
+                    caller.line(),
+                    dst.shape(),
+                    src.shape(),
+                    dst.dtype(),
+                    src.dtype(),
+                );
+            }
             return Err(pg_core::PgError::ShapeMismatch {
                 expected: dst.shape().to_vec(),
                 got: src.shape().to_vec(),
@@ -4863,38 +5317,62 @@ impl GpuModel {
         )
     }
 
-    fn apply_q_lora_forward(&self, layer: usize, buf: &mut GpuActivations) -> PgResult<()> {
+    fn apply_linear_lora_forward(
+        &self,
+        lora: &GpuQProjectionLora,
+        slot: usize,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        buf: &mut GpuActivations,
+    ) -> PgResult<()> {
+        if slot >= lora.slots {
+            return Err(PgError::InvalidOp(format!(
+                "LoRA slot {slot} out of range for {} slots",
+                lora.slots
+            )));
+        }
+        let stream = self.gemm.stream();
+        let t = input.shape()[0];
+        let r = lora.rank;
+        let lora_tmp = &buf.lora_tmp;
+        unsafe {
+            self.gemm.matmul_f32(
+                input.cu_ptr(stream)?,
+                lora.a[slot].cu_ptr(stream)?,
+                lora_tmp.cu_ptr(stream)?,
+                t,
+                r,
+                lora.input_dim,
+                1.0,
+                0.0,
+            )?;
+            self.gemm.matmul_f32(
+                lora_tmp.cu_ptr(stream)?,
+                lora.b[slot].cu_ptr(stream)?,
+                output.cu_ptr(stream)?,
+                t,
+                lora.output_dim,
+                r,
+                lora.scale,
+                1.0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_qkv_loras_forward(&self, layer: usize, buf: &mut GpuActivations) -> PgResult<()> {
+        let attn_norm = buf.attn_norm.clone();
         if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
-            let t = buf.attn_norm.shape()[0];
-            let d = self.config.model_dim;
-            let r = lora.rank;
-            unsafe {
-                self.gemm.matmul_f32(
-                    buf.attn_norm.cu_ptr(stream)?,
-                    lora.a[layer].cu_ptr(stream)?,
-                    buf.lora_tmp.cu_ptr(stream)?,
-                    t,
-                    r,
-                    d,
-                    1.0,
-                    0.0,
-                )?;
-                self.gemm.matmul_f32(
-                    buf.lora_tmp.cu_ptr(stream)?,
-                    lora.b[layer].cu_ptr(stream)?,
-                    buf.lora_delta.cu_ptr(stream)?,
-                    t,
-                    d,
-                    r,
-                    lora.scale,
-                    0.0,
-                )?;
-            }
-            let lora_delta_q =
-                buf.lora_delta
-                    .reshape(&[t, self.config.num_heads, self.config.head_dim])?;
-            self.add_inplace(&buf.q, &lora_delta_q, 1.0)?;
+            let q = buf.q.clone();
+            self.apply_linear_lora_forward(lora, layer, &attn_norm, &q, buf)?;
+        }
+        if let Some(lora) = &self.k_lora {
+            let k = buf.k.clone();
+            self.apply_linear_lora_forward(lora, layer, &attn_norm, &k, buf)?;
+        }
+        if let Some(lora) = &self.v_lora {
+            let v = buf.v.clone();
+            self.apply_linear_lora_forward(lora, layer, &attn_norm, &v, buf)?;
         }
         Ok(())
     }
@@ -4920,34 +5398,39 @@ impl GpuModel {
             ));
         }
         let stream = self.gemm.stream();
-        if self.try_defer_linear_backward_weight_gemm_to_side_bf16(
-            dy_bf16,
-            x_bf16,
-            weight_bf16,
-            dx_bf16,
-            dw,
-            tokens,
-            out_dim,
-            in_dim,
-            dx_beta,
-            dw_beta,
-            role,
-        )? {
+        let skip_dw = gpu_skip_bank_dw(dw_beta);
+        if !skip_dw
+            && self.try_defer_linear_backward_weight_gemm_to_side_bf16(
+                dy_bf16,
+                x_bf16,
+                weight_bf16,
+                dx_bf16,
+                dw,
+                tokens,
+                out_dim,
+                in_dim,
+                dx_beta,
+                dw_beta,
+                role,
+            )?
+        {
             return Ok(());
         }
-        if self.try_overlap_linear_backward_gemms_to_bf16(
-            dy_bf16,
-            x_bf16,
-            weight_bf16,
-            dx_bf16,
-            dw,
-            tokens,
-            out_dim,
-            in_dim,
-            dx_beta,
-            dw_beta,
-            role,
-        )? {
+        if !skip_dw
+            && self.try_overlap_linear_backward_gemms_to_bf16(
+                dy_bf16,
+                x_bf16,
+                weight_bf16,
+                dx_bf16,
+                dw,
+                tokens,
+                out_dim,
+                in_dim,
+                dx_beta,
+                dw_beta,
+                role,
+            )?
+        {
             return Ok(());
         }
         unsafe {
@@ -4961,6 +5444,9 @@ impl GpuModel {
                 1.0,
                 dx_beta,
             )?;
+            if skip_dw {
+                return Ok(());
+            }
             self.gemm.linear_backward_weight_bf16_to_f32(
                 dy_bf16.cu_ptr(stream)?,
                 x_bf16.cu_ptr(stream)?,
@@ -4975,61 +5461,100 @@ impl GpuModel {
         Ok(())
     }
 
-    fn backward_q_lora(
+    fn backward_linear_lora(
+        &self,
+        lora: &GpuQProjectionLora,
+        slot: usize,
+        input: &GpuTensor,
+        grad_output: &GpuTensor,
+        grad_input_accum: &GpuTensor,
+        buf: &mut GpuActivations,
+    ) -> PgResult<()> {
+        if slot >= lora.slots {
+            return Err(PgError::InvalidOp(format!(
+                "LoRA slot {slot} out of range for {} slots",
+                lora.slots
+            )));
+        }
+        let stream = self.gemm.stream();
+        let t = input.shape()[0];
+        let r = lora.rank;
+        let lora_tmp = &buf.lora_tmp;
+        let lora_grad_tmp = &buf.lora_grad_tmp;
+        let lora_delta = &buf.lora_delta;
+        unsafe {
+            self.gemm.matmul_f32(
+                input.cu_ptr(stream)?,
+                lora.a[slot].cu_ptr(stream)?,
+                lora_tmp.cu_ptr(stream)?,
+                t,
+                r,
+                lora.input_dim,
+                1.0,
+                0.0,
+            )?;
+            self.gemm.linear_backward_weight_f32(
+                grad_output.cu_ptr(stream)?,
+                lora_tmp.cu_ptr(stream)?,
+                lora.grad_b[slot].cu_ptr(stream)?,
+                t,
+                lora.output_dim,
+                r,
+                lora.scale,
+                1.0,
+            )?;
+            self.gemm.linear_backward_input_f32(
+                grad_output.cu_ptr(stream)?,
+                lora.b[slot].cu_ptr(stream)?,
+                lora_grad_tmp.cu_ptr(stream)?,
+                t,
+                lora.output_dim,
+                r,
+                lora.scale,
+                0.0,
+            )?;
+            self.gemm.linear_backward_weight_f32(
+                lora_grad_tmp.cu_ptr(stream)?,
+                input.cu_ptr(stream)?,
+                lora.grad_a[slot].cu_ptr(stream)?,
+                t,
+                r,
+                lora.input_dim,
+                1.0,
+                1.0,
+            )?;
+            self.gemm.linear_backward_input_f32(
+                lora_grad_tmp.cu_ptr(stream)?,
+                lora.a[slot].cu_ptr(stream)?,
+                lora_delta.cu_ptr(stream)?,
+                t,
+                r,
+                lora.input_dim,
+                1.0,
+                0.0,
+            )?;
+        }
+        self.add_inplace(grad_input_accum, lora_delta, 1.0)
+    }
+
+    fn backward_qkv_loras(
         &self,
         layer: usize,
+        attn_norm: &GpuTensor,
         grad_q_proj: &GpuTensor,
+        grad_k_proj: &GpuTensor,
+        grad_v_proj: &GpuTensor,
         grad_attn_norm: &GpuTensor,
         buf: &mut GpuActivations,
     ) -> PgResult<()> {
         if let Some(lora) = &self.q_lora {
-            let stream = self.gemm.stream();
-            let t = buf.attn_norm.shape()[0];
-            let d = self.config.model_dim;
-            let r = lora.rank;
-            unsafe {
-                self.gemm.linear_backward_weight_f32(
-                    grad_q_proj.cu_ptr(stream)?,
-                    buf.lora_tmp.cu_ptr(stream)?,
-                    lora.grad_b[layer].cu_ptr(stream)?,
-                    t,
-                    d,
-                    r,
-                    lora.scale,
-                    1.0,
-                )?;
-                self.gemm.linear_backward_input_f32(
-                    grad_q_proj.cu_ptr(stream)?,
-                    lora.b[layer].cu_ptr(stream)?,
-                    buf.lora_grad_tmp.cu_ptr(stream)?,
-                    t,
-                    d,
-                    r,
-                    lora.scale,
-                    0.0,
-                )?;
-                self.gemm.linear_backward_weight_f32(
-                    buf.lora_grad_tmp.cu_ptr(stream)?,
-                    buf.attn_norm.cu_ptr(stream)?,
-                    lora.grad_a[layer].cu_ptr(stream)?,
-                    t,
-                    r,
-                    d,
-                    1.0,
-                    1.0,
-                )?;
-                self.gemm.linear_backward_input_f32(
-                    buf.lora_grad_tmp.cu_ptr(stream)?,
-                    lora.a[layer].cu_ptr(stream)?,
-                    buf.lora_delta.cu_ptr(stream)?,
-                    t,
-                    r,
-                    d,
-                    1.0,
-                    0.0,
-                )?;
-            }
-            self.add_inplace(grad_attn_norm, &buf.lora_delta, 1.0)?;
+            self.backward_linear_lora(lora, layer, attn_norm, grad_q_proj, grad_attn_norm, buf)?;
+        }
+        if let Some(lora) = &self.k_lora {
+            self.backward_linear_lora(lora, layer, attn_norm, grad_k_proj, grad_attn_norm, buf)?;
+        }
+        if let Some(lora) = &self.v_lora {
+            self.backward_linear_lora(lora, layer, attn_norm, grad_v_proj, grad_attn_norm, buf)?;
         }
         Ok(())
     }
@@ -5086,7 +5611,8 @@ impl GpuModel {
                 CudaPtr(targets.cu_ptr(stream)?),
                 CudaPtr(losses.cu_ptr(stream)?),
                 self.config.vocab_size as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 tokens as u32,
             )
         } else {
@@ -5095,7 +5621,8 @@ impl GpuModel {
                 CudaPtr(targets.cu_ptr(stream)?),
                 CudaPtr(losses.cu_ptr(stream)?),
                 self.config.vocab_size as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 tokens as u32,
             )
         }
@@ -5283,7 +5810,7 @@ impl GpuModel {
             )?;
         }
 
-        let save_qk_during_qkv = self.q_lora.is_none();
+        let save_qk_during_qkv = !self.any_qkv_lora_enabled();
         let qkv_projected = self.qkv_projection_forward(
             layer,
             buf,
@@ -5345,7 +5872,7 @@ impl GpuModel {
             self.linear_forward_f32(&buf.attn_norm, &k_w, &buf.k, t, kv, d)?;
             self.linear_forward_f32(&buf.attn_norm, &v_w, &buf.v, t, kv, d)?;
         }
-        self.apply_q_lora_forward(layer, buf)?;
+        self.apply_qkv_loras_forward(layer, buf)?;
         if !qk_pre_norm_saved_by_qkv {
             self.copy_tensor(&buf.q, &cache.q_pre_norm)?;
             self.copy_tensor(&buf.k, &cache.k_pre_norm)?;
@@ -5468,6 +5995,11 @@ impl GpuModel {
             d,
             d,
         )?;
+        if let Some(lora) = &self.o_lora {
+            let attn_norm = buf.attn_norm.clone();
+            let proj_out = buf.proj_out.clone();
+            self.apply_linear_lora_forward(lora, layer, &attn_norm, &proj_out, buf)?;
+        }
 
         if self.use_fused_attention_residual_from_base() {
             self.kernels.residual_add_scale_from_base_fwd(
@@ -5488,14 +6020,14 @@ impl GpuModel {
                 (t * d) as u32,
             )?;
         }
-        if self.parallel_residual_enabled() {
+        if self.parallel_residual_enabled_for_layer(layer) {
             self.copy_tensor(&buf.x_in, &cache.x_after_attn)?;
         } else {
             self.copy_tensor(&buf.x, &cache.x_after_attn)?;
         }
 
         self.kernels.rms_norm_forward(
-            if self.parallel_residual_enabled() {
+            if self.parallel_residual_enabled_for_layer(layer) {
                 CudaPtr(buf.x_in.cu_ptr(stream)?)
             } else {
                 CudaPtr(buf.x.cu_ptr(stream)?)
@@ -5554,6 +6086,11 @@ impl GpuModel {
                 d,
                 mlp,
             )?;
+        }
+        if let Some(lora) = &self.mlp_lora {
+            let mlp_norm = buf.mlp_norm.clone();
+            let mlp_out = buf.mlp_out.clone();
+            self.apply_linear_lora_forward(lora, layer, &mlp_norm, &mlp_out, buf)?;
         }
         self.kernels.residual_add_scale_fwd(
             CudaPtr(buf.x.cu_ptr(stream)?),
@@ -5629,7 +6166,7 @@ impl GpuModel {
             // The LoRA backward path consumes forward LoRA scratch that is not
             // part of the saved block cache. Fall back to the established
             // restore/recompute path when LoRA is active.
-            && self.q_lora.is_none();
+            && !self.any_lora_enabled();
         if direct_saved {
             // Read-only saved activations are consumed directly below.
         } else if let Some(saved) = saved {
@@ -5701,7 +6238,8 @@ impl GpuModel {
         let substage_start = record_stage_event_if(stream, stage_timing.is_some())?;
         let grad_x_after_attn = &block_cache.grad_x_after_attn;
         let grad_mlp_out = &block_cache.grad_mlp_out;
-        let grad_mlp_out_bf16 = &buf.x_aux_bf16;
+        let grad_mlp_out_bf16_storage = buf.x_aux_bf16.clone();
+        let grad_mlp_out_bf16 = &grad_mlp_out_bf16_storage;
         let residual_scale_rows_per_chunk = gpu_residual_scale_backward_rows_per_chunk();
         let mlp_residual_start = record_stage_event_if(stream, stage_timing.is_some())?;
         if !gpu_residual_scale_reduce_enabled() {
@@ -5931,7 +6469,8 @@ impl GpuModel {
         )?;
 
         let grad_mlp_norm = &block_cache.grad_mlp_norm;
-        let grad_mlp_norm_bf16 = &buf.x_aux_bf16;
+        let grad_mlp_norm_bf16_storage = buf.x_aux_bf16.clone();
+        let grad_mlp_norm_bf16 = &grad_mlp_norm_bf16_storage;
         let mlp_up_w = self.weights.mlp_up_bank.slice_first(layer)?;
         let mlp_up_w_bf16 = self.weights.mlp_up_bank_bf16.slice_first(layer)?;
         // MLP-down dW may still be reading buf.x_aux_bf16; MLP-up dX writes it.
@@ -5992,8 +6531,27 @@ impl GpuModel {
         )?;
 
         let grad_x_pre_mlp_norm = &block_cache.grad_x_pre_mlp_norm;
+        if let Some(lora) = &self.mlp_lora {
+            if self.use_bf16_backward_gemm() {
+                self.kernels.bf16_to_f32(
+                    CudaPtr(grad_mlp_out_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_mlp_out.cu_ptr(stream)?),
+                    grad_mlp_out.numel() as u32,
+                )?;
+            }
+            let mlp_norm_for_lora = act!(mlp_norm).clone();
+            let grad_mlp_norm_for_lora = grad_mlp_norm.clone();
+            self.backward_linear_lora(
+                lora,
+                layer,
+                &mlp_norm_for_lora,
+                grad_mlp_out,
+                &grad_mlp_norm_for_lora,
+                buf,
+            )?;
+        }
         let mlp_norm_start = record_stage_event_if(stream, stage_timing.is_some())?;
-        if self.parallel_residual_enabled()
+        if self.parallel_residual_enabled_for_layer(layer)
             && recompute_residual_mix_norm_inputs
             && self.use_bf16_norm_grad_path()
         {
@@ -6010,7 +6568,9 @@ impl GpuModel {
                     1e-6,
                     0.0,
                 )?;
-        } else if self.parallel_residual_enabled() && recompute_residual_mix_norm_inputs {
+        } else if self.parallel_residual_enabled_for_layer(layer)
+            && recompute_residual_mix_norm_inputs
+        {
             self.kernels.rms_norm_backward_accum_residual_mix_input(
                 CudaPtr(layer_x.cu_ptr(stream)?),
                 CudaPtr(x0.cu_ptr(stream)?),
@@ -6024,7 +6584,7 @@ impl GpuModel {
                 0.0,
             )?;
         } else if self.use_bf16_norm_grad_path() {
-            let mlp_norm_input = if self.parallel_residual_enabled() {
+            let mlp_norm_input = if self.parallel_residual_enabled_for_layer(layer) {
                 act!(x_in)
             } else {
                 block_act!(x_after_attn)
@@ -6039,7 +6599,7 @@ impl GpuModel {
                 1e-6,
             )?;
         } else {
-            let mlp_norm_input = if self.parallel_residual_enabled() {
+            let mlp_norm_input = if self.parallel_residual_enabled_for_layer(layer) {
                 act!(x_in)
             } else {
                 block_act!(x_after_attn)
@@ -6054,7 +6614,7 @@ impl GpuModel {
                 1e-6,
             )?;
         }
-        if !self.parallel_residual_enabled() {
+        if !self.parallel_residual_enabled_for_layer(layer) {
             self.add_inplace(grad_x_after_attn, grad_x_pre_mlp_norm, 1.0)?;
         }
         finish_stage_event_optional(
@@ -6076,10 +6636,11 @@ impl GpuModel {
         let substage_start = record_stage_event_if(stream, stage_timing.is_some())?;
         let grad_x_in = &block_cache.grad_x_in;
         let grad_proj_out = &block_cache.grad_proj_out;
-        let grad_proj_out_bf16 = &buf.x_aux_bf16;
+        let grad_proj_out_bf16_storage = buf.x_aux_bf16.clone();
+        let grad_proj_out_bf16 = &grad_proj_out_bf16_storage;
         let attn_out_residual_start = record_stage_event_if(stream, stage_timing.is_some())?;
         let fuse_attn_residual_add =
-            self.parallel_residual_enabled() && gpu_residual_scale_reduce_enabled();
+            self.parallel_residual_enabled_for_layer(layer) && gpu_residual_scale_reduce_enabled();
         let mut attn_residual_add_fused = false;
         if !gpu_residual_scale_reduce_enabled() {
             self.zero_tensor(grad_x_in)?;
@@ -6183,7 +6744,7 @@ impl GpuModel {
                 (t * d) as u32,
             )?;
         }
-        if self.parallel_residual_enabled() && !attn_residual_add_fused {
+        if self.parallel_residual_enabled_for_layer(layer) && !attn_residual_add_fused {
             self.add_inplace(grad_x_in, grad_x_pre_mlp_norm, 1.0)?;
         }
         finish_stage_event_optional(
@@ -6293,7 +6854,7 @@ impl GpuModel {
             && saved_attention_bf16.is_some()
             && self.use_fused_qkv_projection()
             && self.use_bf16_qkv_dx_output()
-            && self.q_lora.is_none()
+            && !self.any_lora_enabled()
             && gpu_sparse_xsa_warphead_backward_enabled()
             && !gpu_sparse_xsa_grouped_kv_backward_enabled();
         let compact_attn_gate_grad_width = self.config.sparse_attn_gate_width;
@@ -6761,9 +7322,9 @@ impl GpuModel {
                     "PG_GPU_BF16_BACKWARD_CHAIN requires direct BF16 saved attention activations with F32 attention saves skipped; refusing F32 saved-attention fallback".into(),
                 ));
             }
-            if self.q_lora.is_some() {
+            if self.any_lora_enabled() {
                 return Err(pg_core::PgError::InvalidOp(
-                    "PG_GPU_BF16_BACKWARD_CHAIN requires q_lora disabled; q_lora backward still depends on the F32 Q path".into(),
+                    "PG_GPU_BF16_BACKWARD_CHAIN requires LoRA-TTT adapters disabled; LoRA backward still depends on F32 adapter paths".into(),
                 ));
             }
             if !self.config.ve_layers.is_empty() {
@@ -6918,11 +7479,15 @@ impl GpuModel {
         if use_bf16_attention_tail_direct_qkv_pack {
             let q_gain_chunks = t.div_ceil(q_gain_chunk_tokens).max(1);
             self.zero_tensor(&block_cache.q_gain_reduce_scratch)?;
-            self.kernels
-                .q_gain_rope_qk_norm_bwd_chunked_go_bf16_pack_q(
+            if gpu_combined_qkv_rope_tail_backward_enabled() {
+                self.kernels.qkv_rope_qk_norm_bwd_chunked_go_bf16_pack(
                     CudaPtr(block_act!(q_pre_norm).cu_ptr(stream)?),
                     CudaPtr(block_act!(q_post_rope).cu_ptr(stream)?),
                     CudaPtr(grad_q_post_gain_bf16.cu_ptr(stream)?),
+                    CudaPtr(block_act!(k_pre_norm).cu_ptr(stream)?),
+                    CudaPtr(grad_k_attn_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_v_xsa.cu_ptr(stream)?),
                     CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
                     CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
                     CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
@@ -6931,32 +7496,58 @@ impl GpuModel {
                     CudaPtr(grads.block_q_gain[layer].cu_ptr(stream)?),
                     runtime_seq_len as u32,
                     h as u32,
+                    hkv as u32,
                     hd as u32,
                     self.config.rope_dims as u32,
-                    (t * h) as u32,
+                    t as u32,
                     q_gain_chunk_tokens as u32,
                     q_gain_chunks as u32,
-                    (d + 2 * kv) as u32,
+                    d as u32,
+                    kv as u32,
+                    add_v_xsa,
                     1e-6,
                 )?;
-            self.kernels.rope_qk_norm_bwd_go_bf16_pack_kv(
-                CudaPtr(block_act!(k_pre_norm).cu_ptr(stream)?),
-                CudaPtr(grad_k_attn_bf16.cu_ptr(stream)?),
-                CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
-                CudaPtr(grad_v_xsa.cu_ptr(stream)?),
-                CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
-                CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                CudaPtr(buf.qkv_aux_bf16.cu_ptr(stream)?),
-                runtime_seq_len as u32,
-                hkv as u32,
-                hd as u32,
-                self.config.rope_dims as u32,
-                (t * hkv) as u32,
-                d as u32,
-                kv as u32,
-                add_v_xsa,
-                1e-6,
-            )?;
+            } else {
+                self.kernels
+                    .q_gain_rope_qk_norm_bwd_chunked_go_bf16_pack_q(
+                        CudaPtr(block_act!(q_pre_norm).cu_ptr(stream)?),
+                        CudaPtr(block_act!(q_post_rope).cu_ptr(stream)?),
+                        CudaPtr(grad_q_post_gain_bf16.cu_ptr(stream)?),
+                        CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
+                        CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                        CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                        CudaPtr(buf.qkv_aux_bf16.cu_ptr(stream)?),
+                        CudaPtr(block_cache.q_gain_reduce_scratch.cu_ptr(stream)?),
+                        CudaPtr(grads.block_q_gain[layer].cu_ptr(stream)?),
+                        runtime_seq_len as u32,
+                        h as u32,
+                        hd as u32,
+                        self.config.rope_dims as u32,
+                        (t * h) as u32,
+                        q_gain_chunk_tokens as u32,
+                        q_gain_chunks as u32,
+                        (d + 2 * kv) as u32,
+                        1e-6,
+                    )?;
+                self.kernels.rope_qk_norm_bwd_go_bf16_pack_kv(
+                    CudaPtr(block_act!(k_pre_norm).cu_ptr(stream)?),
+                    CudaPtr(grad_k_attn_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_v_projection_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_v_xsa.cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                    CudaPtr(buf.qkv_aux_bf16.cu_ptr(stream)?),
+                    runtime_seq_len as u32,
+                    hkv as u32,
+                    hd as u32,
+                    self.config.rope_dims as u32,
+                    (t * hkv) as u32,
+                    d as u32,
+                    kv as u32,
+                    add_v_xsa,
+                    1e-6,
+                )?;
+            }
         } else if use_bf16_attention_tail_qkv_pack {
             let q_gain_chunks = t.div_ceil(q_gain_chunk_tokens).max(1);
             self.zero_tensor(&block_cache.q_gain_reduce_scratch)?;
@@ -7161,6 +7752,7 @@ impl GpuModel {
                 saved_direct.map(|saved| &saved.attn_norm),
                 saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
                 t,
+                bank_dw_beta,
             )?
         } else {
             self.qkv_projection_backward(
@@ -7175,6 +7767,7 @@ impl GpuModel {
                 saved_direct.map(|saved| &saved.attn_norm),
                 saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
                 t,
+                bank_dw_beta,
             )?
         };
         if use_bf16_attention_tail_qkv_pack && !qkv_fused {
@@ -7360,7 +7953,35 @@ impl GpuModel {
                 )?;
                 self.add_inplace(&grad_attn_norm, grad_attn_norm_v, 1.0)?;
             }
-            self.backward_q_lora(layer, &grad_q_proj, &grad_attn_norm, buf)?;
+            let attn_norm_for_lora = act!(attn_norm).clone();
+            self.backward_qkv_loras(
+                layer,
+                &attn_norm_for_lora,
+                &grad_q_proj,
+                &grad_k_proj,
+                &grad_v_projection,
+                &grad_attn_norm,
+                buf,
+            )?;
+        }
+        if let Some(lora) = &self.o_lora {
+            if self.use_bf16_backward_gemm() {
+                self.kernels.bf16_to_f32(
+                    CudaPtr(grad_proj_out_bf16.cu_ptr(stream)?),
+                    CudaPtr(grad_proj_out.cu_ptr(stream)?),
+                    grad_proj_out.numel() as u32,
+                )?;
+            }
+            let attn_norm_for_lora = act!(attn_norm).clone();
+            let grad_attn_norm_for_lora = grad_attn_norm.clone();
+            self.backward_linear_lora(
+                lora,
+                layer,
+                &attn_norm_for_lora,
+                grad_proj_out,
+                &grad_attn_norm_for_lora,
+                buf,
+            )?;
         }
         finish_stage_event_optional(
             stream,
@@ -7372,7 +7993,7 @@ impl GpuModel {
         check_cuda_graph_capture_stage(stream, &format!("block_{layer}_qkv_projection_backward"))?;
         let qkv_norm_resid_start = record_stage_event_if(stream, stage_timing.is_some())?;
         let qkv_dx_bf16_for_norm_tail =
-            qkv_fused && self.use_bf16_qkv_dx_output() && self.q_lora.is_none();
+            qkv_fused && self.use_bf16_qkv_dx_output() && !self.any_qkv_lora_enabled();
         let gate_extra_grad =
             self.config.attn_out_gate_enabled || self.config.sparse_attn_gate_enabled;
         if gate_extra_grad && !qkv_dx_bf16_for_norm_tail {
@@ -7506,6 +8127,29 @@ impl GpuModel {
                             1.0,
                         )?;
                 }
+            } else if gate_extra_grad
+                && compact_attn_gate_grad_input
+                && gpu_skip_residual_mix_grad_enabled()
+            {
+                self.kernels
+                    .rms_norm_backward_accum_residual_mix_bwd_go_bf16_add_compact_no_mix_grad(
+                        CudaPtr(act!(x_in).cu_ptr(stream)?),
+                        CudaPtr(block_cache.grad_attn_norm_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gate_grad_input_compact.cu_ptr(stream)?),
+                        CudaPtr(layer_x.cu_ptr(stream)?),
+                        CudaPtr(x0.cu_ptr(stream)?),
+                        CudaPtr(self.weights.resid_mix[layer].cu_ptr(stream)?),
+                        CudaPtr(grad_x_in.cu_ptr(stream)?),
+                        CudaPtr(grad_x_out.cu_ptr(stream)?),
+                        CudaPtr(grad_x0.cu_ptr(stream)?),
+                        CudaPtr(block_cache.residual_mix_norm_stats.cu_ptr(stream)?),
+                        t as u32,
+                        d as u32,
+                        compact_attn_gate_grad_width as u32,
+                        self.ln_scale_factor(layer),
+                        1e-6,
+                        1.0,
+                    )?;
             } else if gate_extra_grad && compact_attn_gate_grad_input {
                 self.kernels
                     .rms_norm_backward_accum_residual_mix_bwd_go_bf16_add_compact(
@@ -7522,6 +8166,25 @@ impl GpuModel {
                         t as u32,
                         d as u32,
                         compact_attn_gate_grad_width as u32,
+                        self.ln_scale_factor(layer),
+                        1e-6,
+                        1.0,
+                    )?;
+            } else if gate_extra_grad && gpu_skip_residual_mix_grad_enabled() {
+                self.kernels
+                    .rms_norm_backward_accum_residual_mix_bwd_go_bf16_add_no_mix_grad(
+                        CudaPtr(act!(x_in).cu_ptr(stream)?),
+                        CudaPtr(block_cache.grad_attn_norm_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gate_grad_input.cu_ptr(stream)?),
+                        CudaPtr(layer_x.cu_ptr(stream)?),
+                        CudaPtr(x0.cu_ptr(stream)?),
+                        CudaPtr(self.weights.resid_mix[layer].cu_ptr(stream)?),
+                        CudaPtr(grad_x_in.cu_ptr(stream)?),
+                        CudaPtr(grad_x_out.cu_ptr(stream)?),
+                        CudaPtr(grad_x0.cu_ptr(stream)?),
+                        CudaPtr(block_cache.residual_mix_norm_stats.cu_ptr(stream)?),
+                        t as u32,
+                        d as u32,
                         self.ln_scale_factor(layer),
                         1e-6,
                         1.0,
@@ -7685,10 +8348,24 @@ impl GpuModel {
     ) -> PgResult<()> {
         let first_bank_contribution_beta = gpu_bank_grad_dw_beta(true);
         let accum_bank_contribution_beta = gpu_bank_grad_dw_beta(false);
+        let recurrent_bank_beta = if gpu_skip_recurrent_bank_grads_enabled() {
+            f32::NAN
+        } else {
+            first_bank_contribution_beta
+        };
+        let recurrent_pass1_bank_beta = if gpu_skip_recurrent_bank_grads_enabled()
+            || gpu_skip_recurrent_pass1_bank_grads_enabled()
+        {
+            f32::NAN
+        } else {
+            accum_bank_contribution_beta
+        };
         if self.is_recurrent_layer(layer) {
-            if let (Some(pass2_saved), Some(pass1_saved), Some(mid_x)) =
-                (saved, recurrent_pass1_saved, recurrent_mid_x)
-            {
+            if self.recurrent_layer_uses_straight_through_backward(layer) {
+                self.copy_tensor(grad_x, grad_x_out)?;
+                return Ok(());
+            }
+            if let (Some(pass2_saved), Some(mid_x)) = (saved, recurrent_mid_x) {
                 let grad_mid = block_cache.grad_mid.clone();
                 self.block_backward_single_into(
                     layer,
@@ -7704,9 +8381,18 @@ impl GpuModel {
                     runtime_seq_len,
                     Some(pass2_saved),
                     forward_generation,
-                    first_bank_contribution_beta,
+                    recurrent_bank_beta,
                     stage_timing.as_deref_mut(),
                 )?;
+                if gpu_recurrent_pass1_straight_through_enabled() {
+                    self.copy_tensor(&grad_mid, grad_x_out)?;
+                    return Ok(());
+                }
+                let pass1_saved = recurrent_pass1_saved.ok_or_else(|| {
+                    PgError::InvalidOp(format!(
+                        "missing recurrent pass-1 saved activations for layer {layer}"
+                    ))
+                })?;
                 return self.block_backward_single_into(
                     layer,
                     input_ids,
@@ -7721,7 +8407,7 @@ impl GpuModel {
                     runtime_seq_len,
                     Some(pass1_saved),
                     forward_generation,
-                    accum_bank_contribution_beta,
+                    recurrent_pass1_bank_beta,
                     stage_timing.as_deref_mut(),
                 );
             }
@@ -7751,9 +8437,13 @@ impl GpuModel {
                 runtime_seq_len,
                 None,
                 forward_generation,
-                first_bank_contribution_beta,
+                recurrent_bank_beta,
                 stage_timing.as_deref_mut(),
             )?;
+            if gpu_recurrent_pass1_straight_through_enabled() {
+                self.copy_tensor(&grad_mid, grad_x_out)?;
+                return Ok(());
+            }
             return self.block_backward_single_into(
                 layer,
                 input_ids,
@@ -7768,7 +8458,7 @@ impl GpuModel {
                 runtime_seq_len,
                 None,
                 forward_generation,
-                accum_bank_contribution_beta,
+                recurrent_pass1_bank_beta,
                 stage_timing.as_deref_mut(),
             );
         }
@@ -7800,6 +8490,7 @@ impl GpuModel {
         runtime_seq_len: usize,
         forward_generation: u64,
         save: Option<&GpuLayerForwardCache>,
+        save_backward_activations: bool,
         mut stage_timing: Option<&mut GpuBackwardStageTiming>,
     ) -> PgResult<()> {
         use pg_kernels::gpu_kernels::CudaPtr;
@@ -7871,7 +8562,8 @@ impl GpuModel {
             )?;
         }
         if let Some(save) = save.filter(|_| {
-            !(lean_bf16_direct_saved && gpu_recompute_residual_mix_norm_inputs_enabled())
+            save_backward_activations
+                && !(lean_bf16_direct_saved && gpu_recompute_residual_mix_norm_inputs_enabled())
         }) {
             self.copy_tensor(&buf.x_in, &save.x_in)?;
         }
@@ -7901,16 +8593,24 @@ impl GpuModel {
             self.copy_tensor(&buf.attn_norm, &save.attn_norm)?;
         }
 
-        let save_qk_during_qkv = save.filter(|_| self.q_lora.is_none());
+        let save_qk_during_qkv = save.filter(|_| !self.any_qkv_lora_enabled());
         let fused_qkv_rope_prepack_forward = gpu_fused_qkv_rope_prepack_forward_enabled()
             && self.use_fused_qkv_projection()
             && self.use_cudnn_prepacked_bf16_attention()
             && save_qk_during_qkv.is_some()
-            && self.q_lora.is_none()
+            && !self.any_qkv_lora_enabled()
             && self.config.ve_layers.is_empty()
             && self.config.rope_dims > 0
             && runtime_seq_len > 0
             && t % runtime_seq_len == 0;
+        let is_xsa_layer = layer >= n.saturating_sub(self.config.xsa_last_n);
+        let forward_only_bf16_prepack = fused_qkv_rope_prepack_forward
+            && !save_backward_activations
+            && is_xsa_layer
+            && self.config.sparse_attn_gate_enabled
+            && !self.config.attn_out_gate_enabled
+            && self.use_cudnn_saved_bf16_attention()
+            && self.use_bf16_sparse_xsa_forward();
         let qkv_projected = if fused_qkv_rope_prepack_forward {
             self.qkv_projection_forward_packed_only(layer, buf, t, attn_norm_bf16_ready)?
         } else {
@@ -7926,7 +8626,7 @@ impl GpuModel {
         let qk_pre_norm_saved_by_qkv = qkv_projected && save_qk_during_qkv.is_some();
         if qkv_projected {
             // Hot path handled by a single packed QKV GEMM.
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_bf16_tensor(&buf.x_in_bf16, &save.attn_norm_bf16)?;
             }
         } else if self.use_bf16_primary_forward_gemm() {
@@ -7943,7 +8643,7 @@ impl GpuModel {
                     (t * d) as u32,
                 )?;
             }
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_bf16_tensor(&buf.x_in_bf16, &save.attn_norm_bf16)?;
             }
             self.linear_forward_bf16_input_ready(
@@ -7984,8 +8684,9 @@ impl GpuModel {
             self.linear_forward_f32(&buf.attn_norm, &k_w, &buf.k, t, kv, d)?;
             self.linear_forward_f32(&buf.attn_norm, &v_w, &buf.v, t, kv, d)?;
         }
-        self.apply_q_lora_forward(layer, buf)?;
-        if let Some(save) = save.filter(|_| !qk_pre_norm_saved_by_qkv) {
+        self.apply_qkv_loras_forward(layer, buf)?;
+        if let Some(save) = save.filter(|_| save_backward_activations && !qk_pre_norm_saved_by_qkv)
+        {
             self.copy_tensor(&buf.q, &save.q_pre_norm)?;
             self.copy_tensor(&buf.k, &save.k_pre_norm)?;
         }
@@ -8020,7 +8721,7 @@ impl GpuModel {
                 1.0,
                 (t * kv) as u32,
             )?;
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_tensor(&buf.ve_embed_out, &save.ve_embed_out)?;
                 self.copy_tensor(&buf.ve_out, &save.ve_out)?;
             }
@@ -8052,30 +8753,51 @@ impl GpuModel {
         }
         if fused_qkv_rope_prepack_forward {
             let save = save.expect("prepacked BF16 attention requires saved BF16 buffers");
-            self.kernels.unpack_qkv_rope_gain_prepack_fwd(
-                CudaPtr(buf.qkv_out.cu_ptr(stream)?),
-                CudaPtr(buf.q.cu_ptr(stream)?),
-                CudaPtr(buf.k.cu_ptr(stream)?),
-                CudaPtr(buf.v.cu_ptr(stream)?),
-                CudaPtr(save.q_pre_norm.cu_ptr(stream)?),
-                CudaPtr(save.k_pre_norm.cu_ptr(stream)?),
-                CudaPtr(save.q_post_rope.cu_ptr(stream)?),
-                CudaPtr(save.q_bhsd_bf16.cu_ptr(stream)?),
-                CudaPtr(save.k_bhsd_bf16.cu_ptr(stream)?),
-                CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
-                CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
-                CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
-                CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
-                t as u32,
-                runtime_seq_len as u32,
-                d as u32,
-                kv as u32,
-                h as u32,
-                hkv as u32,
-                hd as u32,
-                self.config.rope_dims as u32,
-                1e-6,
-            )?;
+            if forward_only_bf16_prepack {
+                self.kernels.unpack_qkv_rope_gain_prepack_fwd_bf16_only(
+                    CudaPtr(buf.qkv_out.cu_ptr(stream)?),
+                    CudaPtr(save.q_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(save.k_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                    t as u32,
+                    runtime_seq_len as u32,
+                    d as u32,
+                    kv as u32,
+                    h as u32,
+                    hkv as u32,
+                    hd as u32,
+                    self.config.rope_dims as u32,
+                    1e-6,
+                )?;
+            } else {
+                self.kernels.unpack_qkv_rope_gain_prepack_fwd(
+                    CudaPtr(buf.qkv_out.cu_ptr(stream)?),
+                    CudaPtr(buf.q.cu_ptr(stream)?),
+                    CudaPtr(buf.k.cu_ptr(stream)?),
+                    CudaPtr(buf.v.cu_ptr(stream)?),
+                    CudaPtr(save.q_pre_norm.cu_ptr(stream)?),
+                    CudaPtr(save.k_pre_norm.cu_ptr(stream)?),
+                    CudaPtr(save.q_post_rope.cu_ptr(stream)?),
+                    CudaPtr(save.q_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(save.k_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
+                    CudaPtr(self.weights.q_gains[layer].cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_cos.cu_ptr(stream)?),
+                    CudaPtr(self.weights.rope_sin.cu_ptr(stream)?),
+                    t as u32,
+                    runtime_seq_len as u32,
+                    d as u32,
+                    kv as u32,
+                    h as u32,
+                    hkv as u32,
+                    hd as u32,
+                    self.config.rope_dims as u32,
+                    1e-6,
+                )?;
+            }
             save.bf16_qkv_freshness.mark(
                 Bf16QkvProducer::FusedNormQkvRopeGain,
                 forward_generation,
@@ -8132,7 +8854,8 @@ impl GpuModel {
                 // `bf16_qkv_freshness_rejects_stale_step_and_layer` for the contract.
             }
         }
-        if let Some(save) = save.filter(|_| !skip_f32_attention_saved) {
+        if let Some(save) = save.filter(|_| save_backward_activations && !skip_f32_attention_saved)
+        {
             self.copy_tensor(&buf.q, &save.q)?;
             self.copy_tensor(&buf.k, &save.k)?;
             self.copy_tensor(&buf.v, &save.v)?;
@@ -8185,7 +8908,6 @@ impl GpuModel {
                 )?;
             }
         }
-        let is_xsa_layer = layer >= n.saturating_sub(self.config.xsa_last_n);
         let bf16_attention_projection_output =
             self.use_bf16_attention_projection_output() && lean_bf16_direct_saved && save.is_some();
         let saved_attn_weight_input_bf16_direct = save
@@ -8236,23 +8958,43 @@ impl GpuModel {
             if bf16_sparse_xsa_forward {
                 let save =
                     save.expect("BF16 SparseAttnGate+XSA forward requires saved BF16 attention");
-                self.kernels.sparse_attn_gate_xsa_fwd_bf16_bhsd(
-                    CudaPtr(save.attn_out_bhsd_bf16.cu_ptr(stream)?),
-                    CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
-                    CudaPtr(buf.attn_norm.cu_ptr(stream)?),
-                    CudaPtr(self.weights.sparse_attn_gate_weights[layer].cu_ptr(stream)?),
-                    CudaPtr(buf.attn_gated.cu_ptr(stream)?),
-                    CudaPtr(attn_weight_input_bf16.cu_ptr(stream)?),
-                    CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
-                    (t / runtime_seq_len) as u32,
-                    runtime_seq_len as u32,
-                    h as u32,
-                    hkv as u32,
-                    hd as u32,
-                    d as u32,
-                    self.config.sparse_attn_gate_width as u32,
-                    self.config.sparse_attn_gate_scale,
-                )?;
+                if gpu_sparse_xsa_warphead_forward_enabled() {
+                    self.kernels.sparse_attn_gate_xsa_fwd_bf16_bhsd_warpheads(
+                        CudaPtr(save.attn_out_bhsd_bf16.cu_ptr(stream)?),
+                        CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_norm.cu_ptr(stream)?),
+                        CudaPtr(self.weights.sparse_attn_gate_weights[layer].cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gated.cu_ptr(stream)?),
+                        CudaPtr(attn_weight_input_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
+                        (t / runtime_seq_len) as u32,
+                        runtime_seq_len as u32,
+                        h as u32,
+                        hkv as u32,
+                        hd as u32,
+                        d as u32,
+                        self.config.sparse_attn_gate_width as u32,
+                        self.config.sparse_attn_gate_scale,
+                    )?;
+                } else {
+                    self.kernels.sparse_attn_gate_xsa_fwd_bf16_bhsd(
+                        CudaPtr(save.attn_out_bhsd_bf16.cu_ptr(stream)?),
+                        CudaPtr(save.v_bhsd_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_norm.cu_ptr(stream)?),
+                        CudaPtr(self.weights.sparse_attn_gate_weights[layer].cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gated.cu_ptr(stream)?),
+                        CudaPtr(attn_weight_input_bf16.cu_ptr(stream)?),
+                        CudaPtr(buf.attn_gate_values.cu_ptr(stream)?),
+                        (t / runtime_seq_len) as u32,
+                        runtime_seq_len as u32,
+                        h as u32,
+                        hkv as u32,
+                        hd as u32,
+                        d as u32,
+                        self.config.sparse_attn_gate_width as u32,
+                        self.config.sparse_attn_gate_scale,
+                    )?;
+                }
             } else {
                 self.kernels.sparse_attn_gate_xsa_fwd(
                     attn_out,
@@ -8271,7 +9013,7 @@ impl GpuModel {
                     self.config.sparse_attn_gate_scale,
                 )?;
             }
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_tensor(&buf.attn_gated, &save.attn_gated)?;
                 self.copy_tensor(&buf.attn_gate_values, &save.attn_gate_values)?;
             }
@@ -8281,7 +9023,9 @@ impl GpuModel {
             self.kernels.xsa_fwd(
                 attn_out, v, xsa_out, t as u32, h as u32, hkv as u32, hd as u32,
             )?;
-            if let Some(save) = save.filter(|_| !lean_bf16_direct_saved) {
+            if let Some(save) =
+                save.filter(|_| save_backward_activations && !lean_bf16_direct_saved)
+            {
                 self.copy_tensor(&buf.xsa_out, &save.xsa_out)?;
             }
             &buf.xsa_out
@@ -8304,7 +9048,7 @@ impl GpuModel {
                 d as u32,
                 self.config.attn_out_gate_width as u32,
             )?;
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_tensor(&buf.attn_gated, &save.attn_gated)?;
                 self.copy_tensor(&buf.attn_gate_values, &save.attn_gate_values)?;
             }
@@ -8323,7 +9067,7 @@ impl GpuModel {
                 self.config.sparse_attn_gate_width as u32,
                 self.config.sparse_attn_gate_scale,
             )?;
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 self.copy_tensor(&buf.attn_gated, &save.attn_gated)?;
                 self.copy_tensor(&buf.attn_gate_values, &save.attn_gate_values)?;
             }
@@ -8415,11 +9159,18 @@ impl GpuModel {
         } else {
             self.linear_forward_f32(attn_src_tensor, &o_w, &buf.proj_out, t, d, d)?;
         }
-        if let Some(save) = save.filter(|_| !bf16_attention_projection_output) {
+        if let Some(lora) = &self.o_lora {
+            let attn_norm = buf.attn_norm.clone();
+            let proj_out = buf.proj_out.clone();
+            self.apply_linear_lora_forward(lora, layer, &attn_norm, &proj_out, buf)?;
+        }
+        if let Some(save) =
+            save.filter(|_| save_backward_activations && !bf16_attention_projection_output)
+        {
             self.copy_tensor(&buf.proj_out, &save.proj_out)?;
         }
 
-        let fused_parallel_attn_resid_norm = self.use_fused_parallel_attn_residual_rms_norm();
+        let fused_parallel_attn_resid_norm = self.use_fused_parallel_attn_residual_rms_norm(layer);
         let mut mlp_norm_bf16_ready = false;
         let saved_mlp_norm_bf16_direct = save
             .filter(|_| lean_bf16_direct_saved && self.use_bf16_norm_side_outputs())
@@ -8500,13 +9251,13 @@ impl GpuModel {
                 (t * d) as u32,
             )?;
         }
-        if let Some(save) = save {
-            if self.parallel_residual_enabled() && lean_bf16_direct_saved {
+        if let Some(save) = save.filter(|_| save_backward_activations) {
+            if self.parallel_residual_enabled_for_layer(layer) && lean_bf16_direct_saved {
                 // In parallel-residual mode the MLP norm input is exactly
                 // x_in. The lean BF16 direct-saved path can reuse saved.x_in
                 // during backward instead of storing a duplicate F32
                 // x_after_attn activation.
-            } else if self.parallel_residual_enabled() {
+            } else if self.parallel_residual_enabled_for_layer(layer) {
                 self.copy_tensor(&buf.x_in, &save.x_after_attn)?;
             } else {
                 self.copy_tensor(&buf.x, &save.x_after_attn)?;
@@ -8514,7 +9265,7 @@ impl GpuModel {
         }
 
         if !fused_parallel_attn_resid_norm {
-            let mlp_norm_input = if self.parallel_residual_enabled() {
+            let mlp_norm_input = if self.parallel_residual_enabled_for_layer(layer) {
                 x_in
             } else {
                 x
@@ -8541,7 +9292,7 @@ impl GpuModel {
                 )?;
             }
         }
-        if let Some(save) = save.filter(|_| !lean_bf16_direct_saved) {
+        if let Some(save) = save.filter(|_| save_backward_activations && !lean_bf16_direct_saved) {
             self.copy_tensor(&buf.mlp_norm, &save.mlp_norm)?;
         }
         finish_stage_event_optional(
@@ -8605,7 +9356,7 @@ impl GpuModel {
                     d,
                 )?;
             }
-            if let Some(save) = save {
+            if let Some(save) = save.filter(|_| save_backward_activations) {
                 if saved_mlp_norm_bf16_direct.is_none() {
                     self.copy_bf16_tensor(mlp_norm_bf16_output, &save.mlp_norm_bf16)?;
                 }
@@ -8613,7 +9364,7 @@ impl GpuModel {
         } else {
             self.linear_forward_f32(&buf.mlp_norm, &up_w, &buf.mlp_up, t, mlp, d)?;
         }
-        if let Some(save) = save.filter(|_| !lean_bf16_direct_saved) {
+        if let Some(save) = save.filter(|_| save_backward_activations && !lean_bf16_direct_saved) {
             self.copy_tensor(&buf.mlp_up, &save.mlp_up)?;
         }
         let fused_mlp_act_bf16 = self.use_fused_mlp_activation_bf16();
@@ -8630,14 +9381,16 @@ impl GpuModel {
             self.kernels
                 .leaky_relu_sq_forward(mlp_up, mlp_act, (t * mlp) as u32)?;
         }
-        if let Some(save) = save.filter(|_| lean_bf16_direct_saved && !bf16_mlp_up_output) {
+        if let Some(save) = save
+            .filter(|_| save_backward_activations && lean_bf16_direct_saved && !bf16_mlp_up_output)
+        {
             self.kernels.f32_to_bf16(
                 CudaPtr(buf.mlp_up.cu_ptr(stream)?),
                 CudaPtr(save.mlp_up_bf16.cu_ptr(stream)?),
                 (t * mlp) as u32,
             )?;
         }
-        if let Some(save) = save.filter(|_| !lean_bf16_direct_saved) {
+        if let Some(save) = save.filter(|_| save_backward_activations && !lean_bf16_direct_saved) {
             self.copy_tensor(&buf.mlp_act, &save.mlp_act)?;
         }
         let bf16_residual_projection_output =
@@ -8700,7 +9453,14 @@ impl GpuModel {
         } else {
             self.linear_forward_f32(&buf.mlp_act, &down_w, &buf.mlp_out, t, d, mlp)?;
         }
-        if let Some(save) = save.filter(|_| !bf16_residual_projection_output) {
+        if let Some(lora) = &self.mlp_lora {
+            let mlp_norm = buf.mlp_norm.clone();
+            let mlp_out = buf.mlp_out.clone();
+            self.apply_linear_lora_forward(lora, layer, &mlp_norm, &mlp_out, buf)?;
+        }
+        if let Some(save) =
+            save.filter(|_| save_backward_activations && !bf16_residual_projection_output)
+        {
             self.copy_tensor(&buf.mlp_out, &save.mlp_out)?;
         }
         if bf16_residual_projection_output {
@@ -8747,6 +9507,7 @@ impl GpuModel {
             runtime_seq_len,
             0,
             None,
+            false,
             stage_timing.as_deref_mut(),
         )?;
         if self.is_recurrent_layer(layer) {
@@ -8757,6 +9518,7 @@ impl GpuModel {
                 runtime_seq_len,
                 0,
                 None,
+                false,
                 stage_timing.as_deref_mut(),
             )?;
         }
@@ -8779,15 +9541,6 @@ impl GpuModel {
             .and_then(|saved| saved.as_ref())
         {
             if self.is_recurrent_layer(layer) {
-                let pass1_saved = cache
-                    .recurrent_pass1_layers
-                    .get(layer)
-                    .and_then(|saved| saved.as_ref())
-                    .ok_or_else(|| {
-                        PgError::InvalidOp(format!(
-                            "missing recurrent pass-1 saved activations for layer {layer}"
-                        ))
-                    })?;
                 let mid_x = cache
                     .recurrent_mid_x
                     .get(layer)
@@ -8797,13 +9550,34 @@ impl GpuModel {
                             "missing recurrent mid activation boundary for layer {layer}"
                         ))
                     })?;
+                let pass1_save_backward_activations =
+                    !gpu_recurrent_pass1_straight_through_enabled();
+                let recurrent_pass1_cache = cache
+                    .recurrent_pass1_layers
+                    .get(layer)
+                    .and_then(|saved| saved.as_ref());
+                let pass1_saved = if pass1_save_backward_activations {
+                    Some(recurrent_pass1_cache.ok_or_else(|| {
+                        PgError::InvalidOp(format!(
+                            "missing recurrent pass-1 saved activations for layer {layer}"
+                        ))
+                    })?)
+                } else {
+                    // Pass-1 straight-through does not need F32 activations for
+                    // backward, but still benefits from the lightweight BF16
+                    // cache: it enables the fused QKV/RoPE prepack path and
+                    // cuDNN BF16 SDPA for the recurrent pass instead of falling
+                    // back to the slower unpacked forward.
+                    recurrent_pass1_cache
+                };
                 self.block_forward_once(
                     layer,
                     input_ids,
                     buf,
                     runtime_seq_len,
                     forward_generation,
-                    Some(pass1_saved),
+                    pass1_saved,
+                    pass1_save_backward_activations,
                     stage_timing.as_deref_mut(),
                 )?;
                 self.copy_tensor(&buf.x, mid_x)?;
@@ -8814,6 +9588,7 @@ impl GpuModel {
                     runtime_seq_len,
                     forward_generation,
                     Some(saved),
+                    true,
                     stage_timing.as_deref_mut(),
                 )?;
             } else {
@@ -8824,6 +9599,7 @@ impl GpuModel {
                     runtime_seq_len,
                     forward_generation,
                     Some(saved),
+                    true,
                     stage_timing.as_deref_mut(),
                 )?;
             }
@@ -8883,15 +9659,31 @@ impl GpuModel {
         let x_in = CudaPtr(buf.x_in.cu_ptr(stream)?);
         let x0 = CudaPtr(buf.x0.cu_ptr(stream)?);
 
-        self.kernels.embedding_gather_fwd(
-            CudaPtr(input_ids.cu_ptr(stream)?),
-            CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
-            x,
-            d as u32,
-            t as u32,
-        )?;
+        if self.config.bigram_vocab_size > 0 && gpu_bigram_embedding_merge_enabled() {
+            self.kernels.embedding_bigram_project_merge_fwd(
+                CudaPtr(input_ids.cu_ptr(stream)?),
+                CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_embed.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_proj.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_scale_param.cu_ptr(stream)?),
+                x,
+                d as u32,
+                self.config.bigram_dim as u32,
+                self.config.bigram_vocab_size as u32,
+                t as u32,
+                runtime_seq_len as u32,
+            )?;
+        } else {
+            self.kernels.embedding_gather_fwd(
+                CudaPtr(input_ids.cu_ptr(stream)?),
+                CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
+                x,
+                d as u32,
+                t as u32,
+            )?;
+        }
 
-        if self.config.bigram_vocab_size > 0 {
+        if self.config.bigram_vocab_size > 0 && !gpu_bigram_embedding_merge_enabled() {
             self.kernels.bigram_hash_embed_fwd(
                 CudaPtr(input_ids.cu_ptr(stream)?),
                 CudaPtr(self.weights.bigram_embed.cu_ptr(stream)?),
@@ -8992,7 +9784,7 @@ impl GpuModel {
                 1e-6,
             )?;
         }
-        if materialize_output_logits {
+        if materialize_output_logits || self.lm_head_lora.is_some() {
             let required_logits = t * self.config.vocab_size;
             if buf.logits.numel() < required_logits {
                 return Err(PgError::ShapeMismatch {
@@ -9001,6 +9793,11 @@ impl GpuModel {
                 });
             }
             self.output_projection_forward(&buf.x_in, &buf.x_in_bf16, &buf.logits, t)?;
+            if let Some(lora) = &self.lm_head_lora {
+                let x_in = buf.x_in.clone();
+                let logits = buf.logits.clone();
+                self.apply_linear_lora_forward(lora, 0, &x_in, &logits, buf)?;
+            }
         }
         Ok(())
     }
@@ -9048,15 +9845,31 @@ impl GpuModel {
         let x0 = CudaPtr(buf.x0.cu_ptr(stream)?);
 
         let stage_start = record_stage_event_if(stream, time_forward_substages)?;
-        self.kernels.embedding_gather_fwd(
-            CudaPtr(input_ids.cu_ptr(stream)?),
-            CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
-            x,
-            d as u32,
-            t as u32,
-        )?;
+        if self.config.bigram_vocab_size > 0 && gpu_bigram_embedding_merge_enabled() {
+            self.kernels.embedding_bigram_project_merge_fwd(
+                CudaPtr(input_ids.cu_ptr(stream)?),
+                CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_embed.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_proj.cu_ptr(stream)?),
+                CudaPtr(self.weights.bigram_scale_param.cu_ptr(stream)?),
+                x,
+                d as u32,
+                self.config.bigram_dim as u32,
+                self.config.bigram_vocab_size as u32,
+                t as u32,
+                runtime_seq_len as u32,
+            )?;
+        } else {
+            self.kernels.embedding_gather_fwd(
+                CudaPtr(input_ids.cu_ptr(stream)?),
+                CudaPtr(self.weights.tok_emb.cu_ptr(stream)?),
+                x,
+                d as u32,
+                t as u32,
+            )?;
+        }
 
-        if self.config.bigram_vocab_size > 0 {
+        if self.config.bigram_vocab_size > 0 && !gpu_bigram_embedding_merge_enabled() {
             self.kernels.bigram_hash_embed_fwd(
                 CudaPtr(input_ids.cu_ptr(stream)?),
                 CudaPtr(self.weights.bigram_embed.cu_ptr(stream)?),
@@ -9235,8 +10048,13 @@ impl GpuModel {
                 1e-6,
             )?;
         }
-        if !self.use_output_ce_no_full_logits() {
+        if !self.use_output_ce_no_full_logits() || self.lm_head_lora.is_some() {
             self.output_projection_forward(&buf.x_in, &buf.x_in_bf16, &buf.logits, t)?;
+            if let Some(lora) = &self.lm_head_lora {
+                let x_in = buf.x_in.clone();
+                let logits = buf.logits.clone();
+                self.apply_linear_lora_forward(lora, 0, &x_in, &logits, buf)?;
+            }
         }
         finish_stage_event_optional(
             stream,
@@ -9315,6 +10133,57 @@ impl GpuModel {
             ));
         }
 
+        if let Some(lora) = &self.lm_head_lora {
+            if let Some(losses) = losses {
+                self.cross_entropy_losses(&buf.logits, targets, losses, t)?;
+            }
+            self.kernels.cross_entropy_bwd(
+                CudaPtr(buf.logits.cu_ptr(stream)?),
+                CudaPtr(targets.cu_ptr(stream)?),
+                CudaPtr(grad_logits.cu_ptr(stream)?),
+                vocab as u32,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
+                1.0 / t as f32,
+                t as u32,
+            )?;
+            unsafe {
+                self.gemm.linear_backward_input_f32(
+                    grad_logits.cu_ptr(stream)?,
+                    self.weights.tok_emb.cu_ptr(stream)?,
+                    grad_x.cu_ptr(stream)?,
+                    t,
+                    vocab,
+                    d,
+                    1.0,
+                    0.0,
+                )?;
+                self.gemm.linear_backward_weight_f32(
+                    grad_logits.cu_ptr(stream)?,
+                    buf.x_in.cu_ptr(stream)?,
+                    grads.tok_emb.cu_ptr(stream)?,
+                    t,
+                    vocab,
+                    d,
+                    1.0,
+                    1.0,
+                )?;
+            }
+            let x_in = buf.x_in.clone();
+            let grad_x_accum = grad_x.clone();
+            self.backward_linear_lora(lora, 0, &x_in, grad_logits, &grad_x_accum, buf)?;
+            self.kernels.rms_norm_backward(
+                CudaPtr(final_norm_input.cu_ptr(stream)?),
+                CudaPtr(grad_x.cu_ptr(stream)?),
+                CudaPtr(grad_pre_norm.cu_ptr(stream)?),
+                t as u32,
+                d as u32,
+                1.0,
+                1e-6,
+            )?;
+            return Ok(());
+        }
+
         if self.use_chunked_bf16_output_ce_cache() {
             let tiled = tiled_output.ok_or_else(|| {
                 PgError::InvalidOp("PG_GPU_CHUNKED_OUTPUT_CE_CACHE requires chunk scratch".into())
@@ -9389,7 +10258,8 @@ impl GpuModel {
                         CudaPtr(losses.cu_ptr(stream)?),
                         CudaPtr(grad_logits_bf16.cu_ptr(stream)?),
                         vocab as u32,
-                        self.config.logit_softcap,
+                        self.config.logit_softcap_pos,
+                        self.config.logit_softcap_neg,
                         1.0 / t as f32,
                         t as u32,
                     )?;
@@ -9399,7 +10269,8 @@ impl GpuModel {
                         CudaPtr(targets.cu_ptr(stream)?),
                         CudaPtr(grad_logits_bf16.cu_ptr(stream)?),
                         vocab as u32,
-                        self.config.logit_softcap,
+                        self.config.logit_softcap_pos,
+                        self.config.logit_softcap_neg,
                         1.0 / t as f32,
                         t as u32,
                     )?;
@@ -9412,7 +10283,8 @@ impl GpuModel {
                         CudaPtr(losses.cu_ptr(stream)?),
                         CudaPtr(grad_logits_bf16.cu_ptr(stream)?),
                         vocab as u32,
-                        self.config.logit_softcap,
+                        self.config.logit_softcap_pos,
+                        self.config.logit_softcap_neg,
                         1.0 / t as f32,
                         t as u32,
                     )?;
@@ -9422,7 +10294,8 @@ impl GpuModel {
                         CudaPtr(targets.cu_ptr(stream)?),
                         CudaPtr(grad_logits_bf16.cu_ptr(stream)?),
                         vocab as u32,
-                        self.config.logit_softcap,
+                        self.config.logit_softcap_pos,
+                        self.config.logit_softcap_neg,
                         1.0 / t as f32,
                         t as u32,
                     )?;
@@ -9463,7 +10336,8 @@ impl GpuModel {
                 CudaPtr(targets.cu_ptr(stream)?),
                 CudaPtr(grad_logits.cu_ptr(stream)?),
                 vocab as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 1.0 / t as f32,
                 t as u32,
             )?;
@@ -9566,7 +10440,8 @@ impl GpuModel {
                 CudaPtr(targets_chunk.cu_ptr(stream)?),
                 CudaPtr(grad_chunk.cu_ptr(stream)?),
                 vocab as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 1.0 / t as f32,
                 chunk as u32,
             )?;
@@ -9661,7 +10536,8 @@ impl GpuModel {
                 CudaPtr(losses_chunk.cu_ptr(stream)?),
                 CudaPtr(grad_chunk.cu_ptr(stream)?),
                 vocab as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 1.0 / t as f32,
                 chunk as u32,
             )?;
@@ -9737,7 +10613,8 @@ impl GpuModel {
                 CudaPtr(targets_chunk.cu_ptr(stream)?),
                 CudaPtr(losses_chunk.cu_ptr(stream)?),
                 vocab as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 chunk as u32,
             )?;
         }
@@ -9832,7 +10709,7 @@ impl GpuModel {
             vocab,
             d,
             tile,
-            self.config.logit_softcap,
+            self.config.logit_softcap_pos,
         )
     }
 
@@ -9873,7 +10750,7 @@ impl GpuModel {
             vocab,
             d,
             tile,
-            self.config.logit_softcap,
+            self.config.logit_softcap_pos,
             1.0 / t as f32,
         )
     }
@@ -9938,7 +10815,8 @@ impl GpuModel {
                 vocab_start as u32,
                 tile as u32,
                 tile as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 t as u32,
             )?;
         }
@@ -10000,7 +10878,8 @@ impl GpuModel {
                 vocab_start as u32,
                 tile as u32,
                 tile as u32,
-                self.config.logit_softcap,
+                self.config.logit_softcap_pos,
+                self.config.logit_softcap_neg,
                 1.0 / t as f32,
                 t as u32,
             )?;
@@ -10050,6 +10929,15 @@ impl GpuModel {
         losses: &GpuTensor,
         tokens: usize,
     ) -> PgResult<()> {
+        if self.lm_head_lora.is_some() {
+            let target_tokens = targets.shape().iter().product::<usize>();
+            if target_tokens != tokens {
+                return Err(PgError::InvalidOp(format!(
+                    "cross_entropy_losses_with_state token mismatch: targets={target_tokens} tokens={tokens}"
+                )));
+            }
+            return self.cross_entropy_losses(&buf.logits, targets, losses, tokens);
+        }
         if self.use_chunked_bf16_output_ce_cache() {
             let target_tokens = targets.shape().iter().product::<usize>();
             if target_tokens != tokens {
@@ -10270,6 +11158,13 @@ impl GpuModel {
         let fused_output_loss = compute_loss && self.use_fused_ce_loss_bwd();
         let output_losses = if compute_loss && (tiled_output_loss || fused_output_loss) {
             Some(&state.losses)
+        } else if !compute_loss && (self.use_tiled_output_ce() || self.use_fused_exact_output_ce())
+        {
+            // The record-shaped graph path drops the scalar loss, but the
+            // tiled/fused exact output kernels still use the persistent loss
+            // buffer as per-row CE scratch. Keep the chunked BF16 cache on its
+            // no-loss path; only the opt-in fused/tiled experiments pay this.
+            Some(&state.losses)
         } else {
             None
         };
@@ -10311,9 +11206,6 @@ impl GpuModel {
         };
         self.copy_tensor(&state.grad_output_pre_norm, &state.grad_ping)?;
         self.zero_tensor(&state.grad_x0)?;
-        for skip_grad in &state.grad_encoder_skips {
-            self.zero_tensor(skip_grad)?;
-        }
         finish_stage_event(stream, stage_start, &mut state.stage_timing.output_ms)?;
         check_cuda_graph_capture_stage(stream, "output_loss_backward")?;
 
@@ -10374,13 +11266,12 @@ impl GpuModel {
 
             if i < n_skip {
                 let enc_layer = n_enc - 1 - i;
-                self.zero_tensor(&state.grad_x_post_skip)?;
                 let skip_src = if lean_forward_cache {
                     buf.encoder_skips[enc_layer].clone()
                 } else {
                     state.cache.skips[enc_layer].clone()
                 };
-                self.kernels.residual_add_scale_bwd(
+                self.kernels.residual_add_scale_bwd_assign(
                     CudaPtr(skip_src.cu_ptr(stream)?),
                     CudaPtr(grad_x.cu_ptr(stream)?),
                     CudaPtr(self.weights.skip_weights.slice_first(i)?.cu_ptr(stream)?),

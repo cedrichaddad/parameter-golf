@@ -177,11 +177,21 @@ pub enum NcclOverlapMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum RecurrentBackwardProfile {
+    #[default]
+    Full,
+    Pass1StraightThrough,
+    AllStraightThrough,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum RecordProfile {
     #[default]
     Baseline,
     Frontier2014Clean,
     Frontier2135Audit,
+    Frontier2135SpeedProbe,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -191,6 +201,88 @@ pub enum TttMask {
     None,
     NoQv,
     KOff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TttLoraTargetsSpec {
+    pub lm_head: bool,
+    pub q: bool,
+    pub k: bool,
+    pub v: bool,
+    pub o: bool,
+    pub mlp: bool,
+}
+
+impl Default for TttLoraTargetsSpec {
+    fn default() -> Self {
+        // The current Rust GPU LoRA-TTT runtime implements query-projection
+        // adapters only. Frontier specs override this explicitly with the
+        // upstream reproduction target set.
+        Self {
+            lm_head: false,
+            q: true,
+            k: false,
+            v: false,
+            o: false,
+            mlp: false,
+        }
+    }
+}
+
+impl TttLoraTargetsSpec {
+    pub fn upstream_pr2135() -> Self {
+        Self {
+            lm_head: true,
+            q: true,
+            k: false,
+            v: true,
+            o: true,
+            mlp: true,
+        }
+    }
+
+    pub fn upstream_pr2014_no_qv() -> Self {
+        Self {
+            lm_head: true,
+            q: false,
+            k: true,
+            v: false,
+            o: true,
+            mlp: true,
+        }
+    }
+
+    pub fn rust_gpu_runtime_supported(&self) -> bool {
+        true
+    }
+
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.lm_head {
+            parts.push("lm_head");
+        }
+        if self.q {
+            parts.push("q");
+        }
+        if self.k {
+            parts.push("k");
+        }
+        if self.v {
+            parts.push("v");
+        }
+        if self.o {
+            parts.push("o");
+        }
+        if self.mlp {
+            parts.push("mlp");
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(",")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -254,6 +346,7 @@ pub struct RecurrenceSpec {
     pub start_layer: usize,
     pub repeat_layers: usize,
     pub enable_at_frac: f32,
+    pub enable_at_step: Option<usize>,
 }
 
 impl Default for RecurrenceSpec {
@@ -263,6 +356,7 @@ impl Default for RecurrenceSpec {
             start_layer: 0,
             repeat_layers: 0,
             enable_at_frac: 0.0,
+            enable_at_step: None,
         }
     }
 }
@@ -272,6 +366,7 @@ impl Default for RecurrenceSpec {
 pub struct ParallelResidualSpec {
     pub enabled: bool,
     pub split_attention_mlp: bool,
+    pub start_layer: usize,
 }
 
 impl Default for ParallelResidualSpec {
@@ -279,6 +374,7 @@ impl Default for ParallelResidualSpec {
         Self {
             enabled: false,
             split_attention_mlp: false,
+            start_layer: 0,
         }
     }
 }
@@ -418,10 +514,24 @@ impl Default for NgramTiltSpec {
 pub struct RuntimeSpec {
     pub record_profile: RecordProfile,
     pub backward_chain_profile: BackwardChainProfile,
+    pub recurrent_backward_profile: RecurrentBackwardProfile,
+    pub recurrent_straight_through_layers: usize,
+    pub skip_recurrent_bank_grads: bool,
+    pub skip_recurrent_pass1_bank_grads: bool,
+    pub recurrence_active_required: bool,
+    pub recurrent_active_steps_min: usize,
     pub require_device_batch: bool,
     pub token_ring_full_schedule: bool,
     pub cuda_graph_profile: CudaGraphProfile,
     pub nccl_overlap_mode: NcclOverlapMode,
+    pub bigram_embedding_merge: bool,
+    pub combined_qkv_rope_tail_backward: bool,
+    pub graph_side_gemm_capture: bool,
+    pub sharded_muon_local_graph: bool,
+    pub sharded_muon_pre_norm_graph: bool,
+    pub sharded_muon_fused_global_clip: bool,
+    pub sharded_muon_bf16_shadow_all_gather: bool,
+    pub timing_skip_steps: Option<usize>,
     pub max_ms_per_step: Option<f64>,
 }
 
@@ -430,10 +540,24 @@ impl Default for RuntimeSpec {
         Self {
             record_profile: RecordProfile::Baseline,
             backward_chain_profile: BackwardChainProfile::Off,
+            recurrent_backward_profile: RecurrentBackwardProfile::Full,
+            recurrent_straight_through_layers: 0,
+            skip_recurrent_bank_grads: false,
+            skip_recurrent_pass1_bank_grads: false,
+            recurrence_active_required: false,
+            recurrent_active_steps_min: 0,
             require_device_batch: false,
             token_ring_full_schedule: false,
             cuda_graph_profile: CudaGraphProfile::Off,
             nccl_overlap_mode: NcclOverlapMode::Off,
+            bigram_embedding_merge: false,
+            combined_qkv_rope_tail_backward: false,
+            graph_side_gemm_capture: false,
+            sharded_muon_local_graph: false,
+            sharded_muon_pre_norm_graph: false,
+            sharded_muon_fused_global_clip: false,
+            sharded_muon_bf16_shadow_all_gather: false,
+            timing_skip_steps: None,
             max_ms_per_step: None,
         }
     }
@@ -585,12 +709,23 @@ impl ModelSpec {
             rope_dims: self.rope.dims,
             xsa_last_n: self.xsa_last_n,
             logit_softcap: self.logit_softcap,
+            logit_softcap_pos: if self.asym_logit.enabled {
+                self.asym_logit.softcap_pos
+            } else {
+                self.logit_softcap
+            },
+            logit_softcap_neg: if self.asym_logit.enabled {
+                self.asym_logit.softcap_neg
+            } else {
+                self.logit_softcap
+            },
             qk_gain_init: self.qk_gain_init,
             recurrence_enabled: self.recurrence.enabled,
             recurrence_start_layer: self.recurrence.start_layer,
             recurrence_repeat_layers: self.recurrence.repeat_layers,
             parallel_residual: self.parallel_residual.enabled
                 && self.parallel_residual.split_attention_mlp,
+            parallel_residual_start_layer: self.parallel_residual.start_layer,
             attn_out_gate_enabled: self.attn_out_gate.enabled,
             attn_out_gate_width: self.attn_out_gate.width,
             sparse_attn_gate_enabled: self.sparse_attn_gate.enabled,
@@ -654,6 +789,7 @@ pub struct TrainSpec {
     pub muon_momentum_warmup_start: f32,
     pub muon_momentum_warmup_steps: usize,
     pub muon_wd: f32,
+    pub muon_newton_schulz_steps: usize,
     pub adam_wd: f32,
     pub adam_beta2: f32,
     pub ema_decay: f32,
@@ -690,6 +826,7 @@ impl Default for TrainSpec {
             muon_momentum_warmup_start: 0.92,
             muon_momentum_warmup_steps: 1_500,
             muon_wd: 0.04,
+            muon_newton_schulz_steps: 5,
             adam_wd: 0.04,
             adam_beta2: 0.95,
             ema_decay: 0.997,
@@ -715,7 +852,7 @@ impl TrainSpec {
             muon_momentum_warmup_start: self.muon_momentum_warmup_start,
             muon_momentum_warmup_steps: self.muon_momentum_warmup_steps,
             muon_wd: self.muon_wd,
-            newton_schulz_steps: 5,
+            newton_schulz_steps: self.muon_newton_schulz_steps.max(1),
             adam_beta1: 0.9,
             adam_beta2: self.adam_beta2,
             adam_eps: 1e-8,
@@ -753,6 +890,7 @@ pub struct QuantSpec {
     pub lqer: LqerSpec,
     pub compression: CompressionMode,
     pub matrix_bits: u8,
+    pub mlp_bits: u8,
     pub embed_bits: u8,
     pub attn_gate_bits: u8,
     pub mlp_clip_sigmas: f32,
@@ -797,6 +935,7 @@ impl Default for QuantSpec {
             lqer: LqerSpec::default(),
             compression: CompressionMode::Zstd22,
             matrix_bits: 6,
+            mlp_bits: 5,
             embed_bits: 8,
             attn_gate_bits: 8,
             mlp_clip_sigmas: 12.0,
@@ -817,12 +956,14 @@ pub struct EvalSpec {
     pub adaptation_backend: EvalAdaptationBackend,
     pub lora_rank: usize,
     pub lora_alpha: f32,
+    pub lora_lr: Option<f32>,
     pub phased_ttt_prefix_docs: usize,
     pub phased_ttt_phases: usize,
     pub phased_ttt_weight_decay: f32,
     pub ttt_beta2: f32,
     pub ttt_seq_len: Option<usize>,
     pub ttt_mask: TttMask,
+    pub ttt_lora_targets: TttLoraTargetsSpec,
     pub short_doc_score_first_schedule: Vec<ShortDocScoreFirstEntry>,
     pub ngram_tilt: NgramTiltSpec,
     pub chunk_tokens: usize,
@@ -840,12 +981,14 @@ impl Default for EvalSpec {
             adaptation_backend: EvalAdaptationBackend::None,
             lora_rank: 128,
             lora_alpha: 144.0,
+            lora_lr: None,
             phased_ttt_prefix_docs: 2_000,
             phased_ttt_phases: 3,
             phased_ttt_weight_decay: 1.0,
             ttt_beta2: 0.99,
             ttt_seq_len: None,
             ttt_mask: TttMask::None,
+            ttt_lora_targets: TttLoraTargetsSpec::default(),
             short_doc_score_first_schedule: Vec::new(),
             ngram_tilt: NgramTiltSpec::default(),
             chunk_tokens: 32_768,

@@ -14,10 +14,23 @@ app = modal.App("pg-train-detached")
 
 image = (
     modal.Image.from_dockerfile("deploy/Dockerfile", context_dir=".", add_python="3.12")
+    .add_local_dir(
+        ".",
+        remote_path="/build",
+        copy=False,
+        ignore=[
+            ".git",
+            "target",
+            ".venv",
+            "__pycache__",
+            "output",
+        ],
+    )
 )
 
 data_volume = modal.Volume.from_name("pg-data", create_if_missing=True)
 output_volume = modal.Volume.from_name("pg-output", create_if_missing=True)
+build_cache_volume = modal.Volume.from_name("pg-build-cache", create_if_missing=True)
 
 
 def _pop_result_json(args: list[str]):
@@ -63,23 +76,170 @@ def _pg_train_command() -> list[str]:
     explicit = os.environ.get("PG_TRAIN_BIN")
     if explicit:
         return [explicit]
-    existing = shutil.which("pg-train")
-    if existing:
-        return [existing]
-    source_dir = "/build"
-    binary = os.path.join(source_dir, "target", "release", "pg-train")
-    if not os.path.exists(binary):
-        print("pg-train binary missing; compiling inside Modal function", flush=True)
+    source_dir = os.environ.get("PG_SOURCE_DIR", "/build")
+    if not os.path.exists(os.path.join(source_dir, "Cargo.toml")):
+        for candidate in (
+            "/root",
+            "/root/parameter-golf-rs",
+            "/root/parameter-golf/parameter-golf-rs",
+            os.getcwd(),
+        ):
+            if os.path.exists(os.path.join(candidate, "Cargo.toml")):
+                source_dir = candidate
+                break
+    if not os.path.exists(os.path.join(source_dir, "Cargo.toml")):
+        raise RuntimeError(
+            "could not locate parameter-golf-rs Cargo.toml; set PG_SOURCE_DIR to the mounted repo"
+        )
+    target_dir = os.environ.get("CARGO_TARGET_DIR", "/build/target")
+    binary = os.path.join(target_dir, "release", "pg-train")
+    if os.environ.get("PG_TRAIN_INCREMENTAL_BUILD", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        build_env = os.environ.copy()
+        build_env["CARGO_TARGET_DIR"] = target_dir
+        if os.environ.get("PG_FORCE_CARGO_CLEAN", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            print(f"forcing cargo clean for target cache {target_dir}", flush=True)
+            subprocess.run(
+                ["cargo", "clean", "--target-dir", target_dir],
+                cwd=source_dir,
+                env=build_env,
+                check=True,
+            )
+        print("compiling pg-train inside Modal function with persistent target cache", flush=True)
         subprocess.run(
             ["cargo", "build", "--release", "--features", "cuda", "-p", "pg-train"],
             cwd=source_dir,
+            env=build_env,
             check=True,
         )
+        build_cache_volume.commit()
+    elif not os.path.exists(binary):
+        existing = shutil.which("pg-train")
+        if existing:
+            return [existing]
+        raise RuntimeError("pg-train binary missing and PG_TRAIN_INCREMENTAL_BUILD=0")
     if os.environ.get("PG_STRIP_TRAIN_BIN", "1").lower() not in {"0", "false", "no", "off"}:
         strip = shutil.which("strip")
         if strip:
             subprocess.run([strip, binary], check=True)
     return [binary]
+
+
+def _pg_eval_command() -> list[str]:
+    explicit = os.environ.get("PG_EVAL_BIN")
+    if explicit:
+        return [explicit]
+    source_dir = os.environ.get("PG_SOURCE_DIR", "/build")
+    if not os.path.exists(os.path.join(source_dir, "Cargo.toml")):
+        for candidate in (
+            "/root",
+            "/root/parameter-golf-rs",
+            "/root/parameter-golf/parameter-golf-rs",
+            os.getcwd(),
+        ):
+            if os.path.exists(os.path.join(candidate, "Cargo.toml")):
+                source_dir = candidate
+                break
+    if not os.path.exists(os.path.join(source_dir, "Cargo.toml")):
+        raise RuntimeError(
+            "could not locate parameter-golf-rs Cargo.toml; set PG_SOURCE_DIR to the mounted repo"
+        )
+    target_dir = os.environ.get("CARGO_TARGET_DIR", "/build/target")
+    binary = os.path.join(target_dir, "release", "pg-eval")
+    if os.environ.get("PG_EVAL_INCREMENTAL_BUILD", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        build_env = os.environ.copy()
+        build_env["CARGO_TARGET_DIR"] = target_dir
+        if os.environ.get("PG_FORCE_CARGO_CLEAN", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            print(f"forcing cargo clean for target cache {target_dir}", flush=True)
+            subprocess.run(
+                ["cargo", "clean", "--target-dir", target_dir],
+                cwd=source_dir,
+                env=build_env,
+                check=True,
+            )
+        print("compiling pg-eval inside Modal function with persistent target cache", flush=True)
+        subprocess.run(
+            ["cargo", "build", "--release", "--features", "cuda", "-p", "pg-eval"],
+            cwd=source_dir,
+            env=build_env,
+            check=True,
+        )
+        build_cache_volume.commit()
+    elif not os.path.exists(binary):
+        existing = shutil.which("pg-eval")
+        if existing:
+            return [existing]
+        raise RuntimeError("pg-eval binary missing and PG_EVAL_INCREMENTAL_BUILD=0")
+    if os.environ.get("PG_STRIP_EVAL_BIN", "1").lower() not in {"0", "false", "no", "off"}:
+        strip = shutil.which("strip")
+        if strip:
+            subprocess.run([strip, binary], check=True)
+    return [binary]
+
+
+def _prepare_submission_code_dir() -> str:
+    """Stage the source files counted by the submission byte budget.
+
+    The Modal runtime mounts the persistent Rust build cache at /build/target.
+    Counting /build directly would therefore count build artifacts, not the
+    submitted source. Stage an explicit source-only bundle and let pg-train hash
+    and count that directory.
+    """
+
+    source_dir = os.environ.get("PG_SOURCE_DIR", "/build")
+    out_dir = "/tmp/pg_submission_code"
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    include_paths = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates",
+        "specs",
+        "deploy/Dockerfile",
+        "deploy/run_detached.py",
+        "deploy/build_submission.py",
+    ]
+    ignore = shutil.ignore_patterns(
+        "target",
+        ".git",
+        ".venv",
+        ".venv-*",
+        "__pycache__",
+        "*.pyc",
+        "output",
+        ".pytest_cache",
+    )
+    for rel in include_paths:
+        src = os.path.join(source_dir, rel)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, ignore=ignore)
+        else:
+            shutil.copy2(src, dst)
+    return out_dir
 
 
 def _forwarded_option(args: list[str], name: str) -> str | None:
@@ -153,6 +313,31 @@ def _parse_json_events(text: str) -> dict:
     return events
 
 
+def _merge_json_event_metrics(metrics: dict, json_events: dict) -> dict:
+    """Promote scalar JSON event fields into the flat result metrics map.
+
+    The Rust binary emits authoritative record/audit data as single-line JSON
+    events. Keep those events intact, but also surface the latest scalar values
+    in `metrics` so A/B tooling and CI checks do not have to scrape stdout.
+    """
+
+    promoted_prefixes = {
+        "record_artifact_audit_json": "artifact",
+        "submission_budget_json": "submission",
+        "record_audit_json": "audit",
+        "run_timing_json": "timing",
+    }
+    for event_key, prefix in promoted_prefixes.items():
+        for event in json_events.get(event_key, []):
+            if not isinstance(event, dict):
+                continue
+            for key, value in event.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    metrics[key] = value
+                    metrics[f"{prefix}_{key}"] = value
+    return metrics
+
+
 def _add_per_step_timing_metrics(metrics: dict[str, object]) -> None:
     steps = metrics.get("timing_steps")
     if not isinstance(steps, int) or steps <= 0:
@@ -176,10 +361,12 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     os.environ["PG_GPU_BACKWARD_STAGE_TIMING"] = "1" if stage_timing else "0"
     os.environ["PG_GPU_SAVE_LAYER_ACTS"] = "all"
     os.environ["PG_GPU_DIRECT_SAVED_ACTS"] = "1"
+    os.environ["PG_GPU_LEAN_FORWARD_CACHE"] = "1"
     os.environ["PG_GPU_BF16_PRIMARY_FORWARD_GEMM"] = "1"
     os.environ["PG_CUBLAS_FAST_TF32"] = "1"
     os.environ.setdefault("PG_CUBLAS_FORCE_TENSOR_OP_ALGO", "1")
     os.environ.setdefault("PG_CUBLAS_BF16_ALGO", "1")
+    os.environ.setdefault("PG_CUBLASLT_BF16_GEMM", "1")
     os.environ["PG_GPU_BF16_LOGITS"] = "1"
     os.environ["PG_GPU_QKV_DX_BETA_ACCUM"] = "1"
     os.environ["PG_GPU_FUSED_QKV_PROJ"] = "1"
@@ -192,7 +379,9 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     os.environ["PG_GPU_FINAL_NORM_BF16_OUTPUT"] = "1"
     os.environ["PG_GPU_CUDNN_PREPACKED_BF16_ATTN"] = "1"
     os.environ["PG_GPU_CUDNN_PREPACKED_BF16_POISON"] = "1" if poison_prepacked_qkv else "0"
+    os.environ["PG_GPU_FUSED_QKV_ROPE_PREPACK_FWD"] = "1"
     os.environ["PG_GPU_BF16_SPARSE_XSA_FWD"] = "1"
+    os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_FWD"] = "1"
     os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_BWD"] = "1"
     os.environ["PG_GPU_HOST_SCALAR_UPDATES"] = "0"
     os.environ["PG_GPU_MUON_NS_PROFILE"] = "polar_express"
@@ -205,9 +394,13 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "1"
     os.environ["PG_GPU_CHUNKED_RESIDUAL_SCALE_BWD"] = "1"
     os.environ["PG_GPU_TILED_RESIDUAL_SCALE_BWD"] = "1"
-    os.environ.setdefault("PG_GPU_RESIDUAL_SCALE_BWD_ROWS_PER_CHUNK", "256")
-    os.environ["PG_GPU_OVERWRITE_BANK_GRADS"] = "0"
+    os.environ.setdefault("PG_GPU_RESIDUAL_SCALE_BWD_ROWS_PER_CHUNK", "1024")
+    # The graph path zeros non-bank gradients explicitly and lets each layer's
+    # first dW contribution overwrite its bank slot. Recurrent layers still
+    # accumulate their second tied-weight contribution with beta=1.
+    os.environ["PG_GPU_OVERWRITE_BANK_GRADS"] = "1"
     os.environ["PG_GPU_CHUNKED_Q_GAIN_BWD"] = "1"
+    os.environ.setdefault("PG_GPU_Q_GAIN_BWD_CHUNK_TOKENS", "1024")
     os.environ["PG_GPU_BF16_MLP_DOWN_DX"] = "1"
     os.environ["PG_GPU_VEC4_MLP_ACT_BWD"] = "1"
     os.environ["PG_GPU_FAST_MLP_ACT_BWD"] = "1"
@@ -235,7 +428,7 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     # the fastest record-shaped profile until the sampler is fully GPU-resident.
     os.environ["PG_GPU_SHIFTED_U16_BATCH_UPLOAD"] = "0"
     os.environ["PG_GPU_SPLIT_RESIDUAL_MIX_GRAD"] = "0"
-    os.environ.setdefault("PG_RECORD_TIMING_SKIP_STEPS", "2")
+    os.environ.setdefault("PG_RECORD_TIMING_SKIP_STEPS", "64")
 
 
 def _apply_gpu_env_flags(forwarded: list[str]):
@@ -246,6 +439,15 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--frontier-fast-record-profile" in forwarded:
         forwarded.remove("--frontier-fast-record-profile")
         _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=True)
+    if "--force-cargo-clean" in forwarded:
+        forwarded.remove("--force-cargo-clean")
+        os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
+    if "--ttt-audit" in forwarded:
+        forwarded.remove("--ttt-audit")
+        os.environ["PG_TTT_AUDIT"] = "1"
+    if "--assert-score-no-mutation" in forwarded:
+        forwarded.remove("--assert-score-no-mutation")
+        os.environ["PG_TTT_ASSERT_SCORE_NO_MUTATION"] = "1"
     if "--frontier-throughput-stage-profile" in forwarded:
         forwarded.remove("--frontier-throughput-stage-profile")
         _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=False)
@@ -258,6 +460,12 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         os.environ["PG_CUDA_BACKWARD_GRAPH"] = "1"
         os.environ["PG_CUDA_BACKWARD_GRAPH_STRICT"] = "1"
         os.environ.setdefault("PG_CUDA_GRAPH_CAPTURE_MODE", "relaxed")
+        # Measured H100 active-recurrence profile: graphing the sharded Parallel
+        # Muon pre-norm and local-update slices cuts exposed bank-update wall
+        # time from ~13 ms/step to ~9 ms/step. Keep this owned by the throughput
+        # profile so the best-known graph path is reproducible from one flag.
+        os.environ["PG_GPU_SHARDED_MUON_LOCAL_GRAPH"] = "1"
+        os.environ["PG_GPU_SHARDED_MUON_PRE_NORM_GRAPH"] = "1"
     if "--chunked-residual-mix-bwd" in forwarded:
         forwarded.remove("--chunked-residual-mix-bwd")
         os.environ["PG_GPU_CHUNKED_RESIDUAL_MIX_BWD"] = "1"
@@ -323,6 +531,21 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--enable-cublaslt-bf16-gemm" in forwarded:
         forwarded.remove("--enable-cublaslt-bf16-gemm")
         os.environ["PG_CUBLASLT_BF16_GEMM"] = "1"
+    if "--cublaslt-workspace-mb" in forwarded:
+        idx = forwarded.index("--cublaslt-workspace-mb")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--cublaslt-workspace-mb requires an integer MiB value")
+        workspace_mb = forwarded[idx + 1]
+        try:
+            parsed_workspace_mb = int(workspace_mb)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"--cublaslt-workspace-mb requires an integer MiB value, got {workspace_mb!r}"
+            ) from exc
+        if parsed_workspace_mb < 0:
+            raise RuntimeError("--cublaslt-workspace-mb must be non-negative")
+        os.environ["PG_CUBLASLT_WORKSPACE_MB"] = str(parsed_workspace_mb)
+        del forwarded[idx : idx + 2]
     if "--enable-cublaslt-bf16-strict" in forwarded:
         forwarded.remove("--enable-cublaslt-bf16-strict")
         os.environ["PG_CUBLASLT_BF16_GEMM"] = "1"
@@ -434,6 +657,15 @@ def _apply_gpu_env_flags(forwarded: list[str]):
             raise RuntimeError("--record-max-ms-per-step requires a numeric ceiling")
         os.environ["PG_RECORD_MAX_MS_PER_STEP"] = forwarded[idx + 1]
         del forwarded[idx : idx + 2]
+    if "--debug-eval-in-memory-model" in forwarded:
+        forwarded.remove("--debug-eval-in-memory-model")
+        os.environ["PG_DEBUG_EVAL_IN_MEMORY_MODEL"] = "1"
+    if "--force-recurrence-active" in forwarded:
+        forwarded.remove("--force-recurrence-active")
+        os.environ["PG_FORCE_RECURRENCE_ACTIVE"] = "1"
+    if "--force-recurrence-inactive" in forwarded:
+        forwarded.remove("--force-recurrence-inactive")
+        os.environ["PG_FORCE_RECURRENCE_INACTIVE"] = "1"
     if "--fast-tf32" in forwarded:
         forwarded.remove("--fast-tf32")
         os.environ["PG_CUBLAS_FAST_TF32"] = "1"
@@ -492,9 +724,15 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--enable-overlap-qkv-bwd-gemms" in forwarded:
         forwarded.remove("--enable-overlap-qkv-bwd-gemms")
         os.environ["PG_GPU_OVERLAP_QKV_BWD_GEMMS"] = "1"
+    if "--disable-overlap-qkv-bwd-gemms" in forwarded:
+        forwarded.remove("--disable-overlap-qkv-bwd-gemms")
+        os.environ["PG_GPU_OVERLAP_QKV_BWD_GEMMS"] = "0"
     if "--enable-overlap-attn-out-bwd-gemms" in forwarded:
         forwarded.remove("--enable-overlap-attn-out-bwd-gemms")
         os.environ["PG_GPU_OVERLAP_ATTN_OUT_BWD_GEMMS"] = "1"
+    if "--disable-overlap-attn-out-bwd-gemms" in forwarded:
+        forwarded.remove("--disable-overlap-attn-out-bwd-gemms")
+        os.environ["PG_GPU_OVERLAP_ATTN_OUT_BWD_GEMMS"] = "0"
     if "--enable-compact-attn-gate-grad-input" in forwarded:
         forwarded.remove("--enable-compact-attn-gate-grad-input")
         os.environ["PG_GPU_COMPACT_ATTN_GATE_GRAD_INPUT"] = "1"
@@ -658,6 +896,18 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-bf16-sparse-xsa-forward" in forwarded:
         forwarded.remove("--disable-bf16-sparse-xsa-forward")
         os.environ["PG_GPU_BF16_SPARSE_XSA_FWD"] = "0"
+    if "--enable-sparse-xsa-warphead-fwd" in forwarded:
+        forwarded.remove("--enable-sparse-xsa-warphead-fwd")
+        os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_FWD"] = "1"
+    if "--disable-sparse-xsa-warphead-fwd" in forwarded:
+        forwarded.remove("--disable-sparse-xsa-warphead-fwd")
+        os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_FWD"] = "0"
+    if "--enable-bigram-embed-merge" in forwarded:
+        forwarded.remove("--enable-bigram-embed-merge")
+        os.environ["PG_GPU_BIGRAM_EMBED_MERGE"] = "1"
+    if "--disable-bigram-embed-merge" in forwarded:
+        forwarded.remove("--disable-bigram-embed-merge")
+        os.environ["PG_GPU_BIGRAM_EMBED_MERGE"] = "0"
     if "--enable-sparse-xsa-warphead-bwd" in forwarded:
         forwarded.remove("--enable-sparse-xsa-warphead-bwd")
         os.environ["PG_GPU_SPARSE_XSA_WARPHEAD_BWD"] = "1"
@@ -852,6 +1102,7 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--enable-deferred-all-weight-gemms" in forwarded:
         forwarded.remove("--enable-deferred-all-weight-gemms")
         os.environ["PG_GPU_DEFER_LINEAR_BACKWARD_WEIGHT_GEMMS"] = "1"
+        os.environ["PG_GPU_DEFER_QKV_BWD_DW"] = "1"
     if "--disable-deferred-weight-gemms" in forwarded:
         forwarded.remove("--disable-deferred-weight-gemms")
         os.environ["PG_GPU_DEFER_LINEAR_BACKWARD_WEIGHT_GEMMS"] = "0"
@@ -875,6 +1126,12 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         if int(value) < 256:
             raise ValueError("--q-gain-bwd-chunk-tokens requires an integer >= 256")
         os.environ["PG_GPU_Q_GAIN_BWD_CHUNK_TOKENS"] = value
+    if "--enable-combined-qkv-rope-tail-bwd" in forwarded:
+        forwarded.remove("--enable-combined-qkv-rope-tail-bwd")
+        os.environ["PG_GPU_COMBINED_QKV_ROPE_TAIL_BWD"] = "1"
+    if "--disable-combined-qkv-rope-tail-bwd" in forwarded:
+        forwarded.remove("--disable-combined-qkv-rope-tail-bwd")
+        os.environ["PG_GPU_COMBINED_QKV_ROPE_TAIL_BWD"] = "0"
     if "--residual-scale-bwd-rows-per-chunk" in forwarded:
         idx = forwarded.index("--residual-scale-bwd-rows-per-chunk")
         try:
@@ -1039,6 +1296,30 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--disable-split-residual-mix-grad" in forwarded:
         forwarded.remove("--disable-split-residual-mix-grad")
         os.environ["PG_GPU_SPLIT_RESIDUAL_MIX_GRAD"] = "0"
+    if "--skip-residual-mix-grad" in forwarded:
+        forwarded.remove("--skip-residual-mix-grad")
+        os.environ["PG_GPU_SKIP_RESIDUAL_MIX_GRAD"] = "1"
+    if "--keep-residual-mix-grad" in forwarded:
+        forwarded.remove("--keep-residual-mix-grad")
+        os.environ["PG_GPU_SKIP_RESIDUAL_MIX_GRAD"] = "0"
+    if "--skip-recurrent-pass1-bank-grads" in forwarded:
+        forwarded.remove("--skip-recurrent-pass1-bank-grads")
+        os.environ["PG_GPU_SKIP_RECURRENT_PASS1_BANK_GRADS"] = "1"
+    if "--keep-recurrent-pass1-bank-grads" in forwarded:
+        forwarded.remove("--keep-recurrent-pass1-bank-grads")
+        os.environ["PG_GPU_SKIP_RECURRENT_PASS1_BANK_GRADS"] = "0"
+    if "--recurrent-pass1-straight-through" in forwarded:
+        forwarded.remove("--recurrent-pass1-straight-through")
+        os.environ["PG_GPU_RECURRENT_PASS1_STRAIGHT_THROUGH"] = "1"
+    if "--disable-recurrent-pass1-straight-through" in forwarded:
+        forwarded.remove("--disable-recurrent-pass1-straight-through")
+        os.environ["PG_GPU_RECURRENT_PASS1_STRAIGHT_THROUGH"] = "0"
+    if "--recurrent-all-straight-through" in forwarded:
+        forwarded.remove("--recurrent-all-straight-through")
+        os.environ["PG_GPU_RECURRENT_ALL_STRAIGHT_THROUGH"] = "1"
+    if "--disable-recurrent-all-straight-through" in forwarded:
+        forwarded.remove("--disable-recurrent-all-straight-through")
+        os.environ["PG_GPU_RECURRENT_ALL_STRAIGHT_THROUGH"] = "0"
 
 
 def _maybe_seed_data_env():
@@ -1094,6 +1375,14 @@ def _run_pg_train(args: list[str], label: str):
         mode_idx = forwarded.index("--mode")
         if mode_idx + 1 < len(forwarded):
             mode = forwarded[mode_idx + 1]
+    if mode == "record" and "PG_FORCE_CARGO_CLEAN" not in os.environ:
+        os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
+    if (
+        (mode == "record" or os.environ.get("PG_RECORD_SHAPED_EXPORT_ARTIFACT") == "1")
+        and "PG_SUBMISSION_CODE_BYTES" not in os.environ
+        and "PG_SUBMISSION_CODE_DIR" not in os.environ
+    ):
+        os.environ["PG_SUBMISSION_CODE_DIR"] = _prepare_submission_code_dir()
     if mode == "record-shaped-proxy" and "--allow-unsupported-variants" not in forwarded:
         forwarded.append("--allow-unsupported-variants")
     use_synthetic_train_data = os.environ.get("PG_SYNTHETIC_TRAIN_DATA") == "1"
@@ -1159,8 +1448,10 @@ def _run_pg_train(args: list[str], label: str):
         "returncode": proc.returncode,
         "tail": "".join(tail),
     }
-    result["metrics"] = _parse_key_value_metrics(result["tail"])
     result["json_events"] = _parse_json_events(result["tail"])
+    result["metrics"] = _merge_json_event_metrics(
+        _parse_key_value_metrics(result["tail"]), result["json_events"]
+    )
     _write_result_json(result_json, result)
     output_volume.commit()
     if proc.returncode != 0:
@@ -1177,7 +1468,17 @@ def _run_pg_eval(args: list[str]):
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
+    if "--force-cargo-clean" in forwarded:
+        forwarded.remove("--force-cargo-clean")
+        os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
+    requested_eval_world_size = None
+    if "--eval-gpu-world-size" in forwarded:
+        idx = forwarded.index("--eval-gpu-world-size")
+        if idx + 1 < len(forwarded):
+            requested_eval_world_size = forwarded[idx + 1]
     _apply_gpu_env_flags(forwarded)
+    if requested_eval_world_size is not None:
+        os.environ["PG_EVAL_GPU_WORLD_SIZE"] = requested_eval_world_size
     if os.environ.get("PG_VAL_GLOB") and "--val-data" not in forwarded:
         forwarded.extend(["--val-data", os.environ["PG_VAL_GLOB"]])
     if os.environ.get("PG_TOKENIZER_VOCAB") and "--tokenizer-vocab" not in forwarded:
@@ -1205,8 +1506,19 @@ def _run_pg_eval(args: list[str]):
         and "--max-tokens" not in forwarded
     ):
         forwarded.extend(["--max-tokens", os.environ["PG_EVAL_MAX_TOKENS"]])
-    cmd = ["pg-eval"] + forwarded
+    os.environ.setdefault("RUST_BACKTRACE", "1")
+    cmd = _pg_eval_command() + forwarded
     print("Running eval command:", " ".join(cmd), flush=True)
+    print(
+        "Eval environment:",
+        {
+            "PG_EVAL_GPU_WORLD_SIZE": os.environ.get("PG_EVAL_GPU_WORLD_SIZE"),
+            "PG_TTT_AUDIT": os.environ.get("PG_TTT_AUDIT"),
+            "PG_TTT_ASSERT_SCORE_NO_MUTATION": os.environ.get("PG_TTT_ASSERT_SCORE_NO_MUTATION"),
+            "PG_GPU_BF16_BACKWARD_CHAIN": os.environ.get("PG_GPU_BF16_BACKWARD_CHAIN"),
+        },
+        flush=True,
+    )
 
     _write_running_result_json(result_json, "eval", cmd)
     tail = deque(maxlen=400)
@@ -1229,7 +1541,10 @@ def _run_pg_eval(args: list[str]):
         "returncode": proc.returncode,
         "tail": "".join(tail),
     }
-    result["metrics"] = _parse_key_value_metrics(result["tail"])
+    result["json_events"] = _parse_json_events(result["tail"])
+    result["metrics"] = _merge_json_event_metrics(
+        _parse_key_value_metrics(result["tail"]), result["json_events"]
+    )
     _write_result_json(result_json, result)
     output_volume.commit()
     if proc.returncode != 0:
@@ -1372,7 +1687,10 @@ def _run_pg_bench(args: list[str]):
         "returncode": proc.returncode,
         "tail": "".join(tail),
     }
-    result["metrics"] = _parse_key_value_metrics(result["tail"])
+    result["json_events"] = _parse_json_events(result["tail"])
+    result["metrics"] = _merge_json_event_metrics(
+        _parse_key_value_metrics(result["tail"]), result["json_events"]
+    )
     _write_result_json(result_json, result)
     output_volume.commit()
     if proc.returncode != 0:
@@ -1469,6 +1787,7 @@ def seed_data():
     volumes={
         "/data": data_volume,
         "/output": output_volume,
+        "/build/target": build_cache_volume,
     },
 )
 def run_command(args: list[str]):
@@ -1483,6 +1802,7 @@ def run_command(args: list[str]):
     volumes={
         "/data": data_volume,
         "/output": output_volume,
+        "/build/target": build_cache_volume,
     },
 )
 def run_command_multi(args: list[str]):
@@ -1497,6 +1817,7 @@ def run_command_multi(args: list[str]):
     volumes={
         "/data": data_volume,
         "/output": output_volume,
+        "/build/target": build_cache_volume,
     },
 )
 def run_command_multi_string(args: str):
@@ -1513,6 +1834,7 @@ def run_command_multi_string(args: str):
     volumes={
         "/data": data_volume,
         "/output": output_volume,
+        "/build/target": build_cache_volume,
     },
 )
 def run_eval_command(args: list[str]):
@@ -1526,6 +1848,7 @@ def run_eval_command(args: list[str]):
     volumes={
         "/data": data_volume,
         "/output": output_volume,
+        "/build/target": build_cache_volume,
     },
 )
 def run_bench_command(args: list[str]):

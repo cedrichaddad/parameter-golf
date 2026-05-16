@@ -7,7 +7,7 @@ use crate::config::ModelConfig;
 use crate::gpu::{bank_shapes, checkpoint_layers, estimate_memory};
 use crate::spec::{
     CompressionMode, EvalAdaptationBackend, ModelSpec, QuantScheme, RopeMode, RunMode, RunSpec,
-    SkipTopology,
+    SkipTopology, TttLoraTargetsSpec,
 };
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ pub struct QuantLayout {
     pub scheme: QuantScheme,
     pub compression: CompressionMode,
     pub matrix_bits: u8,
+    pub mlp_bits: u8,
     pub embed_bits: u8,
     pub attn_gate_bits: u8,
     pub gptq_calibration_batches: usize,
@@ -58,10 +59,12 @@ pub struct EvalPlan {
     pub adaptation_backend: EvalAdaptationBackend,
     pub lora_rank: usize,
     pub lora_alpha: f32,
+    pub lora_lr: Option<f32>,
     pub phased_ttt_prefix_docs: usize,
     pub phased_ttt_phases: usize,
     pub phased_ttt_weight_decay: f32,
     pub ttt_beta2: f32,
+    pub ttt_lora_targets: TttLoraTargetsSpec,
     pub chunk_tokens: usize,
 }
 
@@ -131,7 +134,8 @@ impl ExecutionPlan {
                 value_embedding,
                 checkpointed: checkpointed[layer],
                 recurrent,
-                parallel_residual: run_spec.model.parallel_residual.enabled,
+                parallel_residual: run_spec.model.parallel_residual.enabled
+                    && layer >= run_spec.model.parallel_residual.start_layer,
                 attn_out_gate: run_spec.model.attn_out_gate.enabled,
                 sparse_attn_gate: run_spec.model.sparse_attn_gate.enabled,
             });
@@ -145,6 +149,7 @@ impl ExecutionPlan {
             scheme: run_spec.quant.scheme,
             compression: run_spec.quant.compression,
             matrix_bits: run_spec.quant.matrix_bits,
+            mlp_bits: run_spec.quant.mlp_bits,
             embed_bits: run_spec.quant.embed_bits,
             attn_gate_bits: run_spec.quant.attn_gate_bits,
             gptq_calibration_batches: run_spec.quant.gptq_calibration_batches,
@@ -157,10 +162,12 @@ impl ExecutionPlan {
             adaptation_backend: run_spec.eval.adaptation_backend,
             lora_rank: run_spec.eval.lora_rank,
             lora_alpha: run_spec.eval.lora_alpha,
+            lora_lr: run_spec.eval.lora_lr,
             phased_ttt_prefix_docs: run_spec.eval.phased_ttt_prefix_docs,
             phased_ttt_phases: run_spec.eval.phased_ttt_phases,
             phased_ttt_weight_decay: run_spec.eval.phased_ttt_weight_decay,
             ttt_beta2: run_spec.eval.ttt_beta2,
+            ttt_lora_targets: run_spec.eval.ttt_lora_targets.clone(),
             chunk_tokens: run_spec.eval.chunk_tokens,
         };
 
@@ -284,6 +291,12 @@ impl ExecutionPlan {
                 config.parallel_residual,
             )));
         }
+        if spec.parallel_residual.start_layer != config.parallel_residual_start_layer {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for parallel_residual_start_layer: expected {}, got {}",
+                spec.parallel_residual.start_layer, config.parallel_residual_start_layer,
+            )));
+        }
         if spec.attn_out_gate.enabled != config.attn_out_gate_enabled {
             return Err(PgError::InvalidOp(format!(
                 "execution plan mismatch for attn_out_gate_enabled: expected {}, got {}",
@@ -353,6 +366,28 @@ impl ExecutionPlan {
             return Err(PgError::InvalidOp(format!(
                 "execution plan mismatch for logit_softcap: expected {}, got {}",
                 spec.logit_softcap, config.logit_softcap,
+            )));
+        }
+        let expected_softcap_pos = if spec.asym_logit.enabled {
+            spec.asym_logit.softcap_pos
+        } else {
+            spec.logit_softcap
+        };
+        let expected_softcap_neg = if spec.asym_logit.enabled {
+            spec.asym_logit.softcap_neg
+        } else {
+            spec.logit_softcap
+        };
+        if (expected_softcap_pos - config.logit_softcap_pos).abs() > f32::EPSILON {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for logit_softcap_pos: expected {}, got {}",
+                expected_softcap_pos, config.logit_softcap_pos,
+            )));
+        }
+        if (expected_softcap_neg - config.logit_softcap_neg).abs() > f32::EPSILON {
+            return Err(PgError::InvalidOp(format!(
+                "execution plan mismatch for logit_softcap_neg: expected {}, got {}",
+                expected_softcap_neg, config.logit_softcap_neg,
             )));
         }
         if (spec.qk_gain_init - config.qk_gain_init).abs() > f32::EPSILON {
@@ -552,6 +587,7 @@ fn fingerprint(run_spec: &RunSpec) -> String {
         .hash(&mut hasher);
     run_spec.train.muon_momentum_warmup_steps.hash(&mut hasher);
     run_spec.train.muon_wd.to_bits().hash(&mut hasher);
+    run_spec.train.muon_newton_schulz_steps.hash(&mut hasher);
     run_spec.train.adam_wd.to_bits().hash(&mut hasher);
     run_spec.train.adam_beta2.to_bits().hash(&mut hasher);
     run_spec.train.ema_decay.to_bits().hash(&mut hasher);
@@ -568,7 +604,7 @@ mod tests {
     use super::*;
     use crate::{
         BackwardChainProfile, CompressionMode, CudaGraphProfile, EvalAdaptationBackend,
-        RecordProfile, RunSpec, TttMask, VariantFamily,
+        RecordProfile, RecurrentBackwardProfile, RunSpec, TttMask, VariantFamily,
     };
 
     #[test]
@@ -686,7 +722,20 @@ mod tests {
         assert_eq!(clean.model.train_seq_len, 3072);
         assert_eq!(clean.eval.ttt_seq_len, Some(3072));
         assert_eq!(clean.eval.ttt_mask, TttMask::NoQv);
+        assert_eq!(
+            clean.eval.ttt_lora_targets,
+            TttLoraTargetsSpec::upstream_pr2014_no_qv()
+        );
         assert_eq!(clean.train.seq_schedule.len(), 3);
+        assert!(clean.runtime.recurrence_active_required);
+        assert_eq!(clean.runtime.recurrent_active_steps_min, 2000);
+        assert!(clean.runtime.bigram_embedding_merge);
+        assert!(!clean.runtime.combined_qkv_rope_tail_backward);
+        assert!(!clean.runtime.graph_side_gemm_capture);
+        assert!(clean.runtime.sharded_muon_local_graph);
+        assert!(clean.runtime.sharded_muon_pre_norm_graph);
+        assert!(!clean.runtime.sharded_muon_fused_global_clip);
+        assert!(clean.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&clean).unwrap();
 
         let audit = RunSpec::load(&specs_dir.join("frontier_2135_audit_target.toml")).unwrap();
@@ -695,9 +744,13 @@ mod tests {
             RecordProfile::Frontier2135Audit
         );
         assert_eq!(audit.quant.gptq_calibration_batches, 32);
-        assert_eq!(audit.model.train_seq_len, 2048);
-        assert_eq!(audit.train.seq_len, 2048);
-        assert_eq!(audit.train.batch_tokens, 786_432);
+        assert_eq!(audit.quant.matrix_bits, 6);
+        assert_eq!(audit.quant.mlp_bits, 6);
+        assert_eq!(audit.quant.embed_bits, 7);
+        assert_eq!(audit.model.train_seq_len, 1024);
+        assert_eq!(audit.model.recurrence.enable_at_step, Some(1748));
+        assert_eq!(audit.train.seq_len, 1024);
+        assert_eq!(audit.train.batch_tokens, 524_288);
         assert_eq!(audit.train.grad_clip_norm, 0.3);
         assert_eq!(audit.train.scalar_lr, 0.02);
         assert_eq!(audit.train.tied_embed_lr, 0.03);
@@ -711,7 +764,132 @@ mod tests {
         assert_eq!(audit.eval.ngram_tilt.agree_add_boost, 0.0);
         assert_eq!(audit.eval.ttt_seq_len, Some(2560));
         assert_eq!(audit.eval.ttt_mask, TttMask::KOff);
+        assert_eq!(
+            audit.eval.ttt_lora_targets,
+            TttLoraTargetsSpec::upstream_pr2135()
+        );
+        assert_eq!(audit.eval.lora_lr, Some(0.00008));
+        assert!(audit.runtime.recurrence_active_required);
+        assert_eq!(audit.runtime.recurrent_active_steps_min, 2000);
+        assert!(!audit.runtime.bigram_embedding_merge);
+        assert!(!audit.runtime.combined_qkv_rope_tail_backward);
+        assert!(!audit.runtime.graph_side_gemm_capture);
+        assert!(audit.runtime.sharded_muon_local_graph);
+        assert!(audit.runtime.sharded_muon_pre_norm_graph);
+        assert!(!audit.runtime.sharded_muon_fused_global_clip);
+        assert!(audit.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&audit).unwrap();
+
+        let allst =
+            RunSpec::load(&specs_dir.join("frontier_2135_allst_budget_target.toml")).unwrap();
+        assert_eq!(
+            allst.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            allst.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::AllStraightThrough
+        );
+        assert!(!allst.runtime.recurrence_active_required);
+        assert_eq!(allst.quant.matrix_bits, 5);
+        assert_eq!(allst.quant.mlp_bits, 4);
+        assert_eq!(allst.quant.embed_bits, 6);
+        assert!(allst.eval.ttt_lora_targets.rust_gpu_runtime_supported());
+        assert!(!allst.runtime.bigram_embedding_merge);
+        assert!(!allst.runtime.combined_qkv_rope_tail_backward);
+        assert!(!allst.runtime.graph_side_gemm_capture);
+        assert!(allst.runtime.sharded_muon_local_graph);
+        assert!(allst.runtime.sharded_muon_pre_norm_graph);
+        assert!(!allst.runtime.sharded_muon_fused_global_clip);
+        assert!(allst.runtime.sharded_muon_bf16_shadow_all_gather);
+        ExecutionPlan::from_run_spec(&allst).unwrap();
+
+        let hybrid =
+            RunSpec::load(&specs_dir.join("frontier_2135_hybridst_budget_target.toml")).unwrap();
+        assert_eq!(
+            hybrid.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            hybrid.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Pass1StraightThrough
+        );
+        assert_eq!(hybrid.runtime.recurrent_straight_through_layers, 3);
+        assert!(hybrid.runtime.recurrence_active_required);
+        assert_eq!(hybrid.runtime.recurrent_active_steps_min, 2000);
+        assert!(hybrid.eval.ttt_lora_targets.rust_gpu_runtime_supported());
+        ExecutionPlan::from_run_spec(&hybrid).unwrap();
+
+        let hybrid1 =
+            RunSpec::load(&specs_dir.join("frontier_2135_hybridst1_budget_target.toml")).unwrap();
+        assert_eq!(
+            hybrid1.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            hybrid1.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Pass1StraightThrough
+        );
+        assert_eq!(hybrid1.runtime.recurrent_straight_through_layers, 1);
+        assert!(hybrid1.runtime.recurrence_active_required);
+        assert_eq!(hybrid1.runtime.recurrent_active_steps_min, 2000);
+        assert!(hybrid1.eval.ttt_lora_targets.rust_gpu_runtime_supported());
+        ExecutionPlan::from_run_spec(&hybrid1).unwrap();
+
+        let hybrid2 =
+            RunSpec::load(&specs_dir.join("frontier_2135_hybridst2_budget_target.toml")).unwrap();
+        assert_eq!(
+            hybrid2.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            hybrid2.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Pass1StraightThrough
+        );
+        assert_eq!(hybrid2.runtime.recurrent_straight_through_layers, 2);
+        assert!(hybrid2.runtime.recurrence_active_required);
+        assert_eq!(hybrid2.runtime.recurrent_active_steps_min, 2000);
+        assert!(hybrid2.eval.ttt_lora_targets.rust_gpu_runtime_supported());
+        ExecutionPlan::from_run_spec(&hybrid2).unwrap();
+
+        let skip_pass1bank =
+            RunSpec::load(&specs_dir.join("frontier_2135_full_skip_pass1bank_budget_target.toml"))
+                .unwrap();
+        assert_eq!(
+            skip_pass1bank.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            skip_pass1bank.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Full
+        );
+        assert!(skip_pass1bank.runtime.skip_recurrent_pass1_bank_grads);
+        assert!(skip_pass1bank.runtime.recurrence_active_required);
+        assert_eq!(skip_pass1bank.runtime.recurrent_active_steps_min, 2000);
+        assert!(
+            skip_pass1bank
+                .eval
+                .ttt_lora_targets
+                .rust_gpu_runtime_supported()
+        );
+        ExecutionPlan::from_run_spec(&skip_pass1bank).unwrap();
+
+        let flowgrad =
+            RunSpec::load(&specs_dir.join("frontier_2135_flowgrad_budget_target.toml")).unwrap();
+        assert_eq!(
+            flowgrad.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            flowgrad.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::Full
+        );
+        assert!(flowgrad.runtime.skip_recurrent_bank_grads);
+        assert!(flowgrad.runtime.skip_recurrent_pass1_bank_grads);
+        assert!(flowgrad.runtime.recurrence_active_required);
+        assert_eq!(flowgrad.runtime.recurrent_active_steps_min, 2000);
+        assert!(flowgrad.eval.ttt_lora_targets.rust_gpu_runtime_supported());
+        ExecutionPlan::from_run_spec(&flowgrad).unwrap();
     }
 
     #[test]
