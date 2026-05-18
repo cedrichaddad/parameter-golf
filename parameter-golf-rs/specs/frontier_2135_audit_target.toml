@@ -180,7 +180,7 @@ precompute_inside_eval_timer = true
 [runtime]
 record_profile = "frontier2135_audit"
 backward_chain_profile = "bf16_direct_compact"
-recurrent_backward_profile = "full"
+recurrent_backward_profile = "exact_fused"
 recurrent_fused_pass_boundary_backward = true
 recurrence_active_required = true
 recurrent_active_steps_min = 2000

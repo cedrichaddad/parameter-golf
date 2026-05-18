@@ -24,6 +24,15 @@ fn main() {
     };
 
     match command.as_str() {
+        "preflight-caseops" | "preflight-record-data" => {
+            let run_spec = load_preflight_spec(args);
+            let json = pg_train::record_data_preflight_json(&run_spec);
+            println!("record_data_preflight_json={json}");
+            if !pg_train::record_data_preflight_ready(&run_spec) {
+                eprintln!("record data preflight failed");
+                std::process::exit(1);
+            }
+        }
         "run" => {
             let mut spec_path: Option<PathBuf> = None;
             let mut builtin: Option<VariantFamily> = None;
@@ -987,8 +996,55 @@ fn main() {
     }
 }
 
+fn load_preflight_spec<I>(mut args: I) -> RunSpec
+where
+    I: Iterator<Item = String>,
+{
+    let mut spec_path: Option<PathBuf> = None;
+    let mut mode: Option<RunMode> = None;
+    let mut train_data_pattern: Option<String> = None;
+    let mut validation_data_pattern: Option<String> = None;
+    let mut tokenizer_vocab_path: Option<String> = None;
+    let mut caseops_byte_sidecar_pattern: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--spec" => spec_path = args.next().map(PathBuf::from),
+            "--mode" => mode = args.next().as_deref().and_then(parse_mode),
+            "--train-data" => train_data_pattern = args.next(),
+            "--val-data" => validation_data_pattern = args.next(),
+            "--tokenizer-vocab" => tokenizer_vocab_path = args.next(),
+            "--caseops-byte-sidecar" => caseops_byte_sidecar_pattern = args.next(),
+            _ => {}
+        }
+    }
+    let mut run_spec = if let Some(path) = spec_path {
+        RunSpec::load(&path).expect("failed to load spec")
+    } else {
+        RunSpec::for_family(VariantFamily::BaselineSp8192)
+    };
+    if let Some(mode) = mode {
+        run_spec.mode = mode;
+    }
+    if let Some(pattern) = train_data_pattern {
+        run_spec.train.train_data_pattern = Some(pattern);
+    }
+    if let Some(pattern) = validation_data_pattern {
+        run_spec.train.validation_data_pattern = Some(pattern);
+    }
+    if let Some(path) = tokenizer_vocab_path {
+        run_spec.eval.tokenizer_vocab_path = Some(path);
+    }
+    if let Some(pattern) = caseops_byte_sidecar_pattern {
+        run_spec.eval.caseops_byte_sidecar_pattern = Some(pattern);
+    }
+    run_spec
+}
+
 fn print_usage() {
     eprintln!("usage:");
+    eprintln!(
+        "  pg-train preflight-caseops [--spec spec.toml] [--train-data glob] [--val-data glob] [--caseops-byte-sidecar glob]"
+    );
     eprintln!(
         "  pg-train run [--spec spec.toml] [--builtin baseline_sp8192] [--mode smoke|proxy|record-shaped-proxy|record]"
     );

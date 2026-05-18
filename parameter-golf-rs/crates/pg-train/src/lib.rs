@@ -938,6 +938,10 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
         run_spec.runtime.sharded_muon_bf16_shadow_all_gather,
         record_authoritative,
     )?;
+    let exact_fused_recurrence = matches!(
+        run_spec.runtime.recurrent_backward_profile,
+        RecurrentBackwardProfile::ExactFused
+    );
     apply_bool_runtime_env(
         "PG_GPU_RECURRENT_PASS1_STRAIGHT_THROUGH",
         matches!(
@@ -961,17 +965,17 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
     )?;
     apply_bool_runtime_env(
         "PG_GPU_RECURRENT_FUSED_PASS_BOUNDARY_BWD",
-        run_spec.runtime.recurrent_fused_pass_boundary_backward,
+        run_spec.runtime.recurrent_fused_pass_boundary_backward || exact_fused_recurrence,
         record_authoritative,
     )?;
     apply_bool_runtime_env(
         "PG_GPU_SKIP_RECURRENT_BANK_GRADS",
-        run_spec.runtime.skip_recurrent_bank_grads,
+        run_spec.runtime.skip_recurrent_bank_grads && !exact_fused_recurrence,
         record_authoritative,
     )?;
     apply_bool_runtime_env(
         "PG_GPU_SKIP_RECURRENT_PASS1_BANK_GRADS",
-        run_spec.runtime.skip_recurrent_pass1_bank_grads,
+        run_spec.runtime.skip_recurrent_pass1_bank_grads && !exact_fused_recurrence,
         record_authoritative,
     )?;
     apply_usize_runtime_env(
@@ -6842,6 +6846,86 @@ fn canonical_caseops_dataset_for_audit(
         && validation.train_val_file_non_overlap == Some(true)
 }
 
+pub fn record_data_preflight_ready(run_spec: &RunSpec) -> bool {
+    let validation = validation_data_audit(run_spec);
+    canonical_caseops_dataset_for_audit(run_spec, &validation)
+}
+
+pub fn record_data_preflight_json(run_spec: &RunSpec) -> String {
+    let validation = validation_data_audit(run_spec);
+    let sidecar_len_matches = validation.sidecar_token_count == Some(validation.token_count);
+    let canonical = canonical_caseops_dataset_for_audit(run_spec, &validation);
+    let mut fields = Vec::with_capacity(32);
+    fields.push(json_str_field("event", "record_data_preflight"));
+    fields.push(json_str_field(
+        "record_profile",
+        &format!("{:?}", run_spec.runtime.record_profile),
+    ));
+    fields.push(format!("\"ready\":{}", canonical));
+    fields.push(format!("\"canonical_caseops_dataset\":{}", canonical));
+    fields.push(format!("\"train_shards\":{}", validation.train_shard_count));
+    fields.push(format!(
+        "\"train_shards_required\":{}",
+        FRONTIER_2135_TRAIN_SHARDS
+    ));
+    fields.push(json_opt_str_field(
+        "train_file_set_sha256",
+        validation.train_file_set_sha256.as_deref(),
+    ));
+    fields.push(format!("\"val_shards\":{}", validation.shard_count));
+    fields.push(format!("\"val_tokens\":{}", validation.token_count));
+    fields.push(format!(
+        "\"val_tokens_required\":{}",
+        FRONTIER_2135_CASEOPS_VAL_TOKENS
+    ));
+    fields.push(json_opt_usize_field("val_docs", validation.doc_count));
+    fields.push(format!(
+        "\"val_docs_required\":{}",
+        FRONTIER_CASEOPS_VAL_DOCS
+    ));
+    fields.push(json_opt_str_field(
+        "val_file_set_sha256",
+        validation.file_set_sha256.as_deref(),
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar_files\":{}",
+        validation.sidecar_shard_count
+    ));
+    fields.push(json_opt_usize_field(
+        "caseops_byte_sidecar_tokens",
+        validation.sidecar_token_count,
+    ));
+    fields.push(format!(
+        "\"caseops_sidecar_len_matches_val_tokens\":{}",
+        sidecar_len_matches
+    ));
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_file_set_sha256",
+        validation.sidecar_file_set_sha256.as_deref(),
+    ));
+    fields.push(json_opt_bool_field(
+        "train_val_file_non_overlap",
+        validation.train_val_file_non_overlap,
+    ));
+    fields.push(format!(
+        "\"train_val_non_overlap_proof\":{}",
+        validation.train_val_file_non_overlap == Some(true)
+    ));
+    fields.push(format!(
+        "\"caseops_enabled\":{}",
+        run_spec.model.caseops.enabled
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar_required\":{}",
+        run_spec.model.caseops.byte_sidecar
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar_configured\":{}",
+        run_spec.eval.caseops_byte_sidecar_pattern.is_some()
+    ));
+    format!("{{{}}}", fields.join(","))
+}
+
 /// Emit the full [`VariantResult`] as a single-line JSON object.
 ///
 /// Used by `deploy/run_record_ab.py` to do step-time A/B deltas without
@@ -7788,9 +7872,17 @@ fn record_path_audit_json(
         "\"runtime_recurrent_straight_through_layers\":{}",
         run_spec.runtime.recurrent_straight_through_layers
     ));
+    let exact_fused_recurrence = matches!(
+        run_spec.runtime.recurrent_backward_profile,
+        RecurrentBackwardProfile::ExactFused
+    );
     fields.push(format!(
         "\"runtime_recurrent_fused_pass_boundary_backward\":{}",
-        run_spec.runtime.recurrent_fused_pass_boundary_backward
+        run_spec.runtime.recurrent_fused_pass_boundary_backward || exact_fused_recurrence
+    ));
+    fields.push(format!(
+        "\"runtime_exact_recurrent_fused_backward\":{}",
+        exact_fused_recurrence
     ));
     fields.push(format!(
         "\"recurrent_fused_pass_boundary_backward\":{}",
@@ -10027,7 +10119,12 @@ fn proposal_feature_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     if run_spec.model.xsa_last_n > 0 {
         gaps.push("true register-resident XSA inside the SDPA kernel is not implemented; current code fuses SparseAttnGate+XSA adjacent to attention");
     }
-    gaps.push("persistent-CTA per-block backward megakernel is not implemented");
+    if !matches!(
+        run_spec.runtime.recurrent_backward_profile,
+        RecurrentBackwardProfile::ExactFused
+    ) {
+        gaps.push("exact recurrent fused backward or persistent-CTA per-block backward megakernel is not active");
+    }
     if run_spec.runtime.cuda_graph_profile == CudaGraphProfile::Off {
         gaps.push("no-loss backward CUDA graph capture is disabled");
     }

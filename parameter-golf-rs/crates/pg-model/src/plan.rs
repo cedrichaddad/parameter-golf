@@ -783,6 +783,10 @@ mod tests {
         );
         assert_eq!(audit.eval.lora_lr, Some(0.00008));
         assert!(audit.runtime.recurrence_active_required);
+        assert_eq!(
+            audit.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::ExactFused
+        );
         assert_eq!(audit.runtime.recurrent_active_steps_min, 2000);
         assert!(audit.runtime.recurrent_fused_pass_boundary_backward);
         assert!(!audit.runtime.bigram_embedding_merge);

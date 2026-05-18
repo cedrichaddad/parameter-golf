@@ -1173,14 +1173,18 @@ pub struct GpuRuntimeProfile {
 #[cfg(feature = "cuda")]
 impl GpuRuntimeProfile {
     pub fn from_runtime_spec(runtime: &RuntimeSpec) -> Self {
+        let exact_fused_recurrence =
+            runtime.recurrent_backward_profile == RecurrentBackwardProfile::ExactFused;
         Self {
             backward_chain_profile: runtime.backward_chain_profile,
             cuda_graph_profile: runtime.cuda_graph_profile,
             recurrent_backward_profile: runtime.recurrent_backward_profile,
             recurrent_straight_through_layers: runtime.recurrent_straight_through_layers,
-            recurrent_fused_pass_boundary_backward: runtime.recurrent_fused_pass_boundary_backward,
-            skip_recurrent_bank_grads: runtime.skip_recurrent_bank_grads,
-            skip_recurrent_pass1_bank_grads: runtime.skip_recurrent_pass1_bank_grads,
+            recurrent_fused_pass_boundary_backward: runtime.recurrent_fused_pass_boundary_backward
+                || exact_fused_recurrence,
+            skip_recurrent_bank_grads: runtime.skip_recurrent_bank_grads && !exact_fused_recurrence,
+            skip_recurrent_pass1_bank_grads: runtime.skip_recurrent_pass1_bank_grads
+                && !exact_fused_recurrence,
             bigram_embedding_merge: runtime.bigram_embedding_merge,
             combined_qkv_rope_tail_backward: runtime.combined_qkv_rope_tail_backward,
             qkv_norm_resid_reducer_profile: runtime.qkv_norm_resid_reducer_profile,

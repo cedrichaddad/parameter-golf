@@ -189,6 +189,7 @@ pub enum NcclOverlapMode {
 pub enum RecurrentBackwardProfile {
     #[default]
     Full,
+    ExactFused,
     Pass1StraightThrough,
     AllStraightThrough,
 }

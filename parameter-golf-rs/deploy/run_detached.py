@@ -72,6 +72,145 @@ def _write_running_result_json(path: str | None, label: str, cmd: list[str]):
     )
 
 
+def _latest_json_event(json_events: dict, key: str) -> dict:
+    events = json_events.get(key, [])
+    for event in reversed(events):
+        if isinstance(event, dict):
+            return event
+    return {}
+
+
+def _first_known(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _write_finish_status_json(result: dict, result_json: str | None):
+    metrics = result.get("metrics", {})
+    json_events = result.get("json_events", {})
+    run_timing = _latest_json_event(json_events, "run_timing_json")
+    final_audit = _latest_json_event(json_events, "record_final_audit_json")
+    record_audit = _latest_json_event(json_events, "record_audit_json")
+    preflight = _latest_json_event(json_events, "record_data_preflight_json")
+    artifact_audit = _latest_json_event(json_events, "record_artifact_audit_json")
+    status = {
+        "event": "finish_status",
+        "label": result.get("label"),
+        "status": "ok" if result.get("returncode") == 0 else "failed",
+        "returncode": result.get("returncode"),
+        "command": result.get("command"),
+        "source_command": " ".join(result.get("command", [])),
+        "exact_profile": "frontier_2135_audit_target.toml",
+        "speed_floor_profile": "frontier_2135_allst_budget_target.toml",
+        "known_speed_floor_ms_per_step": 113.476857,
+        "known_speed_floor_source": "frontier_2135_allst_combinedtail_full_v1",
+        "known_exact_active_blocker": "exact frontier_2135_audit profile remains above 120 ms/step until exact recurrent replay is reduced",
+        "known_dataset_blocker": "Modal SP8192 validation previously measured 40547886 tokens; canonical PR2135 requires 47851520",
+        "timing_measured_ms_per_step": _first_known(
+            metrics.get("timing_measured_ms_per_step"),
+            run_timing.get("timing_measured_ms_per_step"),
+        ),
+        "timing_train_step_ms_per_step": _first_known(
+            metrics.get("timing_train_step_ms_per_step"),
+            run_timing.get("timing_train_step_ms_per_step"),
+        ),
+        "timing_recurrent_active_steps": _first_known(
+            metrics.get("timing_recurrent_active_steps"),
+            run_timing.get("timing_recurrent_active_steps"),
+        ),
+        "timing_recurrent_active_ms_per_step": _first_known(
+            metrics.get("timing_recurrent_active_ms_per_step"),
+            run_timing.get("timing_recurrent_active_ms_per_step"),
+        ),
+        "final_bpb": _first_known(metrics.get("final_bpb"), run_timing.get("final_bpb")),
+        "eval_tokens": _first_known(metrics.get("eval_tokens"), run_timing.get("eval_tokens")),
+        "artifact_model_bytes": _first_known(
+            metrics.get("artifact_model_bytes"),
+            final_audit.get("artifact_model_bytes"),
+            artifact_audit.get("artifact_model_bytes"),
+        ),
+        "artifact_code_bytes": _first_known(
+            metrics.get("artifact_code_bytes"),
+            final_audit.get("artifact_code_bytes"),
+            artifact_audit.get("artifact_code_bytes"),
+        ),
+        "artifact_total_bytes": _first_known(
+            metrics.get("artifact_total_bytes"),
+            final_audit.get("artifact_total_bytes"),
+            artifact_audit.get("artifact_total_bytes"),
+        ),
+        "artifact_budget_ok": _first_known(
+            metrics.get("artifact_budget_ok"),
+            final_audit.get("artifact_budget_ok"),
+            artifact_audit.get("artifact_budget_ok"),
+        ),
+        "artifact_model_sha256": _first_known(
+            metrics.get("artifact_model_sha256"),
+            final_audit.get("artifact_model_sha256"),
+            artifact_audit.get("artifact_model_sha256"),
+        ),
+        "artifact_code_sha256": _first_known(
+            metrics.get("artifact_code_sha256"),
+            final_audit.get("artifact_code_sha256"),
+            artifact_audit.get("artifact_code_sha256"),
+        ),
+        "caseops_byte_sidecar_sha256": _first_known(
+            metrics.get("caseops_byte_sidecar_sha256"),
+            final_audit.get("caseops_byte_sidecar_sha256"),
+            artifact_audit.get("caseops_byte_sidecar_sha256"),
+        ),
+        "frontier_record_ready": _first_known(
+            metrics.get("frontier_record_ready"),
+            final_audit.get("frontier_record_ready"),
+            record_audit.get("frontier_record_ready"),
+        ),
+        "leaderboard_algorithm_ready": _first_known(
+            metrics.get("leaderboard_algorithm_ready"),
+            record_audit.get("leaderboard_algorithm_ready"),
+        ),
+        "canonical_caseops_dataset": _first_known(
+            metrics.get("canonical_caseops_dataset"),
+            preflight.get("canonical_caseops_dataset"),
+            final_audit.get("canonical_caseops_dataset"),
+            record_audit.get("canonical_caseops_dataset"),
+        ),
+        "preflight_ready": _first_known(metrics.get("ready"), preflight.get("ready")),
+        "preflight_val_tokens": _first_known(
+            metrics.get("val_tokens"),
+            preflight.get("val_tokens"),
+        ),
+        "preflight_val_docs": _first_known(metrics.get("val_docs"), preflight.get("val_docs")),
+        "preflight_train_shards": _first_known(
+            metrics.get("train_shards"),
+            preflight.get("train_shards"),
+        ),
+        "host_batch_flatten_calls": _first_known(
+            metrics.get("host_batch_flatten_calls"),
+            run_timing.get("host_batch_flatten_calls"),
+        ),
+        "host_to_device_batch_bytes": _first_known(
+            metrics.get("host_to_device_batch_bytes"),
+            run_timing.get("host_to_device_batch_bytes"),
+        ),
+        "f32_to_bf16_bridge_launches": _first_known(
+            metrics.get("f32_to_bf16_bridge_launches"),
+            run_timing.get("f32_to_bf16_bridge_launches"),
+        ),
+        "bf16_to_f32_bridge_launches": _first_known(
+            metrics.get("bf16_to_f32_bridge_launches"),
+            run_timing.get("bf16_to_f32_bridge_launches"),
+        ),
+    }
+    paths = ["/output/finish_status.json"]
+    if result_json and result_json.startswith("/output/"):
+        base, _ = os.path.splitext(result_json)
+        paths.append(f"{base}.finish_status.json")
+    for path in paths:
+        _write_result_json(path, status)
+
+
 def _pg_train_command() -> list[str]:
     explicit = os.environ.get("PG_TRAIN_BIN")
     if explicit:
@@ -323,6 +462,7 @@ def _merge_json_event_metrics(metrics: dict, json_events: dict) -> dict:
 
     promoted_prefixes = {
         "record_artifact_audit_json": "artifact",
+        "record_data_preflight_json": "preflight",
         "submission_budget_json": "submission",
         "record_audit_json": "audit",
         "run_timing_json": "timing",
@@ -1337,7 +1477,7 @@ def _maybe_seed_data_env():
         if not root:
             continue
         train_glob = os.path.join(root, "fineweb_train_*.bin")
-        val_glob = os.path.join(root, "fineweb_val_[0-9]*.bin")
+        val_glob = os.path.join(root, "fineweb_val_*.bin")
         if not os.environ.get("PG_TRAIN_GLOB") and glob.glob(train_glob):
             os.environ["PG_TRAIN_GLOB"] = train_glob
         if not os.environ.get("PG_VAL_GLOB") and glob.glob(val_glob):
@@ -1455,12 +1595,69 @@ def _run_pg_train(args: list[str], label: str):
         _parse_key_value_metrics(result["tail"]), result["json_events"]
     )
     _write_result_json(result_json, result)
+    _write_finish_status_json(result, result_json)
     output_volume.commit()
     if proc.returncode != 0:
         raise RuntimeError(
             f"{label} command failed with code {proc.returncode}\n"
             f"Command: {' '.join(cmd)}\n"
             f"Last output:\n{result['tail']}"
+        )
+    return result
+
+
+def _run_pg_preflight(args: list[str], label: str):
+    os.environ["RUST_LOG"] = "info"
+    os.environ.setdefault("RUST_BACKTRACE", "1")
+    os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
+    _maybe_seed_data_env()
+    forwarded, result_json = _pop_result_json(args)
+    if "--force-cargo-clean" in forwarded:
+        forwarded.remove("--force-cargo-clean")
+        os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
+    if not forwarded or forwarded[0] not in {"preflight-caseops", "preflight-record-data"}:
+        forwarded.insert(0, "preflight-caseops")
+    if os.environ.get("PG_TRAIN_GLOB") and "--train-data" not in forwarded:
+        forwarded.extend(["--train-data", os.environ["PG_TRAIN_GLOB"]])
+    if os.environ.get("PG_VAL_GLOB") and "--val-data" not in forwarded:
+        forwarded.extend(["--val-data", os.environ["PG_VAL_GLOB"]])
+    if os.environ.get("PG_TOKENIZER_VOCAB") and "--tokenizer-vocab" not in forwarded:
+        forwarded.extend(["--tokenizer-vocab", os.environ["PG_TOKENIZER_VOCAB"]])
+    if (
+        os.environ.get("PG_CASEOPS_BYTE_SIDECAR")
+        and "--caseops-byte-sidecar" not in forwarded
+    ):
+        forwarded.extend(["--caseops-byte-sidecar", os.environ["PG_CASEOPS_BYTE_SIDECAR"]])
+    cmd = _pg_train_command() + forwarded
+    print(f"Running {label} command:", " ".join(cmd), flush=True)
+    _write_running_result_json(result_json, label, cmd)
+    proc = subprocess.run(
+        cmd,
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    result = {
+        "label": label,
+        "command": cmd,
+        "returncode": proc.returncode,
+        "tail": proc.stdout + proc.stderr,
+    }
+    result["json_events"] = _parse_json_events(result["tail"])
+    result["metrics"] = _merge_json_event_metrics(
+        _parse_key_value_metrics(result["tail"]), result["json_events"]
+    )
+    _write_result_json(result_json, result)
+    _write_finish_status_json(result, result_json)
+    output_volume.commit()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{label} command failed with code {proc.returncode}\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Output:\n{result['tail']}"
         )
     return result
 
@@ -1548,6 +1745,7 @@ def _run_pg_eval(args: list[str]):
         _parse_key_value_metrics(result["tail"]), result["json_events"]
     )
     _write_result_json(result_json, result)
+    _write_finish_status_json(result, result_json)
     output_volume.commit()
     if proc.returncode != 0:
         raise RuntimeError(
@@ -1694,6 +1892,7 @@ def _run_pg_bench(args: list[str]):
         _parse_key_value_metrics(result["tail"]), result["json_events"]
     )
     _write_result_json(result_json, result)
+    _write_finish_status_json(result, result_json)
     output_volume.commit()
     if proc.returncode != 0:
         raise RuntimeError(
@@ -1826,6 +2025,34 @@ def run_command_multi_string(args: str):
     """CLI-friendly multi-GPU entrypoint for detached validation jobs."""
 
     return _run_pg_train(shlex.split(args), "multi-GPU")
+
+
+@app.function(
+    image=image,
+    timeout=1800,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+        "/build/target": build_cache_volume,
+    },
+)
+def preflight_caseops(args: list[str]):
+    return _run_pg_preflight(args, "caseops-preflight")
+
+
+@app.function(
+    image=image,
+    timeout=1800,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+        "/build/target": build_cache_volume,
+    },
+)
+def preflight_caseops_string(args: str):
+    return _run_pg_preflight(shlex.split(args), "caseops-preflight")
 
 
 @app.function(
