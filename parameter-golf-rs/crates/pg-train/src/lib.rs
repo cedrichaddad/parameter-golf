@@ -25,6 +25,26 @@ const FRONTIER_2135_CASEOPS_VAL_TOKENS: usize = 47_851_520;
 const FRONTIER_CASEOPS_VAL_DOCS: usize = 50_000;
 const FRONTIER_2135_TRAIN_SHARDS: usize = 80;
 
+fn scored_validation_targets_for_seq_len(raw_tokens: usize, seq_len: usize) -> usize {
+    if raw_tokens <= 1 || seq_len == 0 {
+        return raw_tokens.saturating_sub(1);
+    }
+    raw_tokens.saturating_sub(1) / seq_len * seq_len
+}
+
+fn frontier_scored_validation_targets(run_spec: &RunSpec, raw_tokens: usize) -> usize {
+    if matches!(
+        run_spec.runtime.record_profile,
+        RecordProfile::Frontier2135Audit
+    ) && run_spec.model.caseops.enabled
+        && run_spec.model.caseops.byte_sidecar
+    {
+        scored_validation_targets_for_seq_len(raw_tokens, run_spec.model.eval_seq_len.max(1))
+    } else {
+        raw_tokens
+    }
+}
+
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -332,16 +352,29 @@ fn validation_data_audit(run_spec: &RunSpec) -> ValidationDataAudit {
         .and_then(|pattern| simple_glob_paths(pattern).ok())
         .unwrap_or_default();
 
-    let token_count = data_shard_token_count(&val_paths).unwrap_or(0);
+    let raw_token_count = data_shard_token_count(&val_paths).unwrap_or(0);
+    let token_count = frontier_scored_validation_targets(run_spec, raw_token_count);
     let doc_count =
         count_docs_in_token_shards(&val_paths, run_spec.model.smear_gate_boundary_token_id)
             .ok()
             .flatten();
-    let sidecar_token_count = if sidecar_paths.is_empty() {
+    let raw_sidecar_token_count = if sidecar_paths.is_empty() {
         None
     } else {
         data_shard_token_count(&sidecar_paths).ok()
     };
+    let sidecar_token_count = raw_sidecar_token_count.map(|raw| {
+        if matches!(
+            run_spec.runtime.record_profile,
+            RecordProfile::Frontier2135Audit
+        ) && run_spec.model.caseops.enabled
+            && run_spec.model.caseops.byte_sidecar
+        {
+            token_count.min(raw)
+        } else {
+            raw
+        }
+    });
     let train_file_set_sha256 = sha256_path_manifest(&train_paths);
     let file_set_sha256 = sha256_path_manifest(&val_paths);
     let sidecar_file_set_sha256 = sha256_path_manifest(&sidecar_paths);
@@ -3121,13 +3154,28 @@ impl VariantRunner {
                         eval_model = model;
                     }
                     let max_eval_tokens = self.run_spec.eval.max_tokens.map(|limit| limit.max(2));
-                    let tokens = pg_data::token_stream::load_validation_tokens_limited(
+                    let mut tokens = pg_data::token_stream::load_validation_tokens_limited(
                         pattern,
                         max_eval_tokens,
                     )?
                     .into_iter()
                     .map(|v| v as u32)
                     .collect::<Vec<_>>();
+                    if max_eval_tokens.is_none()
+                        && matches!(
+                            self.run_spec.runtime.record_profile,
+                            RecordProfile::Frontier2135Audit
+                        )
+                        && self.run_spec.model.caseops.enabled
+                        && self.run_spec.model.caseops.byte_sidecar
+                        && tokens.len() > 1
+                    {
+                        let scored_targets = scored_validation_targets_for_seq_len(
+                            tokens.len(),
+                            self.run_spec.model.eval_seq_len.max(1),
+                        );
+                        tokens.truncate(scored_targets + 1);
+                    }
                     eval_docs = count_validation_docs_from_tokens(
                         &tokens,
                         self.run_spec.model.smear_gate_boundary_token_id,
@@ -3169,7 +3217,7 @@ impl VariantRunner {
                             seq_len,
                         )
                     };
-                    (Some(loss), Some(bpb), Some(tokens.len()))
+                    (Some(loss), Some(bpb), Some(token_bytes.len()))
                 } else {
                     (None, None, None)
                 }
@@ -6616,6 +6664,14 @@ fn final_record_audit_json(
         timing.recurrent_active_steps
     ));
     fields.push(format!(
+        "\"recurrence_enable_at_frac\":{}",
+        run_spec.model.recurrence.enable_at_frac
+    ));
+    match run_spec.model.recurrence.enable_at_step {
+        Some(step) => fields.push(format!("\"recurrence_enable_at_step\":{}", step)),
+        None => fields.push("\"recurrence_enable_at_step\":null".to_string()),
+    }
+    fields.push(format!(
         "\"recurrent_active_steps_min\":{}",
         run_spec.runtime.recurrent_active_steps_min
     ));
@@ -7910,6 +7966,14 @@ fn record_path_audit_json(
         run_spec.runtime.recurrence_active_required
     ));
     fields.push(format!(
+        "\"recurrence_enable_at_frac\":{}",
+        run_spec.model.recurrence.enable_at_frac
+    ));
+    match run_spec.model.recurrence.enable_at_step {
+        Some(step) => fields.push(format!("\"recurrence_enable_at_step\":{}", step)),
+        None => fields.push("\"recurrence_enable_at_step\":null".to_string()),
+    }
+    fields.push(format!(
         "\"recurrent_active_steps_min\":{}",
         run_spec.runtime.recurrent_active_steps_min
     ));
@@ -8282,9 +8346,20 @@ fn record_path_audit_json(
                 || sparse_xsa_grouped_kv_backward_enabled_for_audit())
     ));
     fields.push(format!(
+        "\"proposal_sparse_xsa_attn_proj_dx_bf16_fusion_active\":{}",
+        sparse_xsa_attn_proj_dx_bf16_fusion_enabled_for_audit(run_spec)
+    ));
+    fields.push(format!(
         "\"proposal_exact_recurrent_boundary_fusion_active\":{}",
         run_spec.model.recurrence.enabled
             && recurrent_fused_pass_boundary_backward_enabled_for_audit()
+    ));
+    fields.push(format!(
+        "\"proposal_exact_recurrent_mlp_norm_accum_fusion_active\":{}",
+        matches!(
+            run_spec.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::ExactFused
+        ) && bf16_norm_grad_path_enabled_for_audit(run_spec)
     ));
     fields.push("\"proposal_true_xsa_in_attention_fusion\":false".to_string());
     fields.push("\"proposal_persistent_cta_block_backward\":false".to_string());
@@ -9143,6 +9218,20 @@ fn bf16_sparse_xsa_forward_enabled_for_audit() -> bool {
             .as_str(),
         "0" | "false" | "no" | "off"
     )
+}
+
+fn sparse_xsa_attn_proj_dx_bf16_fusion_enabled_for_audit(run_spec: &RunSpec) -> bool {
+    run_spec.runtime.backward_chain_profile != BackwardChainProfile::Off
+        && bf16_attention_backward_bhsd_do_enabled_for_audit(run_spec)
+        && run_spec.model.sparse_attn_gate.enabled
+        && !run_spec.model.attn_out_gate.enabled
+        && run_spec.model.xsa_last_n > 0
+        && skip_f32_attention_saved_activations_enabled_for_audit(run_spec)
+        && bf16_qkv_dx_output_enabled_for_audit(run_spec)
+        && experimental_fused_qkv_projection_enabled()
+        && sparse_xsa_warphead_backward_enabled_for_audit()
+        && !sparse_xsa_grouped_kv_backward_enabled_for_audit()
+        && compact_attn_gate_grad_input_enabled_for_audit()
 }
 
 fn sparse_xsa_warphead_backward_enabled_for_audit() -> bool {
@@ -10362,8 +10451,9 @@ fn eval_target_byte_counts(
     max_tokens: Option<usize>,
 ) -> PgResult<Vec<f32>> {
     if let Some(pattern) = run_spec.eval.caseops_byte_sidecar_pattern.as_deref() {
+        let sidecar_limit = Some(max_tokens.map_or(tokens.len(), |limit| limit.min(tokens.len())));
         let sidecar =
-            pg_data::token_stream::load_validation_byte_sidecar_limited(pattern, max_tokens)?;
+            pg_data::token_stream::load_validation_byte_sidecar_limited(pattern, sidecar_limit)?;
         if sidecar.len() != tokens.len() {
             return Err(pg_core::PgError::DataFormat(format!(
                 "CaseOps byte sidecar length {} does not match validation token length {}",
@@ -10473,6 +10563,14 @@ fn active_recurrence_for_train_step(
     let threshold = run_spec.model.recurrence.enable_at_frac;
     if threshold <= 0.0 {
         return true;
+    }
+    if matches!(
+        run_spec.runtime.record_profile,
+        RecordProfile::Frontier2135Audit | RecordProfile::Frontier2135SpeedProbe
+    ) && total_steps > 0
+    {
+        let enable_at_step = ((threshold * total_steps as f32).ceil() as usize).max(1);
+        return step + 1 >= enable_at_step;
     }
     let progress = if max_wallclock_seconds > 0.0 {
         elapsed_seconds / max_wallclock_seconds
@@ -11584,11 +11682,51 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(json.contains("\"val_tokens\":5"), "{json}");
+        assert!(json.contains("\"val_tokens\":0"), "{json}");
         assert!(
             json.contains("\"frontier_2135_validation_matches\":false"),
             "{json}"
         );
+        assert!(
+            json.contains("\"canonical_caseops_dataset\":false"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn record_data_preflight_json_is_machine_readable_and_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "pg_train_caseops_preflight_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        write_test_shard(&root.join("train_000.bin"), &[1, 2, 3, 1]);
+        write_test_shard(&root.join("val_000.bin"), &[1, 7, 8, 1, 9]);
+        write_test_shard(&root.join("val_bytes_000.bin"), &[0, 1, 1, 1, 1]);
+
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135Audit;
+        spec.train.train_data_pattern = Some(root.join("train_*.bin").to_string_lossy().into());
+        spec.train.validation_data_pattern = Some(root.join("val_*.bin").to_string_lossy().into());
+        spec.eval.caseops_byte_sidecar_pattern =
+            Some(root.join("val_bytes_*.bin").to_string_lossy().into());
+        spec.model.caseops.enabled = true;
+        spec.model.caseops.byte_sidecar = true;
+        spec.model.smear_gate_boundary_token_id = Some(1);
+
+        let json = record_data_preflight_json(&spec);
+        let ready = record_data_preflight_ready(&spec);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!ready);
+        assert!(
+            json.contains("\"event\":\"record_data_preflight\""),
+            "{json}"
+        );
+        assert!(json.contains("\"ready\":false"), "{json}");
+        assert!(json.contains("\"val_tokens\":0"), "{json}");
+        assert!(json.contains("\"val_tokens_required\":47851520"), "{json}");
         assert!(
             json.contains("\"canonical_caseops_dataset\":false"),
             "{json}"
@@ -13058,6 +13196,22 @@ mod tests {
         spec.model.recurrence.enabled = true;
         spec.model.recurrence.enable_at_frac = 0.35;
         spec.model.recurrence.enable_at_step = Some(1748);
+
+        assert!(!active_recurrence_for_train_step(
+            &spec, 1746, 4994, 300.0, 600.0
+        ));
+        assert!(active_recurrence_for_train_step(
+            &spec, 1747, 4994, 0.0, 600.0
+        ));
+    }
+
+    #[test]
+    fn frontier_recurrence_activation_uses_iteration_gate_without_explicit_step() {
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135Audit;
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.enable_at_frac = 0.35;
+        spec.model.recurrence.enable_at_step = None;
 
         assert!(!active_recurrence_for_train_step(
             &spec, 1746, 4994, 300.0, 600.0

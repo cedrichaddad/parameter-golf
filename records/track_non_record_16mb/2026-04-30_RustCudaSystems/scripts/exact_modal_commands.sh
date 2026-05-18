@@ -173,3 +173,50 @@ cargo test -q -p pg-data
 cargo test -q --features cuda -p pg-eval
 cargo test -q --features cuda -p pg-train
 python3 -m py_compile deploy/run_detached.py deploy/build_submission.py
+
+# Frontier #2135 canonical data preflight. This must pass before any full
+# mode=record train/eval/export can be considered compliant. Latest clean
+# preflight reaches the real data audit and fails for the data-mount reason:
+# train_shards=80 and val_docs=50,000 are correct, but val_tokens=40,541,268
+# versus the canonical PR #2135 requirement of 47,851,520.
+/tmp/pg-modal-venv312/bin/modal run \
+  deploy/run_detached.py::preflight_caseops_string \
+  --args "preflight-caseops --spec /specs/frontier_2135_audit_target.toml --result-json /output/frontier_2135_caseops_preflight_latest.json"
+
+# Data-seed guard. The run_detached image now installs huggingface_hub and the
+# seeder checks token counts instead of accepting any existing SP8192 files. The
+# official willdepueoai/parameter-golf repo does not publish fineweb10B_sp8192 at
+# this path, so the seeder falls back to Austin362667/fineweb10B_sp8192 for proxy
+# timing only, prunes to 80 train shards, regenerates CaseOps sidecars, and then
+# fails closed because val_tokens=40,541,268 != 47,851,520.
+/tmp/pg-modal-venv312/bin/modal run deploy/run_detached.py::seed_data
+
+# Updated preflight after the seed-data repair. This archives the fail-closed
+# canonical data blocker against the restored 80-shard proxy mount.
+/tmp/pg-modal-venv312/bin/modal run \
+  deploy/run_detached.py::preflight_caseops_string \
+  --args "preflight-caseops --spec /specs/frontier_2135_audit_target.toml --result-json /output/frontier_2135_caseops_preflight_after_seed_v1.json"
+
+# Latest exact-gradient #2135 active-recurrence evidence after promoting
+# recurrent_backward_profile=exact_fused and fusing the non-parallel MLP-norm
+# add into RMSNorm backward. This is still over the 120 ms target:
+# timing_measured_ms_per_step=127.578, active=156.311, inactive=119.845.
+/tmp/pg-modal-venv312/bin/modal run --detach \
+  deploy/run_detached.py::run_command_multi_string \
+  --args "run --spec /specs/frontier_2135_audit_target.toml --mode record-shaped-proxy --backend cuda-distributed --artifact /output/frontier_2135_exactfused_accum_short_v1.pgrs --result-json /output/frontier_2135_exactfused_accum_short_v1.json --frontier-graph-record-profile --record-shaped-proxy-max-steps 2200 --record-timing-skip-steps 64 --force-cargo-clean"
+
+# Exact-gradient #2135 after routing the attention-output projection dX through
+# BF16 directly into the compact SparseAttnGate/XSA backward consumer. The new
+# audit field proposal_sparse_xsa_attn_proj_dx_bf16_fusion_active=true and bridge
+# launches remain zero. This is correct but still not decisive:
+# timing_measured_ms_per_step=127.110, active=155.655, inactive=119.427.
+/tmp/pg-modal-venv312/bin/modal run \
+  deploy/run_detached.py::run_command_multi_string \
+  --args "run --spec /specs/frontier_2135_audit_target.toml --mode record-shaped-proxy --backend cuda-distributed --artifact /output/frontier_2135_sparsexsa_bf16dx_short_v1.pgrs --result-json /output/frontier_2135_sparsexsa_bf16dx_short_v1.json --frontier-graph-record-profile --record-shaped-proxy-max-steps 2200 --record-timing-skip-steps 64 --force-cargo-clean"
+
+# Graph-side GEMM capture remains a negative A/B on top of the BF16 XSA dX cut:
+# timing_measured_ms_per_step=127.994, worse than the clean 127.110 short run.
+# Keep graph_side_gemm_capture=false in the audit spec.
+/tmp/pg-modal-venv312/bin/modal run \
+  deploy/run_detached.py::run_command_multi_string \
+  --args "run --spec /specs/frontier_2135_audit_target.toml --mode record-shaped-proxy --backend cuda-distributed --artifact /output/frontier_2135_sparsexsa_bf16dx_graphside_short_v1.pgrs --result-json /output/frontier_2135_sparsexsa_bf16dx_graphside_short_v1.json --frontier-graph-record-profile --record-shaped-proxy-max-steps 2200 --record-timing-skip-steps 64 --enable-graph-side-gemm-capture"

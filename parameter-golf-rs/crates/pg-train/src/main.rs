@@ -1043,7 +1043,7 @@ where
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  pg-train preflight-caseops [--spec spec.toml] [--train-data glob] [--val-data glob] [--caseops-byte-sidecar glob]"
+        "  pg-train preflight-caseops [--spec spec.toml] [--train-data glob] [--val-data glob] [--tokenizer-vocab path] [--caseops-byte-sidecar glob]"
     );
     eprintln!(
         "  pg-train run [--spec spec.toml] [--builtin baseline_sp8192] [--mode smoke|proxy|record-shaped-proxy|record]"

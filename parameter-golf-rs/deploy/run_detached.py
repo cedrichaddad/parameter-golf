@@ -5,15 +5,16 @@ import os
 import glob
 import shutil
 import shlex
-import struct
 import json
 import tomllib
+from array import array
 from collections import deque
 
 app = modal.App("pg-train-detached")
 
 image = (
     modal.Image.from_dockerfile("deploy/Dockerfile", context_dir=".", add_python="3.12")
+    .pip_install("huggingface_hub")
     .add_local_dir(
         ".",
         remote_path="/build",
@@ -31,6 +32,27 @@ image = (
 data_volume = modal.Volume.from_name("pg-data", create_if_missing=True)
 output_volume = modal.Volume.from_name("pg-output", create_if_missing=True)
 build_cache_volume = modal.Volume.from_name("pg-build-cache", create_if_missing=True)
+
+FRONTIER_2135_TRAIN_SHARDS = 80
+FRONTIER_2135_VAL_DOCS = 50_000
+FRONTIER_2135_VAL_TOKENS = 47_851_520
+FRONTIER_2135_EVAL_SEQ_LEN = 2560
+U16_SHARD_HEADER_BYTES = 256 * 4
+SP8192_DATASET_DIR = "/data/datasets/fineweb10B_sp8192"
+SP8192_NESTED_DATASET_DIR = "/data/datasets/datasets/fineweb10B_sp8192"
+SP8192_CASEOPS_NESTED_DATASET_DIR = (
+    "/data/datasets/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved"
+)
+SP8192_TOKENIZER_MODEL = "/data/tokenizers/fineweb_8192_bpe.model"
+SP8192_TOKENIZER_VOCAB = "/data/tokenizers/fineweb_8192_bpe.vocab"
+SP8192_NESTED_TOKENIZER_MODEL = "/data/datasets/tokenizers/fineweb_8192_bpe.model"
+SP8192_NESTED_TOKENIZER_VOCAB = "/data/datasets/tokenizers/fineweb_8192_bpe.vocab"
+SP8192_CASEOPS_TOKENIZER_MODEL = (
+    "/data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model"
+)
+SP8192_CASEOPS_NESTED_TOKENIZER_MODEL = (
+    "/data/datasets/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model"
+)
 
 
 def _pop_result_json(args: list[str]):
@@ -107,7 +129,7 @@ def _write_finish_status_json(result: dict, result_json: str | None):
         "known_speed_floor_ms_per_step": 113.476857,
         "known_speed_floor_source": "frontier_2135_allst_combinedtail_full_v1",
         "known_exact_active_blocker": "exact frontier_2135_audit profile remains above 120 ms/step until exact recurrent replay is reduced",
-        "known_dataset_blocker": "Modal SP8192 validation previously measured 40547886 tokens; canonical PR2135 requires 47851520",
+        "known_dataset_blocker": "Modal SP8192 fallback validation currently measures 40541268 tokens; canonical PR2135 requires 47851520",
         "timing_measured_ms_per_step": _first_known(
             metrics.get("timing_measured_ms_per_step"),
             run_timing.get("timing_measured_ms_per_step"),
@@ -176,15 +198,30 @@ def _write_finish_status_json(result: dict, result_json: str | None):
             final_audit.get("canonical_caseops_dataset"),
             record_audit.get("canonical_caseops_dataset"),
         ),
-        "preflight_ready": _first_known(metrics.get("ready"), preflight.get("ready")),
+        "preflight_ready": _first_known(
+            metrics.get("ready"),
+            preflight.get("ready"),
+            metrics.get("canonical_caseops_dataset"),
+            final_audit.get("canonical_caseops_dataset"),
+            record_audit.get("canonical_caseops_dataset"),
+        ),
         "preflight_val_tokens": _first_known(
             metrics.get("val_tokens"),
             preflight.get("val_tokens"),
+            final_audit.get("val_tokens"),
+            record_audit.get("val_tokens"),
         ),
-        "preflight_val_docs": _first_known(metrics.get("val_docs"), preflight.get("val_docs")),
+        "preflight_val_docs": _first_known(
+            metrics.get("val_docs"),
+            preflight.get("val_docs"),
+            final_audit.get("val_docs"),
+            record_audit.get("val_docs"),
+        ),
         "preflight_train_shards": _first_known(
             metrics.get("train_shards"),
             preflight.get("train_shards"),
+            final_audit.get("train_shards"),
+            record_audit.get("train_shards"),
         ),
         "host_batch_flatten_calls": _first_known(
             metrics.get("host_batch_flatten_calls"),
@@ -203,6 +240,26 @@ def _write_finish_status_json(result: dict, result_json: str | None):
             run_timing.get("bf16_to_f32_bridge_launches"),
         ),
     }
+    blocking_reasons = []
+    if status.get("preflight_ready") is False:
+        blocking_reasons.append("canonical_caseops_dataset_not_ready")
+    measured_ms = status.get("timing_measured_ms_per_step")
+    if measured_ms is not None and measured_ms > 120.0:
+        blocking_reasons.append("exact_profile_over_120ms")
+    if status.get("final_bpb") is None:
+        blocking_reasons.append("full_bpb_not_validated")
+    if status.get("artifact_total_bytes") is None:
+        blocking_reasons.append("artifact_total_bytes_not_proven")
+    if status.get("frontier_record_ready") is False:
+        blocking_reasons.append("frontier_record_ready_false")
+    status["blocking_reasons"] = blocking_reasons
+    status["completion_state"] = (
+        "ready"
+        if not blocking_reasons and result.get("returncode") == 0
+        else "blocked"
+        if blocking_reasons
+        else "failed"
+    )
     paths = ["/output/finish_status.json"]
     if result_json and result_json.startswith("/output/"):
         base, _ = os.path.splitext(result_json)
@@ -1612,6 +1669,11 @@ def _run_pg_preflight(args: list[str], label: str):
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
+    # Preflight is the gate that decides whether a full record run is allowed
+    # to allocate GPUs. The persistent Modal target cache can otherwise reuse an
+    # older pg-train binary whose CLI/audit surface predates the current
+    # preflight command. Keep this path fail-safe by rebuilding clean.
+    os.environ.setdefault("PG_FORCE_CARGO_CLEAN", "1")
     if "--force-cargo-clean" in forwarded:
         forwarded.remove("--force-cargo-clean")
         os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
@@ -1804,22 +1866,51 @@ def _token_byte_count(prev: int, target: int, base_bytes, has_leading_space, is_
     return min(nbytes, 65535)
 
 
+def _count_u16_shard_tokens(path: str) -> int:
+    size = os.path.getsize(path)
+    payload = size - U16_SHARD_HEADER_BYTES
+    if payload < 0 or payload % 2 != 0:
+        raise RuntimeError(
+            f"u16 shard {path} has invalid size {size}; expected 1024-byte header and u16 payload"
+        )
+    return payload // 2
+
+
+def _sum_u16_shard_tokens(paths: list[str]) -> int:
+    return sum(_count_u16_shard_tokens(path) for path in paths)
+
+
+def _scored_validation_targets(raw_tokens: int, seq_len: int = FRONTIER_2135_EVAL_SEQ_LEN) -> int:
+    if raw_tokens <= 1:
+        return max(0, raw_tokens - 1)
+    return ((raw_tokens - 1) // seq_len) * seq_len
+
+
 def _read_u16_shard(path: str):
     with open(path, "rb") as f:
-        header = f.read(256 * 4)
-        if len(header) != 256 * 4:
+        header = f.read(U16_SHARD_HEADER_BYTES)
+        if len(header) != U16_SHARD_HEADER_BYTES:
             raise RuntimeError(f"token shard {path} is missing the 256-int32 header")
         raw = f.read()
     if len(raw) % 2 != 0:
         raise RuntimeError(f"token shard {path} payload has odd byte length")
-    tokens = list(struct.unpack(f"<{len(raw) // 2}H", raw))
+    tokens = array("H")
+    tokens.frombytes(raw)
+    if sys.byteorder != "little":
+        tokens.byteswap()
     return header, tokens
 
 
-def _write_u16_shard(path: str, header: bytes, values: list[int]):
+def _write_u16_shard(path: str, header: bytes, values):
     with open(path, "wb") as f:
         f.write(header)
-        f.write(struct.pack(f"<{len(values)}H", *values))
+        if isinstance(values, array) and values.typecode == "H":
+            out = array("H", values)
+        else:
+            out = array("H", values)
+        if sys.byteorder != "little":
+            out.byteswap()
+        f.write(out.tobytes())
 
 
 def _ensure_caseops_byte_sidecars(dataset_dir: str, vocab_path: str) -> str:
@@ -1828,21 +1919,78 @@ def _ensure_caseops_byte_sidecars(dataset_dir: str, vocab_path: str) -> str:
         raise RuntimeError(f"no validation shards found in {dataset_dir}")
     sidecar_pattern = os.path.join(dataset_dir, "fineweb_val_bytes_*.bin")
     sidecars = sorted(glob.glob(sidecar_pattern))
-    if len(sidecars) == len(val_files):
+    if len(sidecars) == len(val_files) and _sum_u16_shard_tokens(
+        sidecars
+    ) == _sum_u16_shard_tokens(val_files):
         return sidecar_pattern
 
     print("Generating CaseOps validation byte sidecars", flush=True)
+    for sidecar in sidecars:
+        os.remove(sidecar)
     base_bytes, has_leading_space, is_boundary = _build_bpb_luts(vocab_path)
     prev = 0
     for val_path in val_files:
         header, tokens = _read_u16_shard(val_path)
-        byte_counts: list[int] = []
-        for tok in tokens:
-            byte_counts.append(_token_byte_count(prev, tok, base_bytes, has_leading_space, is_boundary))
+        byte_counts = array("H")
+        for idx, tok in enumerate(tokens):
+            byte_counts.append(
+                _token_byte_count(prev, tok, base_bytes, has_leading_space, is_boundary)
+            )
             prev = tok
+            if idx and idx % 5_000_000 == 0:
+                print(
+                    "CaseOps sidecar progress",
+                    {"shard": os.path.basename(val_path), "tokens": idx},
+                    flush=True,
+                )
         name = os.path.basename(val_path).replace("fineweb_val_", "fineweb_val_bytes_")
         _write_u16_shard(os.path.join(dataset_dir, name), header, byte_counts)
     return sidecar_pattern
+
+
+def _copy_file_if_present(src: str, dst: str):
+    if not os.path.exists(src):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        os.remove(dst)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _normalize_sp8192_download_layout():
+    """Normalize both challenge-export and direct-dataset HF layouts into /data."""
+    if os.path.isdir(SP8192_NESTED_DATASET_DIR):
+        os.makedirs(SP8192_DATASET_DIR, exist_ok=True)
+        for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin", "fineweb_val_bytes_*.bin"):
+            for src in glob.glob(os.path.join(SP8192_NESTED_DATASET_DIR, pattern)):
+                _copy_file_if_present(src, os.path.join(SP8192_DATASET_DIR, os.path.basename(src)))
+    _copy_file_if_present(SP8192_NESTED_TOKENIZER_MODEL, SP8192_TOKENIZER_MODEL)
+    _copy_file_if_present(SP8192_NESTED_TOKENIZER_VOCAB, SP8192_TOKENIZER_VOCAB)
+    if os.path.isdir(SP8192_CASEOPS_NESTED_DATASET_DIR):
+        os.makedirs(SP8192_DATASET_DIR, exist_ok=True)
+        for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin", "fineweb_val_bytes_*.bin"):
+            for src in glob.glob(os.path.join(SP8192_CASEOPS_NESTED_DATASET_DIR, pattern)):
+                _copy_file_if_present(src, os.path.join(SP8192_DATASET_DIR, os.path.basename(src)))
+    _copy_file_if_present(SP8192_CASEOPS_NESTED_TOKENIZER_MODEL, SP8192_CASEOPS_TOKENIZER_MODEL)
+
+
+def _sp8192_download_patterns() -> list[str]:
+    return [
+        "datasets/manifest.json",
+        "datasets/docs_selected.jsonl",
+        "datasets/docs_selected.source_manifest.json",
+        "datasets/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved/*",
+        "datasets/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model",
+        "datasets/datasets/fineweb10B_sp8192/*",
+        "datasets/tokenizers/fineweb_8192_bpe.model",
+        "datasets/tokenizers/fineweb_8192_bpe.vocab",
+        "datasets/fineweb10B_sp8192/*",
+        "tokenizers/fineweb_8192_bpe.model",
+        "tokenizers/fineweb_8192_bpe.vocab",
+    ]
 
 def _run_pg_bench(args: list[str]):
     os.environ["RUST_LOG"] = "info"
@@ -1929,54 +2077,147 @@ def _forwarded_requests_multi_gpu(forwarded: list[str]) -> bool:
 def seed_data():
     from huggingface_hub import snapshot_download
 
-    dataset_dir = "/data/datasets/fineweb10B_sp8192"
+    _normalize_sp8192_download_layout()
+    dataset_dir = SP8192_DATASET_DIR
     train_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_train_*.bin")))
     val_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_[0-9]*.bin")))
-    vocab_path = "/data/tokenizers/fineweb_8192_bpe.vocab"
-    if train_files and val_files and os.path.exists(vocab_path):
+    sidecar_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_bytes_*.bin")))
+    vocab_path = SP8192_TOKENIZER_VOCAB
+    val_tokens = _sum_u16_shard_tokens(val_files) if val_files else 0
+    scored_val_tokens = _scored_validation_targets(val_tokens)
+    sidecar_tokens = _sum_u16_shard_tokens(sidecar_files) if sidecar_files else 0
+    data_ready = (
+        len(train_files) == FRONTIER_2135_TRAIN_SHARDS
+        and val_files
+        and scored_val_tokens == FRONTIER_2135_VAL_TOKENS
+        and sidecar_tokens >= scored_val_tokens + 1
+    )
+    if data_ready:
         print(
-            "SP8192 data already present:",
+            "Canonical SP8192 data already present:",
             {
                 "train_files": len(train_files),
                 "val_files": len(val_files),
-                "vocab_path": vocab_path,
+                "val_tokens": val_tokens,
+                "scored_val_tokens": scored_val_tokens,
+                "sidecar_files": len(sidecar_files),
+                "sidecar_tokens": sidecar_tokens,
             },
             flush=True,
         )
     else:
-        print("Downloading SP8192 shards/tokenizer into pg-data volume", flush=True)
-        snapshot_download(
-            repo_id="sproos/parameter-golf-tokenizers",
-            local_dir="/data",
-            allow_patterns=[
-                "datasets/fineweb10B_sp8192/*",
-                "tokenizers/fineweb_8192_bpe.model",
-                "tokenizers/fineweb_8192_bpe.vocab",
-            ],
+        repo_id = os.environ.get("PG_SP8192_DATA_REPO_ID", "romeerp/parameter-golf-caseops-v1")
+        repo_type = os.environ.get("PG_SP8192_DATA_REPO_TYPE", "dataset")
+        fallback_repo_id = os.environ.get(
+            "PG_SP8192_FALLBACK_DATA_REPO_ID", "kevclark/parameter-golf"
         )
+        fallback_repo_type = os.environ.get("PG_SP8192_FALLBACK_DATA_REPO_TYPE", "dataset")
+        proxy_fallback_repo_id = os.environ.get(
+            "PG_SP8192_PROXY_FALLBACK_DATA_REPO_ID", "willdepueoai/parameter-golf"
+        )
+        proxy_fallback_repo_type = os.environ.get(
+            "PG_SP8192_PROXY_FALLBACK_DATA_REPO_TYPE", "dataset"
+        )
+        last_resort_repo_id = os.environ.get(
+            "PG_SP8192_LAST_RESORT_DATA_REPO_ID", "Austin362667/fineweb10B_sp8192"
+        )
+        last_resort_repo_type = os.environ.get("PG_SP8192_LAST_RESORT_DATA_REPO_TYPE", "dataset")
+        print(
+            "Downloading canonical SP8192 shards/tokenizer into pg-data volume",
+            {
+                "repo_id": repo_id,
+                "repo_type": repo_type,
+                "existing_train_files": len(train_files),
+                "existing_val_files": len(val_files),
+                "existing_val_tokens": val_tokens,
+                "required_train_files": FRONTIER_2135_TRAIN_SHARDS,
+                "required_val_tokens": FRONTIER_2135_VAL_TOKENS,
+            },
+            flush=True,
+        )
+        if os.environ.get("PG_SP8192_PRUNE_NONCANONICAL", "1") not in {"0", "false", "False"}:
+            for pattern in (
+                os.path.join(dataset_dir, "fineweb_train_*.bin"),
+                os.path.join(dataset_dir, "fineweb_val_*.bin"),
+                os.path.join(dataset_dir, "fineweb_val_bytes_*.bin"),
+            ):
+                for path in glob.glob(pattern):
+                    os.remove(path)
+        candidates = [(repo_id, repo_type)]
+        if fallback_repo_id and (fallback_repo_id, fallback_repo_type) not in candidates:
+            candidates.append((fallback_repo_id, fallback_repo_type))
+        if proxy_fallback_repo_id and (
+            proxy_fallback_repo_id,
+            proxy_fallback_repo_type,
+        ) not in candidates:
+            candidates.append((proxy_fallback_repo_id, proxy_fallback_repo_type))
+        if last_resort_repo_id and (
+            last_resort_repo_id,
+            last_resort_repo_type,
+        ) not in candidates:
+            candidates.append((last_resort_repo_id, last_resort_repo_type))
+        for candidate_repo_id, candidate_repo_type in candidates:
+            snapshot_download(
+                repo_id=candidate_repo_id,
+                repo_type=candidate_repo_type,
+                local_dir="/data",
+                allow_patterns=_sp8192_download_patterns(),
+            )
+            _normalize_sp8192_download_layout()
+            if glob.glob(os.path.join(dataset_dir, "fineweb_val_[0-9]*.bin")):
+                print(
+                    "SP8192 files found after dataset download",
+                    {"repo_id": candidate_repo_id, "repo_type": candidate_repo_type},
+                    flush=True,
+                )
+                break
 
     os.makedirs(dataset_dir, exist_ok=True)
     if os.path.exists(vocab_path):
         shutil.copyfile(vocab_path, os.path.join(dataset_dir, "tokenizer.vocab"))
     sidecar_pattern = None
-    if os.path.exists(vocab_path):
+    sidecar_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_bytes_*.bin")))
+    val_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_[0-9]*.bin")))
+    if sidecar_files and len(sidecar_files) == len(val_files):
+        sidecar_pattern = os.path.join(dataset_dir, "fineweb_val_bytes_*.bin")
+    elif os.path.exists(vocab_path):
         sidecar_pattern = _ensure_caseops_byte_sidecars(dataset_dir, vocab_path)
     train_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_train_*.bin")))
     val_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_[0-9]*.bin")))
+    for extra_train in train_files[FRONTIER_2135_TRAIN_SHARDS:]:
+        os.remove(extra_train)
+    train_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_train_*.bin")))
     sidecar_files = sorted(glob.glob(os.path.join(dataset_dir, "fineweb_val_bytes_*.bin")))
+    val_tokens = _sum_u16_shard_tokens(val_files) if val_files else 0
+    scored_val_tokens = _scored_validation_targets(val_tokens)
+    sidecar_tokens = _sum_u16_shard_tokens(sidecar_files) if sidecar_files else 0
     result = {
         "dataset_dir": dataset_dir,
         "train_files": len(train_files),
         "val_files": len(val_files),
+        "raw_val_tokens": val_tokens,
+        "val_tokens": scored_val_tokens,
+        "val_tokens_required": FRONTIER_2135_VAL_TOKENS,
         "tokenizer_vocab": vocab_path if os.path.exists(vocab_path) else None,
+        "caseops_tokenizer_model": SP8192_CASEOPS_TOKENIZER_MODEL
+        if os.path.exists(SP8192_CASEOPS_TOKENIZER_MODEL)
+        else None,
         "caseops_byte_sidecar": sidecar_pattern,
         "caseops_byte_sidecar_files": len(sidecar_files),
+        "caseops_byte_sidecar_tokens": sidecar_tokens,
     }
+    result["canonical_frontier_2135_ready"] = (
+        len(train_files) == FRONTIER_2135_TRAIN_SHARDS
+        and scored_val_tokens == FRONTIER_2135_VAL_TOKENS
+        and sidecar_tokens >= scored_val_tokens + 1
+    )
     print("Seed-data result:", result, flush=True)
-    if not train_files or not val_files or not result["tokenizer_vocab"]:
+    if not train_files or not val_files:
         raise RuntimeError(f"SP8192 seed incomplete: {result}")
     if len(sidecar_files) != len(val_files):
         raise RuntimeError(f"CaseOps sidecar generation incomplete: {result}")
+    if not result["canonical_frontier_2135_ready"]:
+        raise RuntimeError(f"SP8192 seed is not canonical for frontier #2135: {result}")
     data_volume.commit()
     return result
 

@@ -1995,7 +1995,7 @@ impl GpuBlockBackwardCache {
                 DType::BF16,
             )?,
             q_gain_reduce_scratch: zeros(&[h, tokens.div_ceil(256)])?,
-            residual_mix_reduce_scratch: zeros(&[2 * d, tokens.div_ceil(256)])?,
+            residual_mix_reduce_scratch: zeros(&[3 * d, tokens.div_ceil(256)])?,
             residual_mix_norm_stats: zeros(&[tokens, 2])?,
             grad_qkv_proj: zeros(&[tokens, d + 2 * kv])?,
             grad_attn_norm_bf16: GpuTensor::zeros_gpu(stream.clone(), &[tokens, d], DType::BF16)?,
@@ -4345,6 +4345,7 @@ impl GpuModel {
         attn_norm_bf16_override: Option<&GpuTensor>,
         tokens: usize,
         bank_dw_beta: f32,
+        defer_weight_unpack: bool,
     ) -> PgResult<bool> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -4446,7 +4447,7 @@ impl GpuModel {
                 bank_dw_beta,
             )?;
         }
-        if !gpu_skip_bank_dw(bank_dw_beta) {
+        if !gpu_skip_bank_dw(bank_dw_beta) && !defer_weight_unpack {
             self.kernels.unpack_qkv_weight_grad(
                 CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
                 CudaPtr(grads.qo_bank.cu_ptr(stream)?),
@@ -4486,6 +4487,7 @@ impl GpuModel {
         attn_norm_bf16_override: Option<&GpuTensor>,
         tokens: usize,
         bank_dw_beta: f32,
+        defer_weight_unpack: bool,
     ) -> PgResult<bool> {
         use pg_kernels::gpu_kernels::CudaPtr;
 
@@ -4537,7 +4539,7 @@ impl GpuModel {
             bank_dw_beta,
             LinearBackwardOverlapRole::Qkv,
         )?;
-        if !gpu_skip_bank_dw(bank_dw_beta) {
+        if !gpu_skip_bank_dw(bank_dw_beta) && !defer_weight_unpack {
             self.kernels.unpack_qkv_weight_grad(
                 CudaPtr(block_cache.grad_qkv_weight.cu_ptr(stream)?),
                 CudaPtr(grads.qo_bank.cu_ptr(stream)?),
@@ -6306,6 +6308,7 @@ impl GpuModel {
         forward_generation: u64,
         bank_dw_beta: f32,
         precomputed_mlp_residual: bool,
+        defer_qkv_weight_unpack: bool,
         recurrent_boundary_fusion: Option<RecurrentPassBoundaryFusion<'_>>,
         mut stage_timing: Option<&mut GpuBackwardStageTiming>,
     ) -> PgResult<bool> {
@@ -6720,6 +6723,7 @@ impl GpuModel {
             )?;
         }
         let mlp_norm_start = record_stage_event_if(stream, stage_timing.is_some())?;
+        let mut mlp_norm_accumulated_into_attn_grad = false;
         if self.parallel_residual_enabled_for_layer(layer)
             && recompute_residual_mix_norm_inputs
             && self.use_bf16_norm_grad_path()
@@ -6752,6 +6756,19 @@ impl GpuModel {
                 1e-6,
                 0.0,
             )?;
+        } else if !self.parallel_residual_enabled_for_layer(layer) && self.use_bf16_norm_grad_path()
+        {
+            self.kernels.rms_norm_backward_accum_go_bf16(
+                CudaPtr(block_act!(x_after_attn).cu_ptr(stream)?),
+                CudaPtr(grad_mlp_norm_bf16.cu_ptr(stream)?),
+                CudaPtr(grad_x_after_attn.cu_ptr(stream)?),
+                t as u32,
+                d as u32,
+                self.ln_scale_factor(layer),
+                1e-6,
+                1.0,
+            )?;
+            mlp_norm_accumulated_into_attn_grad = true;
         } else if self.use_bf16_norm_grad_path() {
             let mlp_norm_input = if self.parallel_residual_enabled_for_layer(layer) {
                 act!(x_in)
@@ -6767,6 +6784,18 @@ impl GpuModel {
                 self.ln_scale_factor(layer),
                 1e-6,
             )?;
+        } else if !self.parallel_residual_enabled_for_layer(layer) {
+            self.kernels.rms_norm_backward_accum(
+                CudaPtr(block_act!(x_after_attn).cu_ptr(stream)?),
+                CudaPtr(grad_mlp_norm.cu_ptr(stream)?),
+                CudaPtr(grad_x_after_attn.cu_ptr(stream)?),
+                t as u32,
+                d as u32,
+                self.ln_scale_factor(layer),
+                1e-6,
+                1.0,
+            )?;
+            mlp_norm_accumulated_into_attn_grad = true;
         } else {
             let mlp_norm_input = if self.parallel_residual_enabled_for_layer(layer) {
                 act!(x_in)
@@ -6783,7 +6812,8 @@ impl GpuModel {
                 1e-6,
             )?;
         }
-        if !self.parallel_residual_enabled_for_layer(layer) {
+        if !self.parallel_residual_enabled_for_layer(layer) && !mlp_norm_accumulated_into_attn_grad
+        {
             self.add_inplace(grad_x_after_attn, grad_x_pre_mlp_norm, 1.0)?;
         }
         finish_stage_event_optional(
@@ -6926,6 +6956,20 @@ impl GpuModel {
         let grad_attn_result = &block_cache.grad_attn_result;
         let o_w = self.weights.qo_bank.slice_first(n + layer)?;
         let o_w_bf16 = self.weights.qo_bank_bf16.slice_first(n + layer)?;
+        let is_xsa_layer = layer >= n.saturating_sub(self.config.xsa_last_n);
+        let use_sparse_xsa_bf16_attn_result = self.use_bf16_backward_gemm()
+            && self.use_bf16_attention_backward_bhsd_do()
+            && self.config.sparse_attn_gate_enabled
+            && !self.config.attn_out_gate_enabled
+            && is_xsa_layer
+            && self.use_skip_f32_attention_saved_acts()
+            && self.use_fused_qkv_projection()
+            && self.use_bf16_qkv_dx_output()
+            && !self.any_lora_enabled()
+            && gpu_sparse_xsa_warphead_backward_enabled()
+            && !gpu_sparse_xsa_grouped_kv_backward_enabled()
+            && gpu_compact_attn_gate_grad_input_enabled();
+        let grad_attn_result_bf16 = &block_cache.grad_q_post_gain_bf16;
         let attn_weight_input =
             if self.config.attn_out_gate_enabled || self.config.sparse_attn_gate_enabled {
                 act!(attn_gated)
@@ -6936,19 +6980,35 @@ impl GpuModel {
             };
         let attn_out_proj_start = record_stage_event_if(stream, stage_timing.is_some())?;
         if self.use_bf16_backward_gemm() {
-            self.linear_backward_input_and_weight_dy_x_bf16_ready_with_role(
-                grad_proj_out_bf16,
-                act_bf16!(attn_weight_input_bf16, &buf.x_in_bf16),
-                &o_w_bf16,
-                grad_attn_result,
-                &grads.qo_bank.slice_first(n + layer)?,
-                t,
-                d,
-                d,
-                0.0,
-                bank_dw_beta,
-                LinearBackwardOverlapRole::AttnOut,
-            )?;
+            if use_sparse_xsa_bf16_attn_result {
+                self.linear_backward_input_bf16_and_weight_dy_x_bf16_ready_with_role(
+                    grad_proj_out_bf16,
+                    act_bf16!(attn_weight_input_bf16, &buf.x_in_bf16),
+                    &o_w_bf16,
+                    grad_attn_result_bf16,
+                    &grads.qo_bank.slice_first(n + layer)?,
+                    t,
+                    d,
+                    d,
+                    0.0,
+                    bank_dw_beta,
+                    LinearBackwardOverlapRole::AttnOut,
+                )?;
+            } else {
+                self.linear_backward_input_and_weight_dy_x_bf16_ready_with_role(
+                    grad_proj_out_bf16,
+                    act_bf16!(attn_weight_input_bf16, &buf.x_in_bf16),
+                    &o_w_bf16,
+                    grad_attn_result,
+                    &grads.qo_bank.slice_first(n + layer)?,
+                    t,
+                    d,
+                    d,
+                    0.0,
+                    bank_dw_beta,
+                    LinearBackwardOverlapRole::AttnOut,
+                )?;
+            }
         } else {
             self.linear_backward_input_and_weight_impl(
                 grad_proj_out,
@@ -7010,7 +7070,6 @@ impl GpuModel {
         } else {
             None
         };
-        let is_xsa_layer = layer >= n.saturating_sub(self.config.xsa_last_n);
         let mut fused_sparse_xsa_bwd = false;
         let use_bf16_attention_backward_bhsd_do = self.use_bf16_attention_backward_bhsd_do()
             && is_xsa_layer
@@ -7164,33 +7223,63 @@ impl GpuModel {
                         if use_bf16_attention_backward_bhsd_do {
                             let do_bhsd_bf16 = buf.qkv_aux_bf16.cu_ptr(stream)?;
                             if compact_attn_gate_grad_input {
-                                self.kernels
-                                    .sparse_attn_gate_xsa_bwd_bf16_bhsd_warpheads_do_bf16_two_pass_compact_grad_input(
-                                        CudaPtr(saved_attn_out_bhsd),
-                                        CudaPtr(saved_v_bhsd),
-                                        CudaPtr(act!(attn_norm).cu_ptr(stream)?),
-                                        CudaPtr(act!(attn_gate_values).cu_ptr(stream)?),
-                                        CudaPtr(grad_attn_result.cu_ptr(stream)?),
-                                        CudaPtr(
-                                            self.weights.sparse_attn_gate_weights[layer]
-                                                .cu_ptr(stream)?,
-                                        ),
-                                        CudaPtr(do_bhsd_bf16),
-                                        CudaPtr(grad_v_xsa.cu_ptr(stream)?),
-                                        CudaPtr(buf.attn_gate_grad_input_compact.cu_ptr(stream)?),
-                                        CudaPtr(
-                                            grads.block_sparse_attn_gate_weight[layer]
-                                                .cu_ptr(stream)?,
-                                        ),
-                                        (t / runtime_seq_len) as u32,
-                                        runtime_seq_len as u32,
-                                        h as u32,
-                                        hkv as u32,
-                                        hd as u32,
-                                        d as u32,
-                                        compact_attn_gate_grad_width as u32,
-                                        self.config.sparse_attn_gate_scale,
-                                    )?;
+                                if use_sparse_xsa_bf16_attn_result {
+                                    self.kernels
+                                        .sparse_attn_gate_xsa_bwd_bf16_bhsd_warpheads_go_bf16_do_bf16_two_pass_compact_grad_input(
+                                            CudaPtr(saved_attn_out_bhsd),
+                                            CudaPtr(saved_v_bhsd),
+                                            CudaPtr(act!(attn_norm).cu_ptr(stream)?),
+                                            CudaPtr(act!(attn_gate_values).cu_ptr(stream)?),
+                                            CudaPtr(grad_attn_result_bf16.cu_ptr(stream)?),
+                                            CudaPtr(
+                                                self.weights.sparse_attn_gate_weights[layer]
+                                                    .cu_ptr(stream)?,
+                                            ),
+                                            CudaPtr(do_bhsd_bf16),
+                                            CudaPtr(grad_v_xsa.cu_ptr(stream)?),
+                                            CudaPtr(buf.attn_gate_grad_input_compact.cu_ptr(stream)?),
+                                            CudaPtr(
+                                                grads.block_sparse_attn_gate_weight[layer]
+                                                    .cu_ptr(stream)?,
+                                            ),
+                                            (t / runtime_seq_len) as u32,
+                                            runtime_seq_len as u32,
+                                            h as u32,
+                                            hkv as u32,
+                                            hd as u32,
+                                            d as u32,
+                                            compact_attn_gate_grad_width as u32,
+                                            self.config.sparse_attn_gate_scale,
+                                        )?;
+                                } else {
+                                    self.kernels
+                                        .sparse_attn_gate_xsa_bwd_bf16_bhsd_warpheads_do_bf16_two_pass_compact_grad_input(
+                                            CudaPtr(saved_attn_out_bhsd),
+                                            CudaPtr(saved_v_bhsd),
+                                            CudaPtr(act!(attn_norm).cu_ptr(stream)?),
+                                            CudaPtr(act!(attn_gate_values).cu_ptr(stream)?),
+                                            CudaPtr(grad_attn_result.cu_ptr(stream)?),
+                                            CudaPtr(
+                                                self.weights.sparse_attn_gate_weights[layer]
+                                                    .cu_ptr(stream)?,
+                                            ),
+                                            CudaPtr(do_bhsd_bf16),
+                                            CudaPtr(grad_v_xsa.cu_ptr(stream)?),
+                                            CudaPtr(buf.attn_gate_grad_input_compact.cu_ptr(stream)?),
+                                            CudaPtr(
+                                                grads.block_sparse_attn_gate_weight[layer]
+                                                    .cu_ptr(stream)?,
+                                            ),
+                                            (t / runtime_seq_len) as u32,
+                                            runtime_seq_len as u32,
+                                            h as u32,
+                                            hkv as u32,
+                                            hd as u32,
+                                            d as u32,
+                                            compact_attn_gate_grad_width as u32,
+                                            self.config.sparse_attn_gate_scale,
+                                        )?;
+                                }
                             } else {
                                 self.kernels
                                     .sparse_attn_gate_xsa_bwd_bf16_bhsd_warpheads_do_bf16_two_pass(
@@ -7925,6 +8014,7 @@ impl GpuModel {
                 saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
                 t,
                 bank_dw_beta,
+                defer_qkv_weight_unpack,
             )?
         } else {
             self.qkv_projection_backward(
@@ -7940,6 +8030,7 @@ impl GpuModel {
                 saved_bf16_direct.map(|saved| &saved.attn_norm_bf16),
                 t,
                 bank_dw_beta,
+                defer_qkv_weight_unpack,
             )?
         };
         if use_bf16_attention_tail_qkv_pack && !qkv_fused {
@@ -8256,6 +8347,7 @@ impl GpuModel {
                             CudaPtr(grad_x0.cu_ptr(stream)?),
                             CudaPtr(residual_mix_reduce_scratch.cu_ptr(stream)?),
                             CudaPtr(grads.block_resid_mix[layer].cu_ptr(stream)?),
+                            CudaPtr(grads.block_mlp_scale[layer].cu_ptr(stream)?),
                             CudaPtr(fusion.pass1_saved.mlp_out_bf16.cu_ptr(stream)?),
                             CudaPtr(self.weights.mlp_scales[layer].cu_ptr(stream)?),
                             CudaPtr(buf.x_aux_bf16.cu_ptr(stream)?),
@@ -8268,27 +8360,6 @@ impl GpuModel {
                             1e-6,
                             1.0,
                         )?;
-                    if gpu_chunked_residual_scale_backward_enabled() {
-                        self.kernels
-                            .residual_add_scale_grad_scale_reduce_bf16_only_chunked(
-                                CudaPtr(fusion.pass1_saved.mlp_out_bf16.cu_ptr(stream)?),
-                                CudaPtr(grad_x_out.cu_ptr(stream)?),
-                                CudaPtr(block_cache.residual_mix_reduce_scratch.cu_ptr(stream)?),
-                                CudaPtr(grads.block_mlp_scale[layer].cu_ptr(stream)?),
-                                d as u32,
-                                (t * d) as u32,
-                                residual_scale_rows_per_chunk as u32,
-                            )?;
-                    } else {
-                        self.kernels
-                            .residual_add_scale_grad_scale_reduce_bf16_only(
-                                CudaPtr(fusion.pass1_saved.mlp_out_bf16.cu_ptr(stream)?),
-                                CudaPtr(grad_x_out.cu_ptr(stream)?),
-                                CudaPtr(grads.block_mlp_scale[layer].cu_ptr(stream)?),
-                                d as u32,
-                                (t * d) as u32,
-                            )?;
-                    }
                     recurrent_boundary_fusion_applied = true;
                 } else if gate_extra_grad && compact_attn_gate_grad_input {
                     self.kernels
@@ -8668,6 +8739,12 @@ impl GpuModel {
                     None
                 };
                 let grad_mid = block_cache.grad_mid.clone();
+                // Pass 1 immediately accumulates into block_cache.grad_qkv_weight
+                // with beta=1 and unpacks the combined tied-weight gradient.
+                // Unpacking pass 2 first is exact but redundant HBM traffic.
+                let defer_pass2_qkv_weight_unpack = fusion_requested
+                    && !gpu_skip_bank_dw(recurrent_bank_beta)
+                    && !gpu_skip_bank_dw(recurrent_pass1_bank_beta);
                 let pass2_start = record_stage_event_if(stream, stage_timing.is_some())?;
                 let pass2_boundary_fusion_applied = self.block_backward_single_into(
                     layer,
@@ -8685,6 +8762,7 @@ impl GpuModel {
                     forward_generation,
                     recurrent_bank_beta,
                     false,
+                    defer_pass2_qkv_weight_unpack,
                     pass1_saved_for_fusion
                         .map(|pass1_saved| RecurrentPassBoundaryFusion { pass1_saved }),
                     stage_timing.as_deref_mut(),
@@ -8727,6 +8805,7 @@ impl GpuModel {
                     forward_generation,
                     recurrent_pass1_bank_beta,
                     pass2_boundary_fusion_applied,
+                    false,
                     None,
                     stage_timing.as_deref_mut(),
                 )?;
@@ -8773,6 +8852,7 @@ impl GpuModel {
                 forward_generation,
                 recurrent_bank_beta,
                 false,
+                false,
                 None,
                 stage_timing.as_deref_mut(),
             )?;
@@ -8804,6 +8884,7 @@ impl GpuModel {
                 forward_generation,
                 recurrent_pass1_bank_beta,
                 false,
+                false,
                 None,
                 stage_timing.as_deref_mut(),
             )?;
@@ -8832,6 +8913,7 @@ impl GpuModel {
             saved,
             forward_generation,
             first_bank_contribution_beta,
+            false,
             false,
             None,
             stage_timing,
