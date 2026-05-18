@@ -460,6 +460,12 @@ fn validate_run_spec(run_spec: &RunSpec) -> PgResult<()> {
             ));
         }
     }
+    if run_spec.runtime.qkv_norm_resid_rows_per_chunk < 256 {
+        return Err(PgError::InvalidOp(format!(
+            "runtime.qkv_norm_resid_rows_per_chunk must be >=256, got {}",
+            run_spec.runtime.qkv_norm_resid_rows_per_chunk
+        )));
+    }
     if spec.rope.dims > spec.model_dim / spec.num_heads {
         return Err(PgError::InvalidOp(format!(
             "rope dims {} exceed head dim {}",
@@ -604,7 +610,8 @@ mod tests {
     use super::*;
     use crate::{
         BackwardChainProfile, CompressionMode, CudaGraphProfile, EvalAdaptationBackend,
-        RecordProfile, RecurrentBackwardProfile, RunSpec, TttMask, VariantFamily,
+        QkvNormResidReducerProfile, RecordProfile, RecurrentBackwardProfile, RunSpec, TttMask,
+        VariantFamily,
     };
 
     #[test]
@@ -716,6 +723,11 @@ mod tests {
             BackwardChainProfile::Bf16DirectCompact
         );
         assert_eq!(
+            clean.runtime.qkv_norm_resid_reducer_profile,
+            QkvNormResidReducerProfile::DirectCompact
+        );
+        assert_eq!(clean.runtime.qkv_norm_resid_rows_per_chunk, 1024);
+        assert_eq!(
             clean.runtime.cuda_graph_profile,
             CudaGraphProfile::RecordStepNoLoss
         );
@@ -735,6 +747,7 @@ mod tests {
         assert!(clean.runtime.sharded_muon_local_graph);
         assert!(clean.runtime.sharded_muon_pre_norm_graph);
         assert!(!clean.runtime.sharded_muon_fused_global_clip);
+        assert!(!clean.runtime.sharded_muon_parallel_local);
         assert!(clean.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&clean).unwrap();
 
@@ -771,12 +784,19 @@ mod tests {
         assert_eq!(audit.eval.lora_lr, Some(0.00008));
         assert!(audit.runtime.recurrence_active_required);
         assert_eq!(audit.runtime.recurrent_active_steps_min, 2000);
+        assert!(audit.runtime.recurrent_fused_pass_boundary_backward);
         assert!(!audit.runtime.bigram_embedding_merge);
-        assert!(!audit.runtime.combined_qkv_rope_tail_backward);
+        assert!(audit.runtime.combined_qkv_rope_tail_backward);
+        assert_eq!(
+            audit.runtime.qkv_norm_resid_reducer_profile,
+            QkvNormResidReducerProfile::DirectCompact
+        );
+        assert_eq!(audit.runtime.qkv_norm_resid_rows_per_chunk, 1024);
         assert!(!audit.runtime.graph_side_gemm_capture);
         assert!(audit.runtime.sharded_muon_local_graph);
         assert!(audit.runtime.sharded_muon_pre_norm_graph);
         assert!(!audit.runtime.sharded_muon_fused_global_clip);
+        assert!(!audit.runtime.sharded_muon_parallel_local);
         assert!(audit.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&audit).unwrap();
 
@@ -796,11 +816,12 @@ mod tests {
         assert_eq!(allst.quant.embed_bits, 6);
         assert!(allst.eval.ttt_lora_targets.rust_gpu_runtime_supported());
         assert!(!allst.runtime.bigram_embedding_merge);
-        assert!(!allst.runtime.combined_qkv_rope_tail_backward);
+        assert!(allst.runtime.combined_qkv_rope_tail_backward);
         assert!(!allst.runtime.graph_side_gemm_capture);
         assert!(allst.runtime.sharded_muon_local_graph);
         assert!(allst.runtime.sharded_muon_pre_norm_graph);
         assert!(!allst.runtime.sharded_muon_fused_global_clip);
+        assert!(!allst.runtime.sharded_muon_parallel_local);
         assert!(allst.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&allst).unwrap();
 
@@ -863,6 +884,11 @@ mod tests {
             skip_pass1bank.runtime.recurrent_backward_profile,
             RecurrentBackwardProfile::Full
         );
+        assert!(
+            skip_pass1bank
+                .runtime
+                .recurrent_fused_pass_boundary_backward
+        );
         assert!(skip_pass1bank.runtime.skip_recurrent_pass1_bank_grads);
         assert!(skip_pass1bank.runtime.recurrence_active_required);
         assert_eq!(skip_pass1bank.runtime.recurrent_active_steps_min, 2000);
@@ -884,6 +910,7 @@ mod tests {
             flowgrad.runtime.recurrent_backward_profile,
             RecurrentBackwardProfile::Full
         );
+        assert!(flowgrad.runtime.recurrent_fused_pass_boundary_backward);
         assert!(flowgrad.runtime.skip_recurrent_bank_grads);
         assert!(flowgrad.runtime.skip_recurrent_pass1_bank_grads);
         assert!(flowgrad.runtime.recurrence_active_required);

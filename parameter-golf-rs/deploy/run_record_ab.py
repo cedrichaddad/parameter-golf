@@ -68,6 +68,10 @@ STAGE_ROWS_PER_STEP: tuple[str, ...] = (
     "timing_cuda_backward_block_qkv_rope_ms_per_step",
     "timing_cuda_backward_block_qkv_proj_ms_per_step",
     "timing_cuda_backward_block_qkv_norm_resid_ms_per_step",
+    "timing_cuda_backward_recurrent_pass2_ms_per_step",
+    "timing_cuda_backward_recurrent_pass1_ms_per_step",
+    "timing_cuda_backward_recurrent_pass2_ms_per_active_step",
+    "timing_cuda_backward_recurrent_pass1_ms_per_active_step",
     "timing_cuda_backward_block_mlp_ms_per_step",
     "timing_cuda_backward_block_mlp_residual_ms_per_step",
     "timing_cuda_backward_block_mlp_down_ms_per_step",
@@ -95,6 +99,8 @@ AUDIT_ROWS: tuple[str, ...] = (
     "backward_nccl_bucket_overlap_windows",
     "backward_nccl_bucket_overlap_confirmed",
     "backward_nccl_bucket_overlap_max_window_ms",
+    "f32_to_bf16_bridge_launches",
+    "bf16_to_f32_bridge_launches",
 )
 
 RUN_TIMING_PREFIX = "run_timing_json="
@@ -131,8 +137,9 @@ def _build_command(
         return [
             _resolve_modal_bin(modal_bin),
             "run",
-            "deploy/run_detached.py",
-            *shlex.split(flags),
+            "deploy/run_detached.py::run_command_multi_string",
+            "--args",
+            flags,
         ]
     return [
         "cargo",
@@ -145,6 +152,19 @@ def _build_command(
         "--",
         *shlex.split(flags),
     ]
+
+
+def _fetch_remote_record_ab_json(modal_bin: str | None, local_dir: Path) -> None:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        _resolve_modal_bin(modal_bin),
+        "volume",
+        "get",
+        "pg-output",
+        "/record_ab",
+        str(local_dir),
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
 
 
 def _extract_timing_json(stdout: str) -> dict | None:
@@ -203,12 +223,12 @@ def _run_one(
     effective_flags = flags
     if timing_json_dir:
         safe_label = label.replace("#", "_").replace("/", "_")
+        result_dir = Path(timing_json_dir)
+        result_json_path = result_dir / f"{safe_label}.json"
         if remote:
             effective_flags = f"{flags} --result-json /output/record_ab/{shlex.quote(safe_label)}.json"
         else:
-            result_dir = Path(timing_json_dir)
             result_dir.mkdir(parents=True, exist_ok=True)
-            result_json_path = result_dir / f"{safe_label}.json"
             effective_flags = f"{flags} --result-json {shlex.quote(str(result_json_path))}"
     if remote:
         tokens = shlex.split(effective_flags)
@@ -245,6 +265,11 @@ def _run_one(
     )
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
+    if remote and result_json_path:
+        _fetch_remote_record_ab_json(modal_bin, result_json_path.parent)
+        fetched_path = result_json_path.parent / "record_ab" / result_json_path.name
+        if not result_json_path.exists() and fetched_path.exists():
+            result_json_path = fetched_path
     timing = None
     if result_json_path and result_json_path.exists():
         try:

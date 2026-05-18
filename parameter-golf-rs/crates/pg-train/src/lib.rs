@@ -7,8 +7,8 @@ use pg_model::backward::GradBuffers;
 use pg_model::{
     AttentionBackend, BackwardChainProfile, CudaGraphProfile, DistributedOptimizerBackend,
     EvalAdaptationBackend, ExecutionPlan, ForwardBuffer, GptModel, ModelComputePrecision,
-    NcclOverlapMode, OutputCeBackend, RecordProfile, RecurrentBackwardProfile, RunMode, RunSpec,
-    TrainBackend, TttMask,
+    NcclOverlapMode, OutputCeBackend, QkvNormResidReducerProfile, RecordProfile,
+    RecurrentBackwardProfile, RunMode, RunSpec, TrainBackend, TttMask,
 };
 use pg_optim::adamw::{AdamW, AdamWState};
 use pg_optim::ema::{Ema, Swa};
@@ -19,7 +19,11 @@ use pg_optim::scheduler;
 
 use pg_core::PgResult;
 use pg_data::bpb::{BpbLuts, compute_bpb};
-use pg_data::token_stream::DistributedTokenLoader;
+use pg_data::{DataShard, token_stream::DistributedTokenLoader};
+
+const FRONTIER_2135_CASEOPS_VAL_TOKENS: usize = 47_851_520;
+const FRONTIER_CASEOPS_VAL_DOCS: usize = 50_000;
+const FRONTIER_2135_TRAIN_SHARDS: usize = 80;
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -206,6 +210,173 @@ fn sha256_file_set(pattern: &str) -> PgResult<Option<String>> {
     Ok(Some(hex_digest(state.finalize())))
 }
 
+fn sha256_path_manifest(paths: &[PathBuf]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut state = Sha256State::new();
+    for path in paths {
+        state.update(path.to_string_lossy().as_bytes());
+        state.update(b"\0");
+        let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        state.update(&len.to_le_bytes());
+        state.update(b"\0");
+    }
+    Some(hex_digest(state.finalize()))
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_sets_non_overlap(train_paths: &[PathBuf], val_paths: &[PathBuf]) -> Option<bool> {
+    if train_paths.is_empty() || val_paths.is_empty() {
+        return None;
+    }
+    let train_canonical = train_paths
+        .iter()
+        .map(|path| canonical_or_original(path))
+        .collect::<Vec<_>>();
+    let val_canonical = val_paths
+        .iter()
+        .map(|path| canonical_or_original(path))
+        .collect::<Vec<_>>();
+    Some(
+        !train_canonical
+            .iter()
+            .any(|train| val_canonical.iter().any(|val| train == val)),
+    )
+}
+
+#[derive(Debug, Clone, Default)]
+struct ValidationDataAudit {
+    shard_count: usize,
+    token_count: usize,
+    doc_count: Option<usize>,
+    file_set_sha256: Option<String>,
+    sidecar_shard_count: usize,
+    sidecar_token_count: Option<usize>,
+    sidecar_file_set_sha256: Option<String>,
+    train_shard_count: usize,
+    train_file_set_sha256: Option<String>,
+    train_val_file_non_overlap: Option<bool>,
+}
+
+fn is_byte_sidecar_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.contains("_bytes_") || name.contains("val_bytes"))
+        .unwrap_or(false)
+}
+
+fn data_shard_token_count(paths: &[PathBuf]) -> PgResult<usize> {
+    let mut tokens = 0usize;
+    for path in paths {
+        tokens = tokens.saturating_add(DataShard::open(path)?.num_tokens());
+    }
+    Ok(tokens)
+}
+
+fn count_docs_in_token_shards(
+    paths: &[PathBuf],
+    boundary_token_id: Option<u32>,
+) -> PgResult<Option<usize>> {
+    let Some(boundary) = boundary_token_id else {
+        return Ok(None);
+    };
+    let boundary = boundary as u16;
+    let mut docs = 0usize;
+    let mut saw_any = false;
+    let mut first_token_was_boundary = false;
+    for path in paths {
+        let shard = DataShard::open(path)?;
+        let tokens = shard.all_tokens();
+        if tokens.is_empty() {
+            continue;
+        }
+        if !saw_any {
+            first_token_was_boundary = tokens.first().copied() == Some(boundary);
+            saw_any = true;
+        }
+        docs = docs.saturating_add(tokens.iter().filter(|&&token| token == boundary).count());
+    }
+    if saw_any && !first_token_was_boundary {
+        docs = docs.saturating_add(1);
+    }
+    Ok(Some(docs))
+}
+
+fn validation_data_audit(run_spec: &RunSpec) -> ValidationDataAudit {
+    let val_paths = run_spec
+        .train
+        .validation_data_pattern
+        .as_deref()
+        .and_then(|pattern| simple_glob_paths(pattern).ok())
+        .map(|paths| {
+            paths
+                .into_iter()
+                .filter(|path| !is_byte_sidecar_path(path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let train_paths = run_spec
+        .train
+        .train_data_pattern
+        .as_deref()
+        .and_then(|pattern| simple_glob_paths(pattern).ok())
+        .unwrap_or_default();
+    let sidecar_paths = run_spec
+        .eval
+        .caseops_byte_sidecar_pattern
+        .as_deref()
+        .and_then(|pattern| simple_glob_paths(pattern).ok())
+        .unwrap_or_default();
+
+    let token_count = data_shard_token_count(&val_paths).unwrap_or(0);
+    let doc_count =
+        count_docs_in_token_shards(&val_paths, run_spec.model.smear_gate_boundary_token_id)
+            .ok()
+            .flatten();
+    let sidecar_token_count = if sidecar_paths.is_empty() {
+        None
+    } else {
+        data_shard_token_count(&sidecar_paths).ok()
+    };
+    let train_file_set_sha256 = sha256_path_manifest(&train_paths);
+    let file_set_sha256 = sha256_path_manifest(&val_paths);
+    let sidecar_file_set_sha256 = sha256_path_manifest(&sidecar_paths);
+    let train_val_file_non_overlap = path_sets_non_overlap(&train_paths, &val_paths);
+
+    ValidationDataAudit {
+        shard_count: val_paths.len(),
+        token_count,
+        doc_count,
+        file_set_sha256,
+        sidecar_shard_count: sidecar_paths.len(),
+        sidecar_token_count,
+        sidecar_file_set_sha256,
+        train_shard_count: train_paths.len(),
+        train_file_set_sha256,
+        train_val_file_non_overlap,
+    }
+}
+
+fn count_validation_docs_from_tokens(
+    tokens: &[u32],
+    boundary_token_id: Option<u32>,
+) -> Option<usize> {
+    let boundary = boundary_token_id?;
+    let mut docs = if tokens.first().copied() == Some(boundary) {
+        0
+    } else if tokens.is_empty() {
+        0
+    } else {
+        1
+    };
+    docs += tokens.iter().filter(|&&token| token == boundary).count();
+    Some(docs)
+}
+
 #[derive(Debug, Clone)]
 pub struct VariantResult {
     pub run_name: String,
@@ -252,6 +423,11 @@ pub struct VariantResult {
     pub device_batch_ready_steps: usize,
     pub device_batch_missing_steps: usize,
     pub device_to_host_scalar_reads: usize,
+    pub f32_to_bf16_bridge_launches: usize,
+    pub bf16_to_f32_bridge_launches: usize,
+    pub backward_nccl_bucket_overlap_windows: usize,
+    pub backward_nccl_bucket_overlap_confirmed: usize,
+    pub backward_nccl_bucket_overlap_max_window_ms: f64,
     pub timing_data_sampling_ms: f64,
     pub timing_train_step_ms: f64,
     pub timing_cuda_zero_grads_ms: f64,
@@ -287,6 +463,8 @@ pub struct VariantResult {
     pub timing_cuda_backward_block_qkv_proj_ms: f64,
     pub timing_cuda_backward_block_qkv_ve_ms: f64,
     pub timing_cuda_backward_block_qkv_norm_resid_ms: f64,
+    pub timing_cuda_backward_recurrent_pass2_ms: f64,
+    pub timing_cuda_backward_recurrent_pass1_ms: f64,
     pub timing_cuda_backward_output_ms: f64,
     pub timing_cuda_backward_decoder_ms: f64,
     pub timing_cuda_backward_encoder_ms: f64,
@@ -363,6 +541,8 @@ struct RunTiming {
     cuda_backward_block_qkv_proj_ms: f64,
     cuda_backward_block_qkv_ve_ms: f64,
     cuda_backward_block_qkv_norm_resid_ms: f64,
+    cuda_backward_recurrent_pass2_ms: f64,
+    cuda_backward_recurrent_pass1_ms: f64,
     cuda_backward_output_ms: f64,
     cuda_backward_decoder_ms: f64,
     cuda_backward_encoder_ms: f64,
@@ -390,6 +570,11 @@ struct RunTiming {
     device_batch_ready_steps: usize,
     device_batch_missing_steps: usize,
     device_to_host_scalar_reads: usize,
+    f32_to_bf16_bridge_launches: usize,
+    bf16_to_f32_bridge_launches: usize,
+    backward_nccl_bucket_overlap_windows: usize,
+    backward_nccl_bucket_overlap_confirmed: usize,
+    backward_nccl_bucket_overlap_max_window_ms: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -481,6 +666,11 @@ fn sharded_parallel_muon_local_graph_enabled() -> bool {
         && !cuda_stage_timing_enabled()
 }
 
+#[cfg(not(feature = "cuda"))]
+fn sharded_parallel_muon_local_graph_enabled() -> bool {
+    false
+}
+
 #[cfg(feature = "cuda")]
 fn sharded_parallel_muon_pre_norm_graph_enabled() -> bool {
     matches!(
@@ -491,6 +681,11 @@ fn sharded_parallel_muon_pre_norm_graph_enabled() -> bool {
         "1" | "true" | "yes" | "on"
     ) && cuda_backward_graph_enabled()
         && !cuda_stage_timing_enabled()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn sharded_parallel_muon_pre_norm_graph_enabled() -> bool {
+    false
 }
 
 #[cfg(feature = "cuda")]
@@ -649,23 +844,31 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
         )?;
         apply_bool_runtime_env("PG_GPU_BF16_QKV_DX_OUTPUT", true, record_authoritative)?;
         apply_bool_runtime_env("PG_GPU_BF16_MLP_DOWN_DX", true, record_authoritative)?;
+        let qkv_norm_resid_reducer = match run_spec.runtime.qkv_norm_resid_reducer_profile {
+            QkvNormResidReducerProfile::DirectCompact => "direct_compact",
+            QkvNormResidReducerProfile::SplitCompact => "split_compact",
+            QkvNormResidReducerProfile::ChunkedCompact => "chunked_compact",
+        };
         apply_string_runtime_env(
             "PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER",
-            if direct_compact {
-                "direct_compact"
-            } else {
-                "split_compact"
-            },
+            qkv_norm_resid_reducer,
             record_authoritative,
         )?;
         apply_bool_runtime_env(
             "PG_GPU_SPLIT_QKV_NORM_RESID_BWD",
-            !direct_compact,
+            run_spec.runtime.qkv_norm_resid_reducer_profile
+                == QkvNormResidReducerProfile::SplitCompact,
             record_authoritative,
         )?;
         apply_bool_runtime_env(
             "PG_GPU_CHUNKED_QKV_NORM_RESID_BWD",
-            false,
+            run_spec.runtime.qkv_norm_resid_reducer_profile
+                == QkvNormResidReducerProfile::ChunkedCompact,
+            record_authoritative,
+        )?;
+        apply_usize_runtime_env(
+            "PG_GPU_QKV_NORM_RESID_BWD_ROWS_PER_CHUNK",
+            run_spec.runtime.qkv_norm_resid_rows_per_chunk.max(256),
             record_authoritative,
         )?;
         apply_bool_runtime_env(
@@ -726,6 +929,11 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
         record_authoritative,
     )?;
     apply_bool_runtime_env(
+        "PG_GPU_SHARDED_MUON_PARALLEL_LOCAL",
+        run_spec.runtime.sharded_muon_parallel_local,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
         "PG_GPU_SHARDED_MUON_BF16_SHADOW_ALL_GATHER",
         run_spec.runtime.sharded_muon_bf16_shadow_all_gather,
         record_authoritative,
@@ -749,6 +957,11 @@ fn apply_runtime_profile_env(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> 
     apply_usize_runtime_env(
         "PG_GPU_RECURRENT_STRAIGHT_THROUGH_LAYERS",
         run_spec.runtime.recurrent_straight_through_layers,
+        record_authoritative,
+    )?;
+    apply_bool_runtime_env(
+        "PG_GPU_RECURRENT_FUSED_PASS_BOUNDARY_BWD",
+        run_spec.runtime.recurrent_fused_pass_boundary_backward,
         record_authoritative,
     )?;
     apply_bool_runtime_env(
@@ -1715,7 +1928,10 @@ impl CudaDistributedRuntime {
         // requested.
         // Building two NCCL pools per device costs initialization time and a
         // second set of NCCL channel buffers; we don't pay that unless enabled.
-        let comm_side_comms = if nccl_side_stream_collectives_enabled() {
+        let comm_side_comms = if plan.run_spec.runtime.nccl_overlap_mode
+            == NcclOverlapMode::BucketedMeasured
+            || nccl_side_stream_collectives_enabled()
+        {
             Some(pg_core::nccl::NcclComm::from_local_devices(
                 comm_side_streams.clone(),
             )?)
@@ -2118,7 +2334,7 @@ impl VariantRunner {
                 }
             }
         };
-        let frontier_record_ready = frontier_record_gaps(&self.run_spec).is_empty();
+        let frontier_record_path_ready = frontier_record_gaps(&self.run_spec).is_empty();
         let leaderboard_algorithm_gaps = leaderboard_algorithm_gaps(&self.run_spec);
         let leaderboard_algorithm_ready = leaderboard_algorithm_gaps.is_empty();
         let record_shape = is_record_shaped_mode(mode);
@@ -2134,7 +2350,7 @@ impl VariantRunner {
                 mode,
                 &batch_plan,
                 world_size,
-                frontier_record_ready,
+                frontier_record_path_ready,
                 leaderboard_algorithm_ready,
                 &leaderboard_algorithm_gaps,
                 record_attention_grade,
@@ -2502,6 +2718,7 @@ impl VariantRunner {
                         step,
                         lr_scale,
                         self.run_spec.train.distributed_optimizer_backend,
+                        self.run_spec.runtime.nccl_overlap_mode,
                         !is_record_shaped_mode(mode),
                         active_batch_plan.microbatch_tokens,
                         step_timing,
@@ -2687,6 +2904,17 @@ impl VariantRunner {
         } else {
             0.0
         };
+        if mode == RunMode::Record && steps_completed < max_steps {
+            return Err(pg_core::PgError::InvalidOp(format!(
+                "record run did not complete the configured training schedule: steps_completed={steps_completed} required_steps={max_steps} max_wallclock_seconds={}",
+                train_config.max_wallclock_seconds
+            )));
+        }
+        if mode == RunMode::Record && timing_steps == 0 {
+            return Err(pg_core::PgError::InvalidOp(
+                "record run produced zero measured timing steps; lower PG_RECORD_TIMING_SKIP_STEPS so runtime gates have evidence".into(),
+            ));
+        }
         if mode == RunMode::Record && timing_steps > 0 {
             let max_ms = record_max_ms_per_step_for_submission(&self.run_spec);
             if max_ms > 0.0 && timing_measured_ms_per_step > max_ms {
@@ -2704,6 +2932,23 @@ impl VariantRunner {
                     timing.host_batch_flatten_calls,
                     timing.host_to_device_batch_bytes,
                     timing.device_batch_missing_steps
+                )));
+            }
+            if self.run_spec.runtime.recurrence_active_required
+                && timing.recurrent_active_steps < self.run_spec.runtime.recurrent_active_steps_min
+            {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record run failed active-recurrence evidence gate: measured_active_recurrent_steps={} required_min={}",
+                    timing.recurrent_active_steps, self.run_spec.runtime.recurrent_active_steps_min
+                )));
+            }
+            if self.run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
+                && (timing.f32_to_bf16_bridge_launches > 0
+                    || timing.bf16_to_f32_bridge_launches > 0)
+            {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record run observed BF16/F32 conversion wrapper launches in the measured backward hot path: f32_to_bf16={} bf16_to_f32={}",
+                    timing.f32_to_bf16_bridge_launches, timing.bf16_to_f32_bridge_launches
                 )));
             }
         }
@@ -2854,6 +3099,9 @@ impl VariantRunner {
         } else {
             "mean_step_loss".to_string()
         };
+        let validation_audit = validation_data_audit(&self.run_spec);
+        let mut eval_docs = None;
+        let mut eval_target_bytes = None;
         let eval_t0 = Instant::now();
         let (eval_loss, final_bpb, eval_tokens) =
             if !matches!(mode, RunMode::Smoke | RunMode::RecordShapedProxy) {
@@ -2876,12 +3124,17 @@ impl VariantRunner {
                     .into_iter()
                     .map(|v| v as u32)
                     .collect::<Vec<_>>();
+                    eval_docs = count_validation_docs_from_tokens(
+                        &tokens,
+                        self.run_spec.model.smear_gate_boundary_token_id,
+                    );
                     let token_bytes = eval_target_byte_counts(
                         &self.run_spec,
                         &tokens,
                         &bpb_luts,
                         max_eval_tokens,
                     )?;
+                    eval_target_bytes = Some(token_bytes.len());
                     let seq_len = self
                         .run_spec
                         .model
@@ -2920,6 +3173,110 @@ impl VariantRunner {
                 (None, None, None)
             };
         timing.eval_ms += eval_t0.elapsed().as_secs_f64() * 1000.0;
+        if mode == RunMode::Record {
+            let Some(scored_tokens) = eval_tokens else {
+                return Err(pg_core::PgError::InvalidOp(
+                    "record mode did not emit eval_tokens; full validation scoring is required"
+                        .into(),
+                ));
+            };
+            if validation_audit.token_count == 0 || scored_tokens != validation_audit.token_count {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "record mode must score the full validation stream: eval_tokens={scored_tokens} validation_tokens={}",
+                    validation_audit.token_count
+                )));
+            }
+            if matches!(
+                self.run_spec.runtime.record_profile,
+                RecordProfile::Frontier2135Audit
+            ) && scored_tokens != FRONTIER_2135_CASEOPS_VAL_TOKENS
+            {
+                return Err(pg_core::PgError::InvalidOp(format!(
+                    "frontier_2135_audit record requires canonical CaseOps validation token count 47851520, got {scored_tokens}"
+                )));
+            }
+            if self.run_spec.model.caseops.enabled && self.run_spec.model.caseops.byte_sidecar {
+                if validation_audit.sidecar_token_count != Some(validation_audit.token_count) {
+                    return Err(pg_core::PgError::InvalidOp(format!(
+                        "record CaseOps sidecar does not match validation tokens: sidecar_tokens={:?} validation_tokens={}",
+                        validation_audit.sidecar_token_count, validation_audit.token_count
+                    )));
+                }
+                if matches!(
+                    self.run_spec.runtime.record_profile,
+                    RecordProfile::Frontier2135Audit
+                ) && validation_audit.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS)
+                {
+                    return Err(pg_core::PgError::InvalidOp(format!(
+                        "frontier_2135_audit record requires canonical CaseOps val_docs=50000, got {:?}",
+                        validation_audit.doc_count
+                    )));
+                }
+            }
+            if matches!(
+                self.run_spec.runtime.record_profile,
+                RecordProfile::Frontier2135Audit
+            ) {
+                if validation_audit.train_shard_count != FRONTIER_2135_TRAIN_SHARDS {
+                    return Err(pg_core::PgError::InvalidOp(format!(
+                        "frontier_2135_audit record requires train_shards=80, got {}",
+                        validation_audit.train_shard_count
+                    )));
+                }
+                if validation_audit.train_file_set_sha256.is_none()
+                    || validation_audit.file_set_sha256.is_none()
+                    || validation_audit.sidecar_file_set_sha256.is_none()
+                    || validation_audit.train_val_file_non_overlap != Some(true)
+                {
+                    return Err(pg_core::PgError::InvalidOp(format!(
+                        "frontier_2135_audit record requires train/val/sidecar file manifests and canonical path non-overlap proof: train_hash={} val_hash={} sidecar_hash={} path_non_overlap={:?}",
+                        validation_audit.train_file_set_sha256.is_some(),
+                        validation_audit.file_set_sha256.is_some(),
+                        validation_audit.sidecar_file_set_sha256.is_some(),
+                        validation_audit.train_val_file_non_overlap
+                    )));
+                }
+            }
+        }
+        let frontier_record_ready = final_frontier_record_ready(
+            &self.run_spec,
+            mode,
+            steps_completed,
+            max_steps,
+            &timing,
+            &validation_audit,
+            eval_tokens,
+            artifact_bytes,
+            submission_code_bytes,
+            submission_total_bytes,
+            artifact_budget_ok,
+            artifact_model_sha256.as_deref(),
+            artifact_code_sha256.as_deref(),
+            caseops_byte_sidecar_sha256.as_deref(),
+        );
+        if artifact_bytes.is_some() || mode == RunMode::Record {
+            println!(
+                "record_audit_json={}",
+                final_record_audit_json(
+                    &self.run_spec,
+                    mode,
+                    steps_completed,
+                    max_steps,
+                    &timing,
+                    &validation_audit,
+                    eval_tokens,
+                    eval_docs,
+                    eval_target_bytes,
+                    artifact_bytes,
+                    submission_code_bytes,
+                    submission_total_bytes,
+                    artifact_budget_ok,
+                    artifact_model_sha256.as_deref(),
+                    artifact_code_sha256.as_deref(),
+                    caseops_byte_sidecar_sha256.as_deref(),
+                )
+            );
+        }
 
         Ok(VariantResult {
             run_name: self.run_spec.name.clone(),
@@ -2969,6 +3326,12 @@ impl VariantRunner {
             device_batch_ready_steps: timing.device_batch_ready_steps,
             device_batch_missing_steps: timing.device_batch_missing_steps,
             device_to_host_scalar_reads: timing.device_to_host_scalar_reads,
+            f32_to_bf16_bridge_launches: timing.f32_to_bf16_bridge_launches,
+            bf16_to_f32_bridge_launches: timing.bf16_to_f32_bridge_launches,
+            backward_nccl_bucket_overlap_windows: timing.backward_nccl_bucket_overlap_windows,
+            backward_nccl_bucket_overlap_confirmed: timing.backward_nccl_bucket_overlap_confirmed,
+            backward_nccl_bucket_overlap_max_window_ms: timing
+                .backward_nccl_bucket_overlap_max_window_ms,
             timing_data_sampling_ms: timing.data_sampling_ms,
             timing_train_step_ms: timing.train_step_ms,
             timing_cuda_zero_grads_ms: timing.cuda_zero_grads_ms,
@@ -3015,6 +3378,8 @@ impl VariantRunner {
             timing_cuda_backward_block_qkv_ve_ms: timing.cuda_backward_block_qkv_ve_ms,
             timing_cuda_backward_block_qkv_norm_resid_ms: timing
                 .cuda_backward_block_qkv_norm_resid_ms,
+            timing_cuda_backward_recurrent_pass2_ms: timing.cuda_backward_recurrent_pass2_ms,
+            timing_cuda_backward_recurrent_pass1_ms: timing.cuda_backward_recurrent_pass1_ms,
             timing_cuda_backward_output_ms: timing.cuda_backward_output_ms,
             timing_cuda_backward_decoder_ms: timing.cuda_backward_decoder_ms,
             timing_cuda_backward_encoder_ms: timing.cuda_backward_encoder_ms,
@@ -3329,7 +3694,8 @@ fn cuda_fast_accumulate_runtime_grads(
         timing.cuda_h2d_ms += h2d_t0.elapsed().as_secs_f64() * 1000.0;
     }
 
-    if let Some(observer) = observer {
+    let bridge_before = runtime.gpu_model.kernels.bridge_launch_counts();
+    let loss = if let Some(observer) = observer {
         if compute_loss {
             return Err(pg_core::PgError::InvalidOp(
                 "observed CUDA backward does not support loss-return mode".into(),
@@ -3346,7 +3712,7 @@ fn cuda_fast_accumulate_runtime_grads(
                 runtime_seq_len,
                 observer,
             )?;
-        Ok(0.0)
+        0.0
     } else if compute_loss {
         runtime.gpu_model.backward_with_state_seq_len(
             &runtime.input_ids,
@@ -3355,10 +3721,10 @@ fn cuda_fast_accumulate_runtime_grads(
             &mut runtime.backward_state,
             &mut runtime.gpu_grads,
             runtime_seq_len,
-        )
+        )?
     } else if cuda_backward_graph_enabled() {
         cuda_fast_accumulate_runtime_grads_no_loss_graph(runtime, runtime_seq_len)?;
-        Ok(0.0)
+        0.0
     } else {
         runtime.gpu_model.backward_with_state_seq_len_no_loss(
             &runtime.input_ids,
@@ -3368,8 +3734,18 @@ fn cuda_fast_accumulate_runtime_grads(
             &mut runtime.gpu_grads,
             runtime_seq_len,
         )?;
-        Ok(0.0)
+        0.0
+    };
+    let bridge_after = runtime.gpu_model.kernels.bridge_launch_counts();
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.f32_to_bf16_bridge_launches += bridge_after
+            .f32_to_bf16
+            .saturating_sub(bridge_before.f32_to_bf16);
+        timing.bf16_to_f32_bridge_launches += bridge_after
+            .bf16_to_f32
+            .saturating_sub(bridge_before.bf16_to_f32);
     }
+    Ok(loss)
 }
 
 #[cfg(feature = "cuda")]
@@ -3699,6 +4075,12 @@ fn accumulate_gpu_backward_stage_timing(
         max_stage.backward_block_qkv_norm_resid_ms = max_stage
             .backward_block_qkv_norm_resid_ms
             .max(t.backward_block_qkv_norm_resid_ms);
+        max_stage.backward_recurrent_pass2_ms = max_stage
+            .backward_recurrent_pass2_ms
+            .max(t.backward_recurrent_pass2_ms);
+        max_stage.backward_recurrent_pass1_ms = max_stage
+            .backward_recurrent_pass1_ms
+            .max(t.backward_recurrent_pass1_ms);
         max_stage.output_ms = max_stage.output_ms.max(t.output_ms);
         max_stage.decoder_ms = max_stage.decoder_ms.max(t.decoder_ms);
         max_stage.encoder_ms = max_stage.encoder_ms.max(t.encoder_ms);
@@ -3737,6 +4119,8 @@ fn accumulate_gpu_backward_stage_timing(
     timing.cuda_backward_block_qkv_proj_ms += max_stage.backward_block_qkv_proj_ms;
     timing.cuda_backward_block_qkv_ve_ms += max_stage.backward_block_qkv_ve_ms;
     timing.cuda_backward_block_qkv_norm_resid_ms += max_stage.backward_block_qkv_norm_resid_ms;
+    timing.cuda_backward_recurrent_pass2_ms += max_stage.backward_recurrent_pass2_ms;
+    timing.cuda_backward_recurrent_pass1_ms += max_stage.backward_recurrent_pass1_ms;
     timing.cuda_backward_output_ms += max_stage.output_ms;
     timing.cuda_backward_decoder_ms += max_stage.decoder_ms;
     timing.cuda_backward_encoder_ms += max_stage.encoder_ms;
@@ -3755,9 +4139,14 @@ struct ReplicaBackwardLaunchResult {
     host_to_device_batch_bytes: usize,
     device_batch_ready_steps: usize,
     device_batch_missing_steps: usize,
+    f32_to_bf16_bridge_launches: usize,
+    bf16_to_f32_bridge_launches: usize,
     backward_bucket_flushes: usize,
     backward_bucket_layers: usize,
     backward_bucket_matrix_reductions: usize,
+    backward_bucket_overlap_windows: usize,
+    backward_bucket_overlap_confirmed: usize,
+    backward_bucket_overlap_max_window_ms: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -4617,9 +5006,13 @@ struct BackwardBucketOverlapObserver<'a> {
     bucket_flushes: usize,
     bucket_layers_reduced: usize,
     bucket_matrix_reductions: usize,
+    overlap_windows: usize,
+    overlap_confirmed: usize,
+    overlap_max_window_ms: f64,
+    pending_reduce_start: Option<cudarc::driver::CudaEvent>,
+    overlap_event_pairs: Vec<(cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>,
     comm: &'a pg_core::nccl::NcclComm,
     side_stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
-    side_events: &'a NcclSideStreamEvents,
     sharded: &'a mut ShardedParallelMuonReplica,
 }
 
@@ -4652,16 +5045,32 @@ impl<'a> BackwardBucketOverlapObserver<'a> {
         Ok(())
     }
 
-    fn record_layer_ready(&self, model: &pg_model::gpu::GpuModel, layer: usize) -> PgResult<()> {
+    fn record_layer_ready(
+        &mut self,
+        model: &pg_model::gpu::GpuModel,
+        layer: usize,
+    ) -> PgResult<()> {
         let kernels = &model.kernels;
-        let event = &self.side_events.main_to_side;
-        event.record(kernels.stream()).map_err(|e| {
-            pg_core::PgError::InvalidOp(format!(
-                "backward NCCL bucket overlap: layer {layer} rank {} main->side record failed: {e:?}",
-                self.rank
-            ))
-        })?;
-        self.side_stream.wait(event).map_err(|e| {
+        let layer_ready = kernels
+            .stream()
+            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| {
+                pg_core::PgError::InvalidOp(format!(
+                    "backward NCCL bucket overlap: layer {layer} rank {} layer-ready event failed: {e:?}",
+                    self.rank
+                ))
+            })?;
+        if let Some(reduce_start) = self.pending_reduce_start.take() {
+            self.overlap_event_pairs.push((reduce_start, layer_ready));
+            let (_, ready) = self
+                .overlap_event_pairs
+                .last()
+                .expect("just pushed overlap event pair");
+            self.side_stream.wait(ready)
+        } else {
+            self.side_stream.wait(&layer_ready)
+        }
+        .map_err(|e| {
             pg_core::PgError::InvalidOp(format!(
                 "backward NCCL bucket overlap: layer {layer} rank {} side wait failed: {e:?}",
                 self.rank
@@ -4758,6 +5167,15 @@ impl<'a> BackwardBucketOverlapObserver<'a> {
         let last = *self.pending_layers.last().unwrap_or(&first);
         let pending_len = self.pending_layers.len();
         self.record_layer_ready(model, first)?;
+        let reduce_start = self
+            .side_stream
+            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| {
+                pg_core::PgError::InvalidOp(format!(
+                    "backward NCCL bucket overlap: layers {first}..{last} rank {} reduce-start event failed: {e:?}",
+                    self.rank
+                ))
+            })?;
         cudarc::nccl::group_start()
             .map_err(|e| pg_core::PgError::Nccl(format!("group_start failed: {e:?}")))?;
         let pending_layers = std::mem::take(&mut self.pending_layers);
@@ -4777,8 +5195,35 @@ impl<'a> BackwardBucketOverlapObserver<'a> {
                 "backward NCCL bucket overlap: layers {first}..{last} group_end failed: {e}"
             ))
         })?;
+        let _reduce_end = self
+            .side_stream
+            .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| {
+                pg_core::PgError::InvalidOp(format!(
+                    "backward NCCL bucket overlap: layers {first}..{last} rank {} reduce-end event failed: {e:?}",
+                    self.rank
+                ))
+            })?;
+        self.pending_reduce_start = Some(reduce_start);
         self.bucket_flushes += 1;
         self.bucket_layers_reduced += pending_len;
+        Ok(())
+    }
+
+    fn finalize_overlap_windows(&mut self) -> PgResult<()> {
+        for (idx, (reduce_start, layer_ready)) in self.overlap_event_pairs.drain(..).enumerate() {
+            let window_ms = reduce_start.elapsed_ms(&layer_ready).map_err(|e| {
+                pg_core::PgError::InvalidOp(format!(
+                    "backward NCCL bucket overlap: rank {} event-window {idx} timing failed: {e:?}",
+                    self.rank
+                ))
+            })? as f64;
+            self.overlap_windows += 1;
+            if window_ms > 0.0 {
+                self.overlap_confirmed += 1;
+                self.overlap_max_window_ms = self.overlap_max_window_ms.max(window_ms);
+            }
+        }
         Ok(())
     }
 }
@@ -4820,6 +5265,7 @@ fn cuda_distributed_sharded_parallel_muon_step(
     step: usize,
     lr_scale: f32,
     local_microbatches: usize,
+    nccl_overlap_mode: NcclOverlapMode,
     timing: &mut RunTiming,
 ) -> PgResult<()> {
     let event_timing = cuda_event_timing_enabled();
@@ -4844,7 +5290,7 @@ fn cuda_distributed_sharded_parallel_muon_step(
         .unwrap_or(0);
     let bf16_shadow_all_gather = sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit();
     let bank_grads_bucketed_during_backward =
-        backward_nccl_bucket_overlap_enabled() && runtime.comm_side_comms.is_some();
+        nccl_overlap_mode == NcclOverlapMode::BucketedMeasured && runtime.comm_side_comms.is_some();
     let apply_global_clip = train_config.grad_clip_norm > 0.0;
     let bank_phase_timing = sharded_parallel_muon_phase_timing_enabled();
     let mut bank_phase_events = if bank_phase_timing && event_timing {
@@ -5544,6 +5990,8 @@ fn cuda_distributed_launch_replica_backward(
         host_batch_flatten_bytes + local_timing.host_to_device_batch_bytes;
     result.device_batch_ready_steps = local_timing.device_batch_ready_steps;
     result.device_batch_missing_steps = local_timing.device_batch_missing_steps;
+    result.f32_to_bf16_bridge_launches = local_timing.f32_to_bf16_bridge_launches;
+    result.bf16_to_f32_bridge_launches = local_timing.bf16_to_f32_bridge_launches;
     result.loss_count = usize::from(compute_loss);
 
     if let Some(start) = backward_start_event {
@@ -5592,6 +6040,7 @@ fn cuda_distributed_step(
     step: usize,
     lr_scale: f32,
     distributed_optimizer_backend: DistributedOptimizerBackend,
+    nccl_overlap_mode: NcclOverlapMode,
     compute_step_loss: bool,
     runtime_seq_len: usize,
     timing: &mut RunTiming,
@@ -5609,17 +6058,17 @@ fn cuda_distributed_step(
     let mut total_loss = 0.0f32;
     let mut loss_count = 0usize;
     let event_timing = cuda_event_timing_enabled();
-    let use_backward_bucket_overlap = backward_nccl_bucket_overlap_enabled()
+    let use_backward_bucket_overlap = nccl_overlap_mode == NcclOverlapMode::BucketedMeasured
         && distributed_optimizer_backend == DistributedOptimizerBackend::ShardedParallelMuon;
     if use_backward_bucket_overlap {
         if compute_step_loss {
             return Err(pg_core::PgError::InvalidOp(
-                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires no-loss backward; disable step-loss timing for this record path".into(),
+                "runtime.nccl_overlap_mode=bucketed_measured requires no-loss backward; disable step-loss timing for this record path".into(),
             ));
         }
         if runtime.comm_side_comms.is_none() {
             return Err(pg_core::PgError::InvalidOp(
-                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires side-stream NCCL communicators".into(),
+                "runtime.nccl_overlap_mode=bucketed_measured requires side-stream NCCL communicators".into(),
             ));
         }
         if runtime
@@ -5629,7 +6078,7 @@ fn cuda_distributed_step(
             != Some(runtime.replicas.len())
         {
             return Err(pg_core::PgError::InvalidOp(
-                "PG_NCCL_BACKWARD_BUCKET_OVERLAP=1 requires initialized sharded Parallel Muon replicas".into(),
+                "runtime.nccl_overlap_mode=bucketed_measured requires initialized sharded Parallel Muon replicas".into(),
             ));
         }
     }
@@ -5677,7 +6126,6 @@ fn cuda_distributed_step(
             .as_ref()
             .expect("checked side-stream comms for backward buckets");
         let side_streams = &runtime.comm_side_streams;
-        let side_events = &runtime.comm_side_events;
         let sharded_replicas = &mut runtime
             .parallel_muon
             .as_mut()
@@ -5695,7 +6143,6 @@ fn cuda_distributed_step(
                 let rank_batches = batches.map(|all_batches| &all_batches[rank_idx]);
                 let comm = &side_comms[rank_idx];
                 let side_stream = &side_streams[rank_idx];
-                let side_events = &side_events[rank_idx];
                 handles.push(
                     scope.spawn(move || -> PgResult<ReplicaBackwardLaunchResult> {
                         let mut observer = BackwardBucketOverlapObserver {
@@ -5707,9 +6154,13 @@ fn cuda_distributed_step(
                             bucket_flushes: 0,
                             bucket_layers_reduced: 0,
                             bucket_matrix_reductions: 0,
+                            overlap_windows: 0,
+                            overlap_confirmed: 0,
+                            overlap_max_window_ms: 0.0,
+                            pending_reduce_start: None,
+                            overlap_event_pairs: Vec::with_capacity(num_layers.saturating_sub(1)),
                             comm,
                             side_stream,
-                            side_events,
                             sharded: sharded_replica,
                         };
                         let mut result = cuda_distributed_launch_replica_backward(
@@ -5721,10 +6172,15 @@ fn cuda_distributed_step(
                             event_timing,
                             Some(&mut observer),
                         )?;
+                        observer.finalize_overlap_windows()?;
                         result.backward_bucket_flushes = observer.bucket_flushes;
                         result.backward_bucket_layers = observer.bucket_layers_reduced;
                         result.backward_bucket_matrix_reductions =
                             observer.bucket_matrix_reductions;
+                        result.backward_bucket_overlap_windows = observer.overlap_windows;
+                        result.backward_bucket_overlap_confirmed = observer.overlap_confirmed;
+                        result.backward_bucket_overlap_max_window_ms =
+                            observer.overlap_max_window_ms;
                         Ok(result)
                     }),
                 );
@@ -5773,6 +6229,9 @@ fn cuda_distributed_step(
     let mut max_backward_bucket_flushes = 0usize;
     let mut max_backward_bucket_layers = 0usize;
     let mut max_backward_bucket_matrix_reductions = 0usize;
+    let mut max_backward_bucket_overlap_windows = 0usize;
+    let mut max_backward_bucket_overlap_confirmed = 0usize;
+    let mut max_backward_bucket_overlap_window_ms = 0.0f64;
     for result in replica_results {
         total_loss += result.loss;
         loss_count += result.loss_count;
@@ -5782,21 +6241,32 @@ fn cuda_distributed_step(
         timing.host_to_device_batch_bytes += result.host_to_device_batch_bytes;
         timing.device_batch_ready_steps += result.device_batch_ready_steps;
         timing.device_batch_missing_steps += result.device_batch_missing_steps;
+        timing.f32_to_bf16_bridge_launches += result.f32_to_bf16_bridge_launches;
+        timing.bf16_to_f32_bridge_launches += result.bf16_to_f32_bridge_launches;
         max_backward_ms = max_backward_ms.max(result.cuda_backward_ms);
         max_backward_bucket_flushes =
             max_backward_bucket_flushes.max(result.backward_bucket_flushes);
         max_backward_bucket_layers = max_backward_bucket_layers.max(result.backward_bucket_layers);
         max_backward_bucket_matrix_reductions =
             max_backward_bucket_matrix_reductions.max(result.backward_bucket_matrix_reductions);
+        max_backward_bucket_overlap_windows =
+            max_backward_bucket_overlap_windows.max(result.backward_bucket_overlap_windows);
+        max_backward_bucket_overlap_confirmed =
+            max_backward_bucket_overlap_confirmed.max(result.backward_bucket_overlap_confirmed);
+        max_backward_bucket_overlap_window_ms =
+            max_backward_bucket_overlap_window_ms.max(result.backward_bucket_overlap_max_window_ms);
     }
     if use_backward_bucket_overlap {
         println!(
-            "backward_nccl_bucket_overlap_runtime_json={{\"event\":\"backward_nccl_bucket_overlap_runtime\",\"step\":{},\"enabled\":true,\"bucket_layers_config\":{},\"bucket_flushes_per_rank_max\":{},\"layers_reduced_per_rank_max\":{},\"matrix_reductions_per_rank_max\":{},\"num_layers\":{},\"world_size\":{}}}",
+            "backward_nccl_bucket_overlap_runtime_json={{\"event\":\"backward_nccl_bucket_overlap_runtime\",\"step\":{},\"enabled\":true,\"bucket_layers_config\":{},\"bucket_flushes_per_rank_max\":{},\"layers_reduced_per_rank_max\":{},\"matrix_reductions_per_rank_max\":{},\"overlap_windows_per_rank_max\":{},\"overlap_confirmed_per_rank_max\":{},\"overlap_max_window_ms\":{:.6},\"num_layers\":{},\"world_size\":{}}}",
             step,
             backward_nccl_bucket_layers(),
             max_backward_bucket_flushes,
             max_backward_bucket_layers,
             max_backward_bucket_matrix_reductions,
+            max_backward_bucket_overlap_windows,
+            max_backward_bucket_overlap_confirmed,
+            max_backward_bucket_overlap_window_ms,
             runtime
                 .replicas
                 .first()
@@ -5805,6 +6275,11 @@ fn cuda_distributed_step(
             runtime.replicas.len()
         );
     }
+    timing.backward_nccl_bucket_overlap_windows += max_backward_bucket_overlap_windows;
+    timing.backward_nccl_bucket_overlap_confirmed += max_backward_bucket_overlap_confirmed;
+    timing.backward_nccl_bucket_overlap_max_window_ms = timing
+        .backward_nccl_bucket_overlap_max_window_ms
+        .max(max_backward_bucket_overlap_window_ms);
     timing.cuda_backward_ms += max_backward_ms;
     accumulate_gpu_backward_stage_timing(&runtime.replicas, timing);
     match distributed_optimizer_backend {
@@ -5847,6 +6322,7 @@ fn cuda_distributed_step(
                 step,
                 lr_scale,
                 1,
+                nccl_overlap_mode,
                 timing,
             )?;
         }
@@ -6068,6 +6544,304 @@ fn record_artifact_audit_json(
     format!("{{{}}}", fields.join(","))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn final_record_audit_json(
+    run_spec: &RunSpec,
+    mode: RunMode,
+    steps_completed: usize,
+    required_steps: usize,
+    timing: &RunTiming,
+    validation: &ValidationDataAudit,
+    eval_tokens: Option<usize>,
+    eval_docs: Option<usize>,
+    eval_target_bytes: Option<usize>,
+    artifact_model_bytes: Option<usize>,
+    artifact_code_bytes: Option<usize>,
+    artifact_total_bytes: Option<usize>,
+    artifact_budget_ok: Option<bool>,
+    artifact_model_sha256: Option<&str>,
+    artifact_code_sha256: Option<&str>,
+    caseops_byte_sidecar_sha256: Option<&str>,
+) -> String {
+    let caseops_sidecar_len_matches_val = validation
+        .sidecar_token_count
+        .zip(Some(validation.token_count))
+        .map(|(sidecar_tokens, val_tokens)| sidecar_tokens == val_tokens);
+    let canonical_caseops_dataset = canonical_caseops_dataset_for_audit(run_spec, validation);
+    let frontier_record_ready = final_frontier_record_ready(
+        run_spec,
+        mode,
+        steps_completed,
+        required_steps,
+        timing,
+        validation,
+        eval_tokens,
+        artifact_model_bytes,
+        artifact_code_bytes,
+        artifact_total_bytes,
+        artifact_budget_ok,
+        artifact_model_sha256,
+        artifact_code_sha256,
+        caseops_byte_sidecar_sha256,
+    );
+
+    let mut fields = Vec::with_capacity(48);
+    fields.push(json_str_field("event", "record_final_audit"));
+    fields.push(json_str_field("mode", run_mode_label(mode)));
+    fields.push("\"final_authoritative\":true".to_string());
+    fields.push(format!(
+        "\"frontier_record_path_ready\":{}",
+        frontier_record_gaps(run_spec).is_empty()
+    ));
+    fields.push(format!(
+        "\"frontier_record_ready\":{}",
+        frontier_record_ready
+    ));
+    fields.push(json_str_field(
+        "artifact_audit_stage",
+        "final_export_eval_audit",
+    ));
+    fields.push(format!("\"steps_completed\":{}", steps_completed));
+    fields.push(format!("\"required_steps\":{}", required_steps));
+    fields.push(format!(
+        "\"steps_completed_required\":{}",
+        steps_completed >= required_steps
+    ));
+    fields.push(format!(
+        "\"timing_recurrent_active_steps\":{}",
+        timing.recurrent_active_steps
+    ));
+    fields.push(format!(
+        "\"recurrent_active_steps_min\":{}",
+        run_spec.runtime.recurrent_active_steps_min
+    ));
+    fields.push(format!(
+        "\"recurrent_active_requirement_met\":{}",
+        !run_spec.runtime.recurrence_active_required
+            || timing.recurrent_active_steps >= run_spec.runtime.recurrent_active_steps_min
+    ));
+    fields.push(format!(
+        "\"f32_to_bf16_bridge_launches\":{}",
+        timing.f32_to_bf16_bridge_launches
+    ));
+    fields.push(format!(
+        "\"bf16_to_f32_bridge_launches\":{}",
+        timing.bf16_to_f32_bridge_launches
+    ));
+    fields.push(format!(
+        "\"measured_bf16_bridge_launches_zero\":{}",
+        timing.f32_to_bf16_bridge_launches == 0 && timing.bf16_to_f32_bridge_launches == 0
+    ));
+    fields.push(format!(
+        "\"backward_nccl_bucket_overlap_windows\":{}",
+        timing.backward_nccl_bucket_overlap_windows
+    ));
+    fields.push(format!(
+        "\"backward_nccl_bucket_overlap_confirmed\":{}",
+        timing.backward_nccl_bucket_overlap_confirmed
+    ));
+    fields.push(json_f64_field(
+        "backward_nccl_bucket_overlap_max_window_ms",
+        timing.backward_nccl_bucket_overlap_max_window_ms,
+    ));
+    fields.push(format!(
+        "\"backward_nccl_bucket_overlap_event_proof\":{}",
+        timing.backward_nccl_bucket_overlap_windows > 0
+            && timing.backward_nccl_bucket_overlap_confirmed > 0
+    ));
+    fields.push(format!("\"train_shards\":{}", validation.train_shard_count));
+    fields.push(json_opt_str_field(
+        "train_file_set_sha256",
+        validation.train_file_set_sha256.as_deref(),
+    ));
+    fields.push(format!("\"val_shards\":{}", validation.shard_count));
+    fields.push(format!("\"val_tokens\":{}", validation.token_count));
+    fields.push(json_opt_usize_field("val_docs", validation.doc_count));
+    fields.push(format!(
+        "\"frontier_2135_val_tokens_required\":{}",
+        FRONTIER_2135_CASEOPS_VAL_TOKENS
+    ));
+    fields.push(format!(
+        "\"frontier_caseops_val_docs_required\":{}",
+        FRONTIER_CASEOPS_VAL_DOCS
+    ));
+    fields.push(format!(
+        "\"frontier_2135_train_shards_required\":{}",
+        FRONTIER_2135_TRAIN_SHARDS
+    ));
+    fields.push(format!(
+        "\"frontier_2135_dataset_matches\":{}",
+        validation.train_shard_count == FRONTIER_2135_TRAIN_SHARDS
+            && validation.token_count == FRONTIER_2135_CASEOPS_VAL_TOKENS
+            && validation.doc_count == Some(FRONTIER_CASEOPS_VAL_DOCS)
+            && validation.train_val_file_non_overlap == Some(true)
+    ));
+    fields.push(json_opt_str_field(
+        "val_file_set_sha256",
+        validation.file_set_sha256.as_deref(),
+    ));
+    fields.push(json_opt_bool_field(
+        "train_val_file_non_overlap",
+        validation.train_val_file_non_overlap,
+    ));
+    fields.push(format!(
+        "\"train_val_non_overlap_proof\":{}",
+        validation.train_val_file_non_overlap == Some(true)
+    ));
+    fields.push(json_str_field(
+        "train_val_non_overlap_proof_method",
+        "canonical_path_set",
+    ));
+    fields.push(json_opt_usize_field("eval_tokens", eval_tokens));
+    fields.push(json_opt_usize_field("eval_docs", eval_docs));
+    fields.push(json_opt_usize_field("eval_target_bytes", eval_target_bytes));
+    fields.push(format!(
+        "\"full_validation_tokens_scored\":{}",
+        eval_tokens == Some(validation.token_count) && validation.token_count > 0
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar_files\":{}",
+        validation.sidecar_shard_count
+    ));
+    fields.push(json_opt_usize_field(
+        "caseops_byte_sidecar_tokens",
+        validation.sidecar_token_count,
+    ));
+    fields.push(json_opt_bool_field(
+        "caseops_sidecar_len_matches_val_tokens",
+        caseops_sidecar_len_matches_val,
+    ));
+    fields.push(format!(
+        "\"canonical_caseops_dataset\":{}",
+        canonical_caseops_dataset
+    ));
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_file_set_sha256",
+        validation.sidecar_file_set_sha256.as_deref(),
+    ));
+    fields.push(json_opt_str_field(
+        "caseops_byte_sidecar_sha256",
+        caseops_byte_sidecar_sha256,
+    ));
+    fields.push(json_opt_usize_field(
+        "artifact_model_bytes",
+        artifact_model_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "artifact_code_bytes",
+        artifact_code_bytes,
+    ));
+    fields.push(json_opt_usize_field(
+        "artifact_total_bytes",
+        artifact_total_bytes,
+    ));
+    fields.push(format!(
+        "\"artifact_total_limit\":{}",
+        run_spec.quant.target_artifact_bytes
+    ));
+    fields.push(format!(
+        "\"artifact_budget_known\":{}",
+        artifact_model_bytes.is_some() && artifact_code_bytes.is_some()
+    ));
+    fields.push(json_opt_bool_field(
+        "artifact_budget_ok",
+        artifact_budget_ok,
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_model_sha256",
+        artifact_model_sha256,
+    ));
+    fields.push(json_opt_str_field(
+        "artifact_code_sha256",
+        artifact_code_sha256,
+    ));
+    fields.push("\"strict_decimal_bytes\":true".to_string());
+    format!("{{{}}}", fields.join(","))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_frontier_record_ready(
+    run_spec: &RunSpec,
+    mode: RunMode,
+    steps_completed: usize,
+    required_steps: usize,
+    timing: &RunTiming,
+    validation: &ValidationDataAudit,
+    eval_tokens: Option<usize>,
+    artifact_model_bytes: Option<usize>,
+    artifact_code_bytes: Option<usize>,
+    artifact_total_bytes: Option<usize>,
+    artifact_budget_ok: Option<bool>,
+    artifact_model_sha256: Option<&str>,
+    artifact_code_sha256: Option<&str>,
+    caseops_byte_sidecar_sha256: Option<&str>,
+) -> bool {
+    if mode != RunMode::Record || !frontier_record_gaps(run_spec).is_empty() {
+        return false;
+    }
+    if steps_completed < required_steps {
+        return false;
+    }
+    if run_spec.runtime.recurrence_active_required
+        && timing.recurrent_active_steps < run_spec.runtime.recurrent_active_steps_min
+    {
+        return false;
+    }
+    if timing.f32_to_bf16_bridge_launches != 0 || timing.bf16_to_f32_bridge_launches != 0 {
+        return false;
+    }
+    if validation.token_count == 0 || eval_tokens != Some(validation.token_count) {
+        return false;
+    }
+    if matches!(
+        run_spec.runtime.record_profile,
+        RecordProfile::Frontier2135Audit
+    ) {
+        if validation.train_shard_count != FRONTIER_2135_TRAIN_SHARDS
+            || validation.token_count != FRONTIER_2135_CASEOPS_VAL_TOKENS
+            || validation.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS)
+        {
+            return false;
+        }
+    }
+    if validation.sidecar_token_count != Some(validation.token_count)
+        || validation.sidecar_file_set_sha256.is_none()
+        || validation.train_file_set_sha256.is_none()
+        || validation.file_set_sha256.is_none()
+        || validation.train_val_file_non_overlap != Some(true)
+    {
+        return false;
+    }
+    if artifact_model_bytes.is_none()
+        || artifact_code_bytes.is_none()
+        || artifact_total_bytes.is_none()
+        || artifact_budget_ok != Some(true)
+        || artifact_model_sha256.is_none()
+        || artifact_code_sha256.is_none()
+        || caseops_byte_sidecar_sha256.is_none()
+    {
+        return false;
+    }
+    true
+}
+
+fn canonical_caseops_dataset_for_audit(
+    run_spec: &RunSpec,
+    validation: &ValidationDataAudit,
+) -> bool {
+    run_spec.model.caseops.enabled
+        && run_spec.model.caseops.byte_sidecar
+        && run_spec.eval.caseops_byte_sidecar_pattern.is_some()
+        && validation.train_shard_count == FRONTIER_2135_TRAIN_SHARDS
+        && validation.token_count == FRONTIER_2135_CASEOPS_VAL_TOKENS
+        && validation.doc_count == Some(FRONTIER_CASEOPS_VAL_DOCS)
+        && validation.sidecar_token_count == Some(validation.token_count)
+        && validation.sidecar_file_set_sha256.is_some()
+        && validation.train_file_set_sha256.is_some()
+        && validation.file_set_sha256.is_some()
+        && validation.train_val_file_non_overlap == Some(true)
+}
+
 /// Emit the full [`VariantResult`] as a single-line JSON object.
 ///
 /// Used by `deploy/run_record_ab.py` to do step-time A/B deltas without
@@ -6204,6 +6978,26 @@ pub fn run_timing_json(result: &VariantResult) -> String {
         "\"device_to_host_scalar_reads\":{}",
         result.device_to_host_scalar_reads
     ));
+    fields.push(format!(
+        "\"f32_to_bf16_bridge_launches\":{}",
+        result.f32_to_bf16_bridge_launches
+    ));
+    fields.push(format!(
+        "\"bf16_to_f32_bridge_launches\":{}",
+        result.bf16_to_f32_bridge_launches
+    ));
+    fields.push(format!(
+        "\"backward_nccl_bucket_overlap_windows\":{}",
+        result.backward_nccl_bucket_overlap_windows
+    ));
+    fields.push(format!(
+        "\"backward_nccl_bucket_overlap_confirmed\":{}",
+        result.backward_nccl_bucket_overlap_confirmed
+    ));
+    fields.push(json_f64_field(
+        "backward_nccl_bucket_overlap_max_window_ms",
+        result.backward_nccl_bucket_overlap_max_window_ms,
+    ));
     fields.push(json_f64_field("ms_per_step", result.ms_per_step));
     fields.push(json_f64_field(
         "wallclock_seconds",
@@ -6246,6 +7040,7 @@ pub fn run_timing_json(result: &VariantResult) -> String {
         },
     ));
     let timing_steps_f = result.timing_steps.max(1) as f64;
+    let active_steps_f = result.timing_recurrent_active_steps.max(1) as f64;
     let per_step = |total: f64| -> f64 {
         if result.timing_steps == 0 {
             0.0
@@ -6383,6 +7178,14 @@ pub fn run_timing_json(result: &VariantResult) -> String {
             result.timing_cuda_backward_block_qkv_norm_resid_ms,
         ),
         (
+            "timing_cuda_backward_recurrent_pass2_ms",
+            result.timing_cuda_backward_recurrent_pass2_ms,
+        ),
+        (
+            "timing_cuda_backward_recurrent_pass1_ms",
+            result.timing_cuda_backward_recurrent_pass1_ms,
+        ),
+        (
             "timing_cuda_backward_output_ms",
             result.timing_cuda_backward_output_ms,
         ),
@@ -6459,6 +7262,22 @@ pub fn run_timing_json(result: &VariantResult) -> String {
             per_step(*total),
         ));
     }
+    fields.push(json_f64_field(
+        "timing_cuda_backward_recurrent_pass2_ms_per_active_step",
+        if result.timing_recurrent_active_steps == 0 {
+            0.0
+        } else {
+            result.timing_cuda_backward_recurrent_pass2_ms / active_steps_f
+        },
+    ));
+    fields.push(json_f64_field(
+        "timing_cuda_backward_recurrent_pass1_ms_per_active_step",
+        if result.timing_recurrent_active_steps == 0 {
+            0.0
+        } else {
+            result.timing_cuda_backward_recurrent_pass1_ms / active_steps_f
+        },
+    ));
     format!("{{{}}}", fields.join(","))
 }
 
@@ -6477,6 +7296,11 @@ fn record_path_audit_json(
 ) -> String {
     let local_batch = batch_plan.local_microbatches_per_step;
     let local_tokens_per_rank = batch_plan.microbatch_tokens * local_batch;
+    let backward_bucket_overlap_configured =
+        run_spec.runtime.nccl_overlap_mode == NcclOverlapMode::BucketedMeasured;
+    let model_config = run_spec.model.to_model_config();
+    let quant_layout_manifest =
+        pg_quant::layout::compile_quant_layout_manifest(&run_spec.quant, Some(&model_config)).ok();
     let mut fields = Vec::with_capacity(30);
     fields.push(json_str_field("event", "record_path_audit"));
     fields.push(json_str_field("mode", run_mode_label(mode)));
@@ -6649,7 +7473,7 @@ fn record_path_audit_json(
     ));
     fields.push(json_str_field(
         "sharded_parallel_muon_bank_grad_collective",
-        if backward_nccl_bucket_overlap_enabled_for_audit() {
+        if backward_bucket_overlap_configured {
             "bucketed_reduce_to_owner"
         } else {
             "reduce_scatter"
@@ -6657,7 +7481,7 @@ fn record_path_audit_json(
     ));
     fields.push(format!(
         "\"backward_nccl_bucket_layers\":{}",
-        if backward_nccl_bucket_overlap_enabled_for_audit() {
+        if backward_bucket_overlap_configured {
             backward_nccl_bucket_layers()
         } else {
             0
@@ -6665,11 +7489,11 @@ fn record_path_audit_json(
     ));
     fields.push(format!(
         "\"nccl_side_stream_collectives\":{}",
-        nccl_side_stream_collectives_enabled_for_audit()
+        backward_bucket_overlap_configured || nccl_side_stream_collectives_enabled_for_audit()
     ));
     fields.push(format!(
         "\"backward_nccl_bucket_overlap\":{}",
-        backward_nccl_bucket_overlap_enabled_for_audit()
+        backward_bucket_overlap_configured
     ));
     fields.push(format!(
         "\"backward_nccl_bucket_overlap_validated\":{}",
@@ -6949,12 +7773,28 @@ fn record_path_audit_json(
         &format!("{:?}", run_spec.runtime.backward_chain_profile),
     ));
     fields.push(json_str_field(
+        "runtime_qkv_norm_resid_reducer_profile",
+        &format!("{:?}", run_spec.runtime.qkv_norm_resid_reducer_profile),
+    ));
+    fields.push(format!(
+        "\"runtime_qkv_norm_resid_rows_per_chunk\":{}",
+        run_spec.runtime.qkv_norm_resid_rows_per_chunk.max(256)
+    ));
+    fields.push(json_str_field(
         "recurrent_backward_profile",
         &format!("{:?}", run_spec.runtime.recurrent_backward_profile),
     ));
     fields.push(format!(
         "\"runtime_recurrent_straight_through_layers\":{}",
         run_spec.runtime.recurrent_straight_through_layers
+    ));
+    fields.push(format!(
+        "\"runtime_recurrent_fused_pass_boundary_backward\":{}",
+        run_spec.runtime.recurrent_fused_pass_boundary_backward
+    ));
+    fields.push(format!(
+        "\"recurrent_fused_pass_boundary_backward\":{}",
+        recurrent_fused_pass_boundary_backward_enabled_for_audit()
     ));
     fields.push(format!(
         "\"runtime_skip_recurrent_bank_grads\":{}",
@@ -7020,6 +7860,10 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"runtime_sharded_muon_fused_global_clip\":{}",
         run_spec.runtime.sharded_muon_fused_global_clip
+    ));
+    fields.push(format!(
+        "\"runtime_sharded_muon_parallel_local\":{}",
+        run_spec.runtime.sharded_muon_parallel_local
     ));
     fields.push(format!(
         "\"runtime_sharded_muon_bf16_shadow_all_gather\":{}",
@@ -7281,9 +8125,11 @@ fn record_path_audit_json(
         run_spec.eval.ttt_beta2
     ));
     fields.push(format!(
-        "\"frontier_record_ready\":{}",
+        "\"frontier_record_path_ready\":{}",
         frontier_record_ready
     ));
+    fields.push("\"frontier_record_ready\":false".to_string());
+    fields.push("\"frontier_record_final_evidence_required\":true".to_string());
     fields.push(format!(
         "\"leaderboard_algorithm_ready\":{}",
         leaderboard_algorithm_ready
@@ -7291,6 +8137,79 @@ fn record_path_audit_json(
     fields.push(json_str_field(
         "leaderboard_algorithm_gaps",
         &leaderboard_algorithm_gaps.join("; "),
+    ));
+    let proposal_feature_gaps = proposal_feature_gaps(run_spec);
+    fields.push(format!(
+        "\"proposal_quantization_compiled_layout_active\":{}",
+        pg_quant::layout::compiled_layout_for_quant_spec(&run_spec.quant).is_some()
+    ));
+    fields.push(format!(
+        "\"proposal_quantization_layout_compiler\":{}",
+        quant_layout_manifest.is_some()
+    ));
+    fields.push(format!(
+        "\"proposal_quantization_proc_macro_compiler\":{}",
+        pg_quant::layout::compiled_layout_for_quant_spec(&run_spec.quant).is_some()
+    ));
+    fields.push(json_opt_str_field(
+        "proposal_quantization_layout_generated_from",
+        quant_layout_manifest
+            .as_ref()
+            .map(|manifest| manifest.generated_from),
+    ));
+    fields.push(json_opt_str_field(
+        "proposal_quantization_layout_fingerprint_crc32",
+        quant_layout_manifest
+            .as_ref()
+            .map(|manifest| manifest.fingerprint_crc32.as_str()),
+    ));
+    fields.push(json_opt_usize_field(
+        "proposal_quantization_layout_estimated_raw_weight_bytes",
+        quant_layout_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.estimated_raw_weight_bytes),
+    ));
+    fields.push(format!(
+        "\"proposal_bigram_embedding_merge_applicable\":{}",
+        run_spec.model.bigram.enabled
+    ));
+    fields.push(format!(
+        "\"proposal_bigram_embedding_merge_active\":{}",
+        run_spec.model.bigram.enabled && run_spec.runtime.bigram_embedding_merge
+    ));
+    fields.push(format!(
+        "\"proposal_bigramhash_fused_backward\":{}",
+        run_spec.model.bigram.enabled && run_spec.runtime.bigram_embedding_merge
+    ));
+    fields.push(format!(
+        "\"proposal_sparse_xsa_gate_fusion_active\":{}",
+        run_spec.model.sparse_attn_gate.enabled
+            && run_spec.model.xsa_last_n > 0
+            && bf16_sparse_xsa_forward_enabled_for_audit()
+            && (sparse_xsa_warphead_backward_enabled_for_audit()
+                || sparse_xsa_grouped_kv_backward_enabled_for_audit())
+    ));
+    fields.push(format!(
+        "\"proposal_exact_recurrent_boundary_fusion_active\":{}",
+        run_spec.model.recurrence.enabled
+            && recurrent_fused_pass_boundary_backward_enabled_for_audit()
+    ));
+    fields.push("\"proposal_true_xsa_in_attention_fusion\":false".to_string());
+    fields.push("\"proposal_persistent_cta_block_backward\":false".to_string());
+    fields.push("\"proposal_nccl_overlap_event_proof\":false".to_string());
+    fields.push("\"proposal_record_step_cuda_graph\":false".to_string());
+    fields.push(format!(
+        "\"proposal_backward_no_loss_cuda_graph\":{}",
+        run_spec.runtime.cuda_graph_profile != CudaGraphProfile::Off
+            && cuda_backward_graph_enabled()
+    ));
+    fields.push(format!(
+        "\"proposal_feature_complete\":{}",
+        proposal_feature_gaps.is_empty()
+    ));
+    fields.push(json_str_field(
+        "proposal_feature_gaps",
+        &proposal_feature_gaps.join("; "),
     ));
     fields.push(json_str_field(
         "timing_backend",
@@ -7445,21 +8364,65 @@ fn record_path_audit_json(
             && (!run_spec.eval.qttt
                 || run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased)
     ));
+    let validation_audit = validation_data_audit(run_spec);
     fields.push(format!(
         "\"train_shards\":{}",
-        run_spec
-            .train
-            .train_data_pattern
-            .as_deref()
-            .and_then(|pattern| simple_glob_paths(pattern).ok())
-            .map(|paths| paths.len())
-            .unwrap_or(0)
+        validation_audit.train_shard_count
     ));
-    fields.push(format!("\"val_docs\":{}", 50_000));
-    fields.push("\"val_tokens\":null".to_string());
+    fields.push(json_opt_str_field(
+        "train_file_set_sha256",
+        validation_audit.train_file_set_sha256.as_deref(),
+    ));
+    fields.push(format!("\"val_shards\":{}", validation_audit.shard_count));
+    fields.push(json_opt_usize_field("val_docs", validation_audit.doc_count));
+    fields.push(format!("\"val_tokens\":{}", validation_audit.token_count));
+    fields.push(json_opt_str_field(
+        "val_file_set_sha256",
+        validation_audit.file_set_sha256.as_deref(),
+    ));
+    fields.push(json_opt_bool_field(
+        "train_val_file_non_overlap",
+        validation_audit.train_val_file_non_overlap,
+    ));
+    fields.push(format!(
+        "\"train_val_non_overlap_proof\":{}",
+        validation_audit.train_val_file_non_overlap == Some(true)
+    ));
+    fields.push(json_str_field(
+        "train_val_non_overlap_proof_method",
+        "canonical_path_set",
+    ));
+    let caseops_sidecar_len_matches_val =
+        validation_audit.sidecar_token_count == Some(validation_audit.token_count);
+    let frontier_2135_validation_matches = validation_audit.token_count
+        == FRONTIER_2135_CASEOPS_VAL_TOKENS
+        && validation_audit.doc_count == Some(FRONTIER_CASEOPS_VAL_DOCS);
+    fields.push(format!(
+        "\"frontier_2135_val_tokens_required\":{}",
+        FRONTIER_2135_CASEOPS_VAL_TOKENS
+    ));
+    fields.push(format!(
+        "\"frontier_caseops_val_docs_required\":{}",
+        FRONTIER_CASEOPS_VAL_DOCS
+    ));
+    fields.push(format!(
+        "\"frontier_2135_train_shards_required\":{}",
+        FRONTIER_2135_TRAIN_SHARDS
+    ));
+    fields.push(format!(
+        "\"frontier_2135_dataset_matches\":{}",
+        validation_audit.train_shard_count == FRONTIER_2135_TRAIN_SHARDS
+            && validation_audit.token_count == FRONTIER_2135_CASEOPS_VAL_TOKENS
+            && validation_audit.doc_count == Some(FRONTIER_CASEOPS_VAL_DOCS)
+            && validation_audit.train_val_file_non_overlap == Some(true)
+    ));
+    fields.push(format!(
+        "\"frontier_2135_validation_matches\":{}",
+        frontier_2135_validation_matches
+    ));
     fields.push(format!(
         "\"canonical_caseops_dataset\":{}",
-        run_spec.eval.caseops_byte_sidecar_pattern.is_some()
+        canonical_caseops_dataset_for_audit(run_spec, &validation_audit)
     ));
     let caseops_sidecar_sha256 = run_spec
         .eval
@@ -7469,6 +8432,18 @@ fn record_path_audit_json(
     fields.push(json_opt_str_field(
         "caseops_byte_sidecar_sha256",
         caseops_sidecar_sha256.as_deref(),
+    ));
+    fields.push(format!(
+        "\"caseops_byte_sidecar_files\":{}",
+        validation_audit.sidecar_shard_count
+    ));
+    fields.push(json_opt_usize_field(
+        "caseops_byte_sidecar_tokens",
+        validation_audit.sidecar_token_count,
+    ));
+    fields.push(json_opt_bool_field(
+        "caseops_sidecar_len_matches_val_tokens",
+        Some(caseops_sidecar_len_matches_val),
     ));
     let audit_code_bytes = current_executable_bytes();
     fields.push(format!(
@@ -7484,6 +8459,15 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"artifact_code_bytes_known\":{}",
         audit_code_bytes.is_some()
+    ));
+    fields.push(json_str_field(
+        "artifact_audit_stage",
+        "pre_export_path_audit",
+    ));
+    fields.push(format!(
+        "\"artifact_authoritative_event_required\":{}",
+        mode == RunMode::Record
+            || (mode == RunMode::RecordShapedProxy && record_shaped_artifact_export_enabled())
     ));
     fields.push("\"artifact_model_bytes_known\":false".to_string());
     fields.push("\"artifact_total_bytes_known\":false".to_string());
@@ -7774,6 +8758,7 @@ fn sharded_parallel_muon_bf16_shadow_all_gather_enabled_for_audit() -> bool {
     )
 }
 
+#[cfg(feature = "cuda")]
 fn sharded_parallel_muon_phase_timing_enabled() -> bool {
     matches!(
         std::env::var("PG_GPU_SHARDED_MUON_PHASE_TIMING")
@@ -7784,6 +8769,7 @@ fn sharded_parallel_muon_phase_timing_enabled() -> bool {
     )
 }
 
+#[cfg(feature = "cuda")]
 fn sharded_parallel_muon_parallel_local_enabled() -> bool {
     matches!(
         std::env::var("PG_GPU_SHARDED_MUON_PARALLEL_LOCAL")
@@ -8080,6 +9066,16 @@ fn sparse_xsa_warphead_backward_enabled_for_audit() -> bool {
 fn sparse_xsa_grouped_kv_backward_enabled_for_audit() -> bool {
     matches!(
         std::env::var("PG_GPU_SPARSE_XSA_GROUPED_KV_BWD")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn recurrent_fused_pass_boundary_backward_enabled_for_audit() -> bool {
+    matches!(
+        std::env::var("PG_GPU_RECURRENT_FUSED_PASS_BOUNDARY_BWD")
             .unwrap_or_else(|_| "0".to_string())
             .to_ascii_lowercase()
             .as_str(),
@@ -8680,14 +9676,7 @@ fn backward_nccl_bucket_overlap_enabled_for_audit() -> bool {
 }
 
 fn backward_nccl_bucket_overlap_validated_for_audit() -> bool {
-    backward_nccl_bucket_overlap_enabled_for_audit()
-        && matches!(
-            std::env::var("PG_NCCL_BACKWARD_BUCKET_OVERLAP_VALIDATED")
-                .unwrap_or_else(|_| "0".to_string())
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+    false
 }
 
 fn cudnn_frontend_sdpa_available() -> bool {
@@ -8798,6 +9787,30 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     }
     if run_spec.model.smear_gate && run_spec.model.smear_gate_boundary_token_id.is_none() {
         gaps.push("SmearGate must be BOS/document-boundary masked before record-shaped frontier runs; unmasked previous-token mixing can leak across packed documents");
+    }
+    let validation_audit = validation_data_audit(run_spec);
+    if matches!(
+        run_spec.runtime.record_profile,
+        RecordProfile::Frontier2135Audit
+    ) {
+        if validation_audit.train_shard_count != FRONTIER_2135_TRAIN_SHARDS {
+            gaps.push("frontier_2135_audit requires train_shards=80 from the actual configured training shard set");
+        }
+        if validation_audit.token_count != FRONTIER_2135_CASEOPS_VAL_TOKENS {
+            gaps.push("frontier_2135_audit requires the actual configured validation shard set to contain exactly 47851520 tokens");
+        }
+        if validation_audit.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS) {
+            gaps.push("frontier_2135_audit requires canonical CaseOps validation doc count 50000 from the actual shard data");
+        }
+    }
+    if validation_audit.file_set_sha256.is_none()
+        || validation_audit.train_file_set_sha256.is_none()
+        || validation_audit.sidecar_file_set_sha256.is_none()
+    {
+        gaps.push("frontier record target requires train, validation, and CaseOps sidecar file-set manifests");
+    }
+    if validation_audit.train_val_file_non_overlap != Some(true) {
+        gaps.push("frontier record target requires canonical path non-overlap proof between train and validation shard sets");
     }
     if gpu_resident_synthetic_record_sampler_configured_for_audit(run_spec) {
         gaps.push("record-shaped proxy uses a GPU-resident synthetic sampler, but final FineWeb training still needs a real GPU-resident or pinned/ring data sampler before CUDA-graphable record mode is complete");
@@ -8944,9 +9957,9 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         {
             gaps.push("Rust GPU LoRA-TTT currently implements q-only adapters; requested frontier LoRA targets are not yet implemented in the Rust runtime");
         }
-        if pg_quant::layout::compiled_layout_for_quant_spec(&run_spec.quant).is_none() {
+        if pg_quant::layout::compile_quant_layout_manifest(&run_spec.quant, None).is_err() {
             gaps.push(
-                "frontier record targets require QuantSpec to match a compiled quantization layout",
+                "frontier record targets require QuantSpec to compile into a hashable quantization layout manifest",
             );
         }
         if matches!(
@@ -8987,6 +10000,38 @@ fn leaderboard_algorithm_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     if !run_spec.quant.lqer.enabled {
         gaps.push("PR1797 algorithm target requires LQER asymmetric post-GPTQ correction");
     }
+    gaps
+}
+
+fn proposal_feature_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
+    let mut gaps = Vec::new();
+    if pg_quant::layout::compile_quant_layout_manifest(&run_spec.quant, None).is_err() {
+        gaps.push("QuantSpec does not compile into a quantization layout manifest");
+    }
+    if run_spec.model.bigram.enabled {
+        if !run_spec.runtime.bigram_embedding_merge {
+            gaps.push("BigramHash is enabled but the fused embedding/BigramHash merge kernel is not active");
+            gaps.push(
+                "BigramHash fused backward requires the fused embedding/BigramHash merge profile",
+            );
+        }
+    }
+    if run_spec.model.sparse_attn_gate.enabled
+        && run_spec.model.xsa_last_n > 0
+        && !(bf16_sparse_xsa_forward_enabled_for_audit()
+            && (sparse_xsa_warphead_backward_enabled_for_audit()
+                || sparse_xsa_grouped_kv_backward_enabled_for_audit()))
+    {
+        gaps.push("SparseAttnGate/XSA fused BF16 forward+backward path is not active");
+    }
+    if run_spec.model.xsa_last_n > 0 {
+        gaps.push("true register-resident XSA inside the SDPA kernel is not implemented; current code fuses SparseAttnGate+XSA adjacent to attention");
+    }
+    gaps.push("persistent-CTA per-block backward megakernel is not implemented");
+    if run_spec.runtime.cuda_graph_profile == CudaGraphProfile::Off {
+        gaps.push("no-loss backward CUDA graph capture is disabled");
+    }
+    gaps.push("NCCL overlap event-window proof is runtime-measured, but final on/off H100 A/B evidence is still required before claiming a record-readiness win");
     gaps
 }
 
@@ -9545,11 +10590,22 @@ fn flatten_params_into(model: &GptModel, flat: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_test_shard(path: &std::path::Path, values: &[u16]) {
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut header = [0i32; 256];
+        header[0] = 20240520;
+        header[1] = 1;
+        header[2] = values.len() as i32;
+        file.write_all(bytemuck::cast_slice(&header)).unwrap();
+        file.write_all(bytemuck::cast_slice(values)).unwrap();
     }
 
     fn with_tiled_output_ce_env<T>(
@@ -9746,7 +10802,7 @@ mod tests {
         unsafe {
             std::env::set_var("PG_NCCL_BACKWARD_BUCKET_OVERLAP_VALIDATED", "true");
         }
-        assert!(backward_nccl_bucket_overlap_validated_for_audit());
+        assert!(!backward_nccl_bucket_overlap_validated_for_audit());
 
         match prev {
             Some(value) => unsafe { std::env::set_var("PG_NCCL_BUCKET_OVERLAP", value) },
@@ -9791,6 +10847,7 @@ mod tests {
         spec.train.seq_len = 2048;
         spec.train.batch_tokens = 786_432;
         spec.train.distributed_optimizer_backend = DistributedOptimizerBackend::ShardedParallelMuon;
+        spec.runtime.nccl_overlap_mode = NcclOverlapMode::BucketedMeasured;
         spec.model.attention_backend = AttentionBackend::CudnnSdpaBf16;
         let config = spec.model.to_model_config();
         let plan = step_batch_plan(&spec, RunMode::RecordShapedProxy, &config, 8).unwrap();
@@ -10316,6 +11373,27 @@ mod tests {
             "{json}"
         );
         assert!(
+            json.contains("\"proposal_feature_complete\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"proposal_persistent_cta_block_backward\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"artifact_audit_stage\":\"pre_export_path_audit\""),
+            "{json}"
+        );
+        assert!(json.contains("\"frontier_record_ready\":false"), "{json}");
+        assert!(
+            json.contains("\"frontier_record_final_evidence_required\":true"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"artifact_authoritative_event_required\":false"),
+            "{json}"
+        );
+        assert!(
             json.contains("\"artifact_model_bytes_known\":false"),
             "{json}"
         );
@@ -10329,6 +11407,226 @@ mod tests {
                 None => unsafe { std::env::remove_var(key) },
             }
         }
+    }
+
+    #[test]
+    fn record_artifact_audit_json_carries_authoritative_budget_evidence() {
+        let mut spec = RunSpec::default();
+        spec.quant.target_artifact_bytes = 16_000_000;
+
+        let json = record_artifact_audit_json(
+            &spec,
+            Some(12_900_000),
+            Some(2_700_000),
+            Some(15_600_000),
+            Some(true),
+            Some("model_sha"),
+            Some("code_sha"),
+            Some("caseops_sha"),
+        );
+
+        assert!(
+            json.contains("\"event\":\"record_artifact_audit\""),
+            "{json}"
+        );
+        assert!(json.contains("\"artifact_model_bytes\":12900000"), "{json}");
+        assert!(json.contains("\"artifact_code_bytes\":2700000"), "{json}");
+        assert!(json.contains("\"artifact_total_bytes\":15600000"), "{json}");
+        assert!(json.contains("\"artifact_total_limit\":16000000"), "{json}");
+        assert!(json.contains("\"artifact_budget_known\":true"), "{json}");
+        assert!(json.contains("\"artifact_budget_ok\":true"), "{json}");
+        assert!(
+            json.contains("\"artifact_model_sha256\":\"model_sha\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"artifact_code_sha256\":\"code_sha\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"caseops_byte_sidecar_sha256\":\"caseops_sha\""),
+            "{json}"
+        );
+        assert!(json.contains("\"strict_decimal_bytes\":true"), "{json}");
+    }
+
+    #[test]
+    fn frontier_2135_pre_run_audit_rejects_noncanonical_caseops_token_count() {
+        let root = std::env::temp_dir().join(format!(
+            "pg_train_caseops_audit_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        write_test_shard(&root.join("train_000.bin"), &[1, 2, 3, 1]);
+        write_test_shard(&root.join("val_000.bin"), &[1, 7, 8, 1, 9]);
+        write_test_shard(&root.join("val_bytes_000.bin"), &[0, 1, 1, 1, 1]);
+
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135Audit;
+        spec.train.train_data_pattern = Some(root.join("train_*.bin").to_string_lossy().into());
+        spec.train.validation_data_pattern = Some(root.join("val_*.bin").to_string_lossy().into());
+        spec.eval.caseops_byte_sidecar_pattern =
+            Some(root.join("val_bytes_*.bin").to_string_lossy().into());
+        spec.model.caseops.enabled = true;
+        spec.model.caseops.byte_sidecar = true;
+        spec.model.smear_gate_boundary_token_id = Some(1);
+        let config = spec.model.to_model_config();
+        let plan = step_batch_plan(&spec, RunMode::RecordShapedProxy, &config, 1).unwrap();
+        let json = record_path_audit_json(
+            &spec,
+            RunMode::RecordShapedProxy,
+            &plan,
+            1,
+            false,
+            false,
+            &[],
+            false,
+            false,
+            "single_gpu",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(json.contains("\"val_tokens\":5"), "{json}");
+        assert!(
+            json.contains("\"frontier_2135_validation_matches\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"canonical_caseops_dataset\":false"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn final_record_audit_json_carries_validation_and_bridge_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "pg_train_final_audit_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        write_test_shard(&root.join("train_000.bin"), &[1, 2, 3, 1]);
+        write_test_shard(&root.join("val_000.bin"), &[1, 7, 8, 1, 9]);
+        write_test_shard(&root.join("val_bytes_000.bin"), &[0, 1, 1, 1, 1]);
+
+        let mut spec = RunSpec::default();
+        spec.train.train_data_pattern = Some(root.join("train_*.bin").to_string_lossy().into());
+        spec.train.validation_data_pattern = Some(root.join("val_*.bin").to_string_lossy().into());
+        spec.eval.caseops_byte_sidecar_pattern =
+            Some(root.join("val_bytes_*.bin").to_string_lossy().into());
+        spec.model.caseops.enabled = true;
+        spec.model.caseops.byte_sidecar = true;
+        spec.model.smear_gate_boundary_token_id = Some(1);
+        spec.quant.target_artifact_bytes = 16_000_000;
+
+        let validation = validation_data_audit(&spec);
+        let mut timing = RunTiming::default();
+        timing.recurrent_active_steps = 2;
+
+        let json = final_record_audit_json(
+            &spec,
+            RunMode::Record,
+            4,
+            4,
+            &timing,
+            &validation,
+            Some(5),
+            Some(2),
+            Some(4),
+            Some(12_000_000),
+            Some(2_000_000),
+            Some(14_000_000),
+            Some(true),
+            Some("model_sha"),
+            Some("code_sha"),
+            Some("caseops_sha"),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(json.contains("\"event\":\"record_final_audit\""), "{json}");
+        assert!(json.contains("\"final_authoritative\":true"), "{json}");
+        assert!(json.contains("\"frontier_record_ready\":false"), "{json}");
+        assert!(
+            json.contains("\"artifact_audit_stage\":\"final_export_eval_audit\""),
+            "{json}"
+        );
+        assert!(json.contains("\"steps_completed_required\":true"), "{json}");
+        assert!(json.contains("\"val_shards\":1"), "{json}");
+        assert!(json.contains("\"val_tokens\":5"), "{json}");
+        assert!(json.contains("\"val_docs\":2"), "{json}");
+        assert!(
+            json.contains("\"full_validation_tokens_scored\":true"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"caseops_sidecar_len_matches_val_tokens\":true"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"measured_bf16_bridge_launches_zero\":true"),
+            "{json}"
+        );
+        assert!(json.contains("\"artifact_total_bytes\":14000000"), "{json}");
+        assert!(json.contains("\"artifact_budget_ok\":true"), "{json}");
+    }
+
+    #[test]
+    fn proposal_feature_gaps_keep_unimplemented_paper_claims_visible() {
+        let mut spec = RunSpec::default();
+        spec.model.xsa_last_n = 4;
+        spec.model.sparse_attn_gate.enabled = true;
+        spec.model.bigram.enabled = true;
+        spec.runtime.bigram_embedding_merge = false;
+
+        let gaps = proposal_feature_gaps(&spec);
+
+        assert!(
+            gaps.iter().any(|gap| gap.contains("BigramHash")),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|gap| gap.contains("SDPA kernel")),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|gap| gap.contains("persistent-CTA")),
+            "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn proposal_feature_gaps_clear_bigram_backward_when_merge_profile_is_active() {
+        let mut spec = RunSpec::default();
+        spec.model.xsa_last_n = 0;
+        spec.model.sparse_attn_gate.enabled = false;
+        spec.model.bigram.enabled = true;
+        spec.runtime.bigram_embedding_merge = true;
+
+        let config = spec.model.to_model_config();
+        let plan = step_batch_plan(&spec, RunMode::Smoke, &config, 1).unwrap();
+        let audit = record_path_audit_json(
+            &spec,
+            RunMode::Smoke,
+            &plan,
+            1,
+            false,
+            false,
+            &[],
+            true,
+            false,
+            "cpu",
+        );
+        let gaps = proposal_feature_gaps(&spec);
+
+        assert!(
+            audit.contains("\"proposal_bigramhash_fused_backward\":true"),
+            "{audit}"
+        );
+        assert!(
+            !gaps.iter().any(|gap| gap.contains("BigramHash")),
+            "{gaps:?}"
+        );
     }
 
     #[test]

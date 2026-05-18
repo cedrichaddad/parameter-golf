@@ -953,6 +953,7 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         os.environ["PG_NCCL_SIDE_STREAM_COLLECTIVES"] = "0"
     if "--enable-backward-nccl-bucket-overlap" in forwarded:
         forwarded.remove("--enable-backward-nccl-bucket-overlap")
+        forwarded.extend(["--runtime-nccl-overlap-mode", "bucketed_measured"])
         os.environ["PG_NCCL_BACKWARD_BUCKET_OVERLAP"] = "1"
         os.environ["PG_NCCL_SIDE_STREAM_COLLECTIVES"] = "1"
         # Per-layer/bucket overlap launches collectives as soon as gradients
@@ -963,6 +964,7 @@ def _apply_gpu_env_flags(forwarded: list[str]):
             os.environ["PG_NCCL_BF16_BANK_GRAD_WIRE"] = "0"
     if "--disable-backward-nccl-bucket-overlap" in forwarded:
         forwarded.remove("--disable-backward-nccl-bucket-overlap")
+        forwarded.extend(["--runtime-nccl-overlap-mode", "off"])
         os.environ["PG_NCCL_BACKWARD_BUCKET_OVERLAP"] = "0"
     if "--backward-nccl-bucket-layers" in forwarded:
         idx = forwarded.index("--backward-nccl-bucket-layers")

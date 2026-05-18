@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use pg_model::{
-    AttentionBackend, DistributedOptimizerBackend, EvalAdaptationBackend, QuantScheme, RunMode,
-    RunSpec, TrainBackend, VariantFamily,
+    AttentionBackend, DistributedOptimizerBackend, EvalAdaptationBackend, NcclOverlapMode,
+    QuantScheme, RunMode, RunSpec, TrainBackend, VariantFamily,
 };
 use pg_train::VariantRunner;
 
@@ -50,6 +50,8 @@ fn main() {
             let mut attn_out_gate_width: Option<usize> = None;
             let mut quant_scheme: Option<QuantScheme> = None;
             let mut prune_keep_ratio: Option<f32> = None;
+            let mut recurrent_fused_pass_boundary_backward: Option<bool> = None;
+            let mut nccl_overlap_mode: Option<NcclOverlapMode> = None;
             let mut result_json_path: Option<PathBuf> = None;
             let mut fast_bank_updates = false;
             let mut allow_unsupported_variants = false;
@@ -118,6 +120,21 @@ fn main() {
                     }
                     "--prune-keep-ratio" => {
                         prune_keep_ratio = args.next().and_then(|v| v.parse::<f32>().ok())
+                    }
+                    "--enable-recurrent-boundary-fusion" => {
+                        recurrent_fused_pass_boundary_backward = Some(true)
+                    }
+                    "--disable-recurrent-boundary-fusion" => {
+                        recurrent_fused_pass_boundary_backward = Some(false)
+                    }
+                    "--runtime-nccl-overlap-mode" => {
+                        nccl_overlap_mode = args.next().as_deref().and_then(parse_nccl_overlap_mode)
+                    }
+                    "--enable-backward-nccl-bucket-overlap" => {
+                        nccl_overlap_mode = Some(NcclOverlapMode::BucketedMeasured)
+                    }
+                    "--disable-backward-nccl-bucket-overlap" => {
+                        nccl_overlap_mode = Some(NcclOverlapMode::Off)
                     }
                     "--result-json" => result_json_path = args.next().map(PathBuf::from),
                     "--fast-bank-updates" => fast_bank_updates = true,
@@ -201,6 +218,12 @@ fn main() {
             }
             if let Some(value) = prune_keep_ratio {
                 run_spec.quant.prune_keep_ratio = Some(value);
+            }
+            if let Some(value) = recurrent_fused_pass_boundary_backward {
+                run_spec.runtime.recurrent_fused_pass_boundary_backward = value;
+            }
+            if let Some(value) = nccl_overlap_mode {
+                run_spec.runtime.nccl_overlap_mode = value;
             }
             if fast_bank_updates {
                 run_spec.train.fast_bank_updates = true;
@@ -393,6 +416,14 @@ fn main() {
             println!(
                 "timing_cuda_backward_block_qkv_norm_resid_ms={:.3}",
                 result.timing_cuda_backward_block_qkv_norm_resid_ms
+            );
+            println!(
+                "timing_cuda_backward_recurrent_pass2_ms={:.3}",
+                result.timing_cuda_backward_recurrent_pass2_ms
+            );
+            println!(
+                "timing_cuda_backward_recurrent_pass1_ms={:.3}",
+                result.timing_cuda_backward_recurrent_pass1_ms
             );
             println!(
                 "timing_cuda_backward_output_ms={:.3}",
@@ -589,6 +620,20 @@ fn main() {
                 )
             );
             println!(
+                "timing_cuda_backward_recurrent_pass2_ms_per_step={:.3}",
+                timing_per_step(
+                    result.timing_cuda_backward_recurrent_pass2_ms,
+                    result.timing_steps
+                )
+            );
+            println!(
+                "timing_cuda_backward_recurrent_pass1_ms_per_step={:.3}",
+                timing_per_step(
+                    result.timing_cuda_backward_recurrent_pass1_ms,
+                    result.timing_steps
+                )
+            );
+            println!(
                 "timing_cuda_backward_output_ms_per_step={:.3}",
                 timing_per_step(result.timing_cuda_backward_output_ms, result.timing_steps)
             );
@@ -616,6 +661,26 @@ fn main() {
             if let Some(ok) = result.artifact_budget_ok {
                 println!("artifact_budget_ok={ok}");
             }
+            println!(
+                "f32_to_bf16_bridge_launches={}",
+                result.f32_to_bf16_bridge_launches
+            );
+            println!(
+                "bf16_to_f32_bridge_launches={}",
+                result.bf16_to_f32_bridge_launches
+            );
+            println!(
+                "backward_nccl_bucket_overlap_windows={}",
+                result.backward_nccl_bucket_overlap_windows
+            );
+            println!(
+                "backward_nccl_bucket_overlap_confirmed={}",
+                result.backward_nccl_bucket_overlap_confirmed
+            );
+            println!(
+                "backward_nccl_bucket_overlap_max_window_ms={:.6}",
+                result.backward_nccl_bucket_overlap_max_window_ms
+            );
             if let Some(bpb) = result.proxy_bpb {
                 println!("proxy_bpb={bpb:.6}");
             }
@@ -944,6 +1009,12 @@ fn print_usage() {
         "               [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]"
     );
     eprintln!("               [--prune-keep-ratio f]");
+    eprintln!(
+        "               [--enable-recurrent-boundary-fusion|--disable-recurrent-boundary-fusion]"
+    );
+    eprintln!(
+        "               [--runtime-nccl-overlap-mode off|bucketed_measured] [--enable-backward-nccl-bucket-overlap|--disable-backward-nccl-bucket-overlap]"
+    );
     eprintln!("               [--fast-bank-updates] [--allow-unsupported-variants]");
     eprintln!("               record requires --backend cuda-distributed and real --train-data");
     eprintln!("  pg-train sweep [--mode smoke|proxy|record-shaped-proxy]");
@@ -964,6 +1035,12 @@ fn print_usage() {
         "                 [--quant-scheme gptq_lite_int6|mixed_int5_int6|aggressive|tight_int7_int4]"
     );
     eprintln!("                 [--prune-keep-ratio f]");
+    eprintln!(
+        "                 [--enable-recurrent-boundary-fusion|--disable-recurrent-boundary-fusion]"
+    );
+    eprintln!(
+        "                 [--runtime-nccl-overlap-mode off|bucketed_measured] [--enable-backward-nccl-bucket-overlap|--disable-backward-nccl-bucket-overlap]"
+    );
     eprintln!("                 [--fast-bank-updates] [--allow-unsupported-variants]");
     eprintln!("  env: PG_SUBMISSION_CODE_BYTES overrides executable-size budget accounting");
 }
@@ -1021,6 +1098,14 @@ fn parse_quant_scheme(raw: &str) -> Option<QuantScheme> {
         "mixed_int5_int6" => Some(QuantScheme::MixedInt5Int6),
         "aggressive" => Some(QuantScheme::Aggressive),
         "tight_int7_int4" => Some(QuantScheme::TightInt7Int4),
+        _ => None,
+    }
+}
+
+fn parse_nccl_overlap_mode(raw: &str) -> Option<NcclOverlapMode> {
+    match raw {
+        "off" => Some(NcclOverlapMode::Off),
+        "bucketed_measured" | "bucketed-measured" => Some(NcclOverlapMode::BucketedMeasured),
         _ => None,
     }
 }

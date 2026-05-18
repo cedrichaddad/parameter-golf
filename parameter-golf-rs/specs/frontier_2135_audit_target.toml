@@ -45,6 +45,8 @@ enabled = true
 start_layer = 3
 repeat_layers = 3
 enable_at_frac = 0.35
+# Keep the explicit step gate in the copied Modal spec; wall-clock gating makes
+# throughput probes activate recurrence too early when the graph path slows down.
 enable_at_step = 1748
 
 [model.parallel_residual]
@@ -179,6 +181,7 @@ precompute_inside_eval_timer = true
 record_profile = "frontier2135_audit"
 backward_chain_profile = "bf16_direct_compact"
 recurrent_backward_profile = "full"
+recurrent_fused_pass_boundary_backward = true
 recurrence_active_required = true
 recurrent_active_steps_min = 2000
 require_device_batch = true
@@ -186,7 +189,9 @@ token_ring_full_schedule = true
 cuda_graph_profile = "record_step_no_loss"
 nccl_overlap_mode = "off"
 bigram_embedding_merge = false
-combined_qkv_rope_tail_backward = false
+combined_qkv_rope_tail_backward = true
+qkv_norm_resid_reducer_profile = "direct_compact"
+qkv_norm_resid_rows_per_chunk = 1024
 graph_side_gemm_capture = false
 sharded_muon_local_graph = true
 sharded_muon_pre_norm_graph = true

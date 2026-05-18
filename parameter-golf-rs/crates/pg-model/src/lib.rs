@@ -14,8 +14,8 @@ pub use plan::ExecutionPlan;
 pub use spec::{
     AsymLogitSpec, AttentionBackend, AttnOutGateSpec, BackwardChainProfile, CompressionMode,
     CudaGraphProfile, DistributedOptimizerBackend, EvalAdaptationBackend, EvalSpec,
-    ModelComputePrecision, ModelSpec, NcclOverlapMode, NgramTiltSpec, OutputCeBackend, QuantScheme,
-    QuantSpec, RecordProfile, RecurrentBackwardProfile, RunMode, RunSpec, RuntimeSpec,
-    ShortDocScoreFirstEntry, TrainBackend, TrainSeqScheduleEntry, TrainSpec, TttMask,
-    VariantFamily,
+    ModelComputePrecision, ModelSpec, NcclOverlapMode, NgramTiltSpec, OutputCeBackend,
+    QkvNormResidReducerProfile, QuantScheme, QuantSpec, RecordProfile, RecurrentBackwardProfile,
+    RunMode, RunSpec, RuntimeSpec, ShortDocScoreFirstEntry, TrainBackend, TrainSeqScheduleEntry,
+    TrainSpec, TttMask, VariantFamily,
 };

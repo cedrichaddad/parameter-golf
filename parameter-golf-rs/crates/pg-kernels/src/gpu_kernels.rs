@@ -7,7 +7,10 @@ use pg_core::error::{PgError, PgResult};
 ///
 /// All kernels operate on f32 data with f32 arithmetic internally.
 /// Grid/block dimensions are set for H100 (132 SMs, 1024 threads/block).
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Compiled GPU kernel module — initialized once, reused for all launches.
 #[repr(transparent)]
@@ -18,6 +21,7 @@ unsafe impl cudarc::driver::DeviceRepr for CudaPtr {}
 pub struct GpuKernels {
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
+    bridge_launch_counts: Arc<GpuBridgeLaunchCounters>,
     // Element-wise kernels
     rms_norm_fwd: CudaFunction,
     rms_norm_fwd_bf16: CudaFunction,
@@ -32,6 +36,8 @@ pub struct GpuKernels {
     rms_norm_bwd_residual_mix_go_bf16_add_compact: CudaFunction,
     rms_norm_bwd_residual_mix_go_bf16_add_no_mix_grad: CudaFunction,
     rms_norm_bwd_residual_mix_go_bf16_add_compact_no_mix_grad: CudaFunction,
+    recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact: CudaFunction,
+    recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact: CudaFunction,
     residual_mix_grad_reduce_from_stats_go_bf16_add: CudaFunction,
     residual_mix_grad_reduce_from_stats_go_bf16_add_compact: CudaFunction,
     rms_norm_bwd_residual_mix_go_bf16_chunked: CudaFunction,
@@ -81,6 +87,7 @@ pub struct GpuKernels {
     residual_add_scale_bwd_from_bf16_only_chunked_tiled_stage1: CudaFunction,
     residual_add_scale_bwd_bf16_only_chunked_tiled_stage1: CudaFunction,
     residual_add_scale_bwd_from_bf16_only_chunked_tiled_stage1_add: CudaFunction,
+    residual_add_scale_grad_scale_reduce_bf16_chunked_stage1: CudaFunction,
     residual_add_scale_grad_scale_reduce_chunks: CudaFunction,
     smear_gate_fwd: CudaFunction,
     smear_gate_fwd_boundary: CudaFunction,
@@ -90,6 +97,8 @@ pub struct GpuKernels {
     shifted_u16_ring_to_u32: CudaFunction,
     embedding_gather: CudaFunction,
     embedding_bigram_project_merge: CudaFunction,
+    embedding_bigram_project_merge_bwd_proj_scale: CudaFunction,
+    embedding_bigram_project_merge_bwd_embed: CudaFunction,
     embedding_gather_bwd: CudaFunction,
     qk_norm_fwd: CudaFunction,
     qk_norm_bwd: CudaFunction,
@@ -190,6 +199,18 @@ pub struct GpuKernels {
     decay_sgd_step_bf16_shadow_hyper: CudaFunction,
     adamw_step: CudaFunction,
     adamw_step_bf16_shadow: CudaFunction,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuBridgeLaunchCounts {
+    pub f32_to_bf16: usize,
+    pub bf16_to_f32: usize,
+}
+
+#[derive(Debug, Default)]
+struct GpuBridgeLaunchCounters {
+    f32_to_bf16: AtomicUsize,
+    bf16_to_f32: AtomicUsize,
 }
 
 /// CUDA C source for all element-wise kernels.
@@ -1846,6 +1867,210 @@ extern "C" __global__ void rms_norm_backward_accum_residual_mix_backward_go_bf16
         grad_x0[idx] += go * mix_x0;
         atomicAdd(&grad_mix[i], go * residual_x[idx]);
         atomicAdd(&grad_mix[dim + i], go * residual_x0[idx]);
+    }
+}
+
+// Exact recurrent boundary fusion for y = block(block(x)) with tied weights.
+// This fuses the final pass-2 QKV/norm/residual tail with the first pass-1 MLP
+// residual backward stage. The pass-1 block backward still runs normally after
+// this point, but it can skip its first elementwise residual stage because
+// grad_mid and pass1_grad_mlp_out_bf16 are already materialized. The pass-1
+// block reuses grad_mid in place as grad_x_after_attn, avoiding a duplicate
+// full-tensor write at the recurrent pass boundary.
+// The pass-1 scale gradient is intentionally reduced by the normal per-feature
+// BF16 reducer after this kernel; doing one atomic per token-feature here was
+// substantially more expensive than the residual path this fusion replaces.
+extern "C" __global__ void recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact(
+    const float* __restrict__ x_norm,
+    const unsigned short* __restrict__ grad_norm_bf16,
+    const float* __restrict__ grad_norm_extra_compact,
+    const float* __restrict__ residual_x,
+    const float* __restrict__ residual_x0,
+    const float* __restrict__ mix,
+    const float* __restrict__ base_grad,
+    float* __restrict__ grad_mid,
+    float* __restrict__ grad_x0,
+    float* __restrict__ grad_mix,
+    const unsigned short* __restrict__ pass1_mlp_out_bf16,
+    const float* __restrict__ pass1_mlp_scale,
+    unsigned short* __restrict__ pass1_grad_mlp_out_bf16,
+    int dim,
+    int extra_width,
+    float ln_scale_factor,
+    float eps,
+    float beta,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x_norm + row * dim;
+    const unsigned short* go_row = grad_norm_bf16 + row * dim;
+    const float* extra_row = grad_norm_extra_compact + row * extra_width;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = x_row[i];
+        float extra = (i < extra_width) ? extra_row[i] : 0.0f;
+        float go = pg_bf16_to_f32(go_row[i]) + extra;
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float shared_sum[32];
+    __shared__ float shared_dot[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_sum[warp_id] = sum_sq;
+        shared_dot[warp_id] = x_dot_go;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        x_dot_go = (threadIdx.x < warps) ? shared_dot[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+            x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        }
+    }
+
+    __shared__ float inv_rms_shared;
+    __shared__ float coeff_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+        coeff_shared = x_dot_go / (rms * rms * (float)dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_shared;
+    float coeff = coeff_shared;
+    int base = row * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        int idx = base + i;
+        float extra = (i < extra_width) ? extra_row[i] : 0.0f;
+        float go_norm = pg_bf16_to_f32(go_row[i]) + extra;
+        float norm_dx = inv_rms * (go_norm - x_norm[idx] * coeff);
+        float go = beta * base_grad[idx] + norm_dx;
+        float mix_x = mix[i];
+        float mix_x0 = mix[dim + i];
+        float pass1_go = go * mix_x;
+
+        grad_mid[idx] = pass1_go;
+        grad_x0[idx] += go * mix_x0;
+        atomicAdd(&grad_mix[i], go * residual_x[idx]);
+        atomicAdd(&grad_mix[dim + i], go * residual_x0[idx]);
+
+        pass1_grad_mlp_out_bf16[idx] = pg_f32_to_bf16(pass1_go * pass1_mlp_scale[i]);
+    }
+}
+
+extern "C" __global__ void recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact(
+    const float* __restrict__ x_norm,
+    const unsigned short* __restrict__ grad_norm_bf16,
+    const float* __restrict__ grad_norm_extra_compact,
+    const float* __restrict__ residual_x,
+    const float* __restrict__ residual_x0,
+    const float* __restrict__ mix,
+    const float* __restrict__ base_grad,
+    float* __restrict__ grad_mid,
+    float* __restrict__ grad_x0,
+    float* __restrict__ grad_mix_chunks,
+    const unsigned short* __restrict__ pass1_mlp_out_bf16,
+    const float* __restrict__ pass1_mlp_scale,
+    unsigned short* __restrict__ pass1_grad_mlp_out_bf16,
+    int dim,
+    int extra_width,
+    int num_chunks,
+    int chunk_rows,
+    float ln_scale_factor,
+    float eps,
+    float beta,
+    int n
+) {
+    int row = blockIdx.x;
+    int num_rows = n / dim;
+    if (row >= num_rows) return;
+
+    const float* x_row = x_norm + row * dim;
+    const unsigned short* go_row = grad_norm_bf16 + row * dim;
+    const float* extra_row = grad_norm_extra_compact + row * extra_width;
+
+    float sum_sq = 0.0f;
+    float x_dot_go = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float xv = x_row[i];
+        float extra = (i < extra_width) ? extra_row[i] : 0.0f;
+        float go = pg_bf16_to_f32(go_row[i]) + extra;
+        sum_sq += xv * xv;
+        x_dot_go += xv * go;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+    }
+
+    __shared__ float shared_sum[32];
+    __shared__ float shared_dot[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    if (lane == 0) {
+        shared_sum[warp_id] = sum_sq;
+        shared_dot[warp_id] = x_dot_go;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 32) {
+        int warps = (blockDim.x + 31) / 32;
+        sum_sq = (threadIdx.x < warps) ? shared_sum[threadIdx.x] : 0.0f;
+        x_dot_go = (threadIdx.x < warps) ? shared_dot[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+            x_dot_go += __shfl_down_sync(0xffffffff, x_dot_go, offset);
+        }
+    }
+
+    __shared__ float inv_rms_shared;
+    __shared__ float coeff_shared;
+    if (threadIdx.x == 0) {
+        float rms = sqrtf(sum_sq / (float)dim + eps);
+        inv_rms_shared = ln_scale_factor / rms;
+        coeff_shared = x_dot_go / (rms * rms * (float)dim);
+    }
+    __syncthreads();
+
+    float inv_rms = inv_rms_shared;
+    float coeff = coeff_shared;
+    int base = row * dim;
+    int chunk = row / chunk_rows;
+    if (chunk >= num_chunks) chunk = num_chunks - 1;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        int idx = base + i;
+        float extra = (i < extra_width) ? extra_row[i] : 0.0f;
+        float go_norm = pg_bf16_to_f32(go_row[i]) + extra;
+        float norm_dx = inv_rms * (go_norm - x_norm[idx] * coeff);
+        float go = beta * base_grad[idx] + norm_dx;
+        float mix_x = mix[i];
+        float mix_x0 = mix[dim + i];
+        float pass1_go = go * mix_x;
+
+        grad_mid[idx] = pass1_go;
+        grad_x0[idx] += go * mix_x0;
+        atomicAdd(&grad_mix_chunks[i * num_chunks + chunk], go * residual_x[idx]);
+        atomicAdd(&grad_mix_chunks[(dim + i) * num_chunks + chunk], go * residual_x0[idx]);
+
+        pass1_grad_mlp_out_bf16[idx] = pg_f32_to_bf16(pass1_go * pass1_mlp_scale[i]);
     }
 }
 
@@ -3671,6 +3896,41 @@ extern "C" __global__ void residual_add_scale_backward_from_bf16_only_chunked_st
     }
 }
 
+extern "C" __global__ void residual_add_scale_grad_scale_reduce_bf16_chunked_stage1(
+    const unsigned short* __restrict__ proj_bf16,
+    const float* __restrict__ grad_output,
+    float* __restrict__ partial,
+    int dim,
+    int rows,
+    int rows_per_chunk
+) {
+    extern __shared__ float sums[];
+    int tid = threadIdx.x;
+    int chunk = blockIdx.x;
+    if (dim > 1024) return;
+
+    for (int d = tid; d < dim; d += blockDim.x) {
+        sums[d] = 0.0f;
+    }
+    __syncthreads();
+
+    int row_start = chunk * rows_per_chunk;
+    if (row_start >= rows) return;
+    int row_end = min(rows, row_start + rows_per_chunk);
+    int elems = (row_end - row_start) * dim;
+    for (int linear = tid; linear < elems; linear += blockDim.x) {
+        int local_row = linear / dim;
+        int d = linear - local_row * dim;
+        int idx = (row_start + local_row) * dim + d;
+        atomicAdd(&sums[d], grad_output[idx] * pg_bf16_to_f32(proj_bf16[idx]));
+    }
+    __syncthreads();
+
+    for (int d = tid; d < dim; d += blockDim.x) {
+        partial[chunk * dim + d] = sums[d];
+    }
+}
+
 extern "C" __global__ void residual_add_scale_backward_bf16_only_chunked_stage1(
     const float* __restrict__ proj,
     const float* __restrict__ grad_output,
@@ -4121,6 +4381,94 @@ extern "C" __global__ void embedding_bigram_project_merge(
         acc += be[k] * bp[k];
     }
     out[idx] = tok_emb[tok * model_dim + j] + bigram_scale[0] * acc;
+}
+
+// Backward for embedding_bigram_project_merge, part 1:
+//   grad_tok_emb[id[t], j] += grad_out[t, j]
+//   grad_bigram_scale += grad_out[t, j] * dot(E[bucket], P[j, :])
+//   grad_bigram_proj[j, k] += bigram_scale * grad_out[t, j] * E[bucket, k]
+extern "C" __global__ void embedding_bigram_project_merge_backward_proj_scale(
+    const int* __restrict__ ids,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ bigram_embed,
+    const float* __restrict__ bigram_proj,
+    const float* __restrict__ bigram_scale,
+    float* __restrict__ grad_tok_emb,
+    float* __restrict__ grad_bigram_proj,
+    float* __restrict__ grad_bigram_scale,
+    int model_dim,
+    int bigram_dim,
+    int bigram_vocab,
+    int tokens,
+    int seq_len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * model_dim;
+    if (idx >= total) return;
+
+    int t = idx / model_dim;
+    int j = idx - t * model_dim;
+    int tok = ids[t];
+    int bucket;
+    if (t % seq_len == 0) {
+        bucket = bigram_vocab - 1;
+    } else {
+        unsigned int curr = (unsigned int)ids[t];
+        unsigned int prev = (unsigned int)ids[t - 1];
+        unsigned int h = (curr * 36313u) ^ (prev * 27191u);
+        bucket = (int)(h % (unsigned int)(bigram_vocab - 1));
+    }
+
+    float go = grad_out[idx];
+    atomicAdd(&grad_tok_emb[tok * model_dim + j], go);
+
+    const float* be = bigram_embed + bucket * bigram_dim;
+    const float* bp = bigram_proj + j * bigram_dim;
+    float acc = 0.0f;
+    float scale = bigram_scale[0];
+    for (int k = 0; k < bigram_dim; ++k) {
+        float e = be[k];
+        acc += e * bp[k];
+        atomicAdd(&grad_bigram_proj[j * bigram_dim + k], scale * go * e);
+    }
+    atomicAdd(grad_bigram_scale, go * acc);
+}
+
+// Backward for embedding_bigram_project_merge, part 2:
+//   grad_bigram_embed[bucket, k] += bigram_scale * sum_j grad_out[t, j] * P[j, k]
+extern "C" __global__ void embedding_bigram_project_merge_backward_embed(
+    const int* __restrict__ ids,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ bigram_proj,
+    const float* __restrict__ bigram_scale,
+    float* __restrict__ grad_bigram_embed,
+    int model_dim,
+    int bigram_dim,
+    int bigram_vocab,
+    int tokens,
+    int seq_len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * bigram_dim;
+    if (idx >= total) return;
+
+    int t = idx / bigram_dim;
+    int k = idx - t * bigram_dim;
+    int bucket;
+    if (t % seq_len == 0) {
+        bucket = bigram_vocab - 1;
+    } else {
+        unsigned int curr = (unsigned int)ids[t];
+        unsigned int prev = (unsigned int)ids[t - 1];
+        unsigned int h = (curr * 36313u) ^ (prev * 27191u);
+        bucket = (int)(h % (unsigned int)(bigram_vocab - 1));
+    }
+
+    float acc = 0.0f;
+    for (int j = 0; j < model_dim; ++j) {
+        acc += grad_out[t * model_dim + j] * bigram_proj[j * bigram_dim + k];
+    }
+    atomicAdd(&grad_bigram_embed[bucket * bigram_dim + k], bigram_scale[0] * acc);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -8835,6 +9183,7 @@ impl GpuKernels {
         Ok(Self {
             stream,
             _module: module.clone(),
+            bridge_launch_counts: Arc::new(GpuBridgeLaunchCounters::default()),
             rms_norm_fwd: module
                 .load_function("rms_norm_forward")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -8867,6 +9216,12 @@ impl GpuKernels {
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             rms_norm_bwd_residual_mix_go_bf16_add_compact: module
                 .load_function("rms_norm_backward_accum_residual_mix_backward_go_bf16_add_compact")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact: module
+                .load_function("recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact: module
+                .load_function("recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             rms_norm_bwd_residual_mix_go_bf16_add_no_mix_grad: module
                 .load_function(
@@ -9031,6 +9386,9 @@ impl GpuKernels {
                     "residual_add_scale_backward_from_bf16_only_chunked_tiled_stage1_add",
                 )
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            residual_add_scale_grad_scale_reduce_bf16_chunked_stage1: module
+                .load_function("residual_add_scale_grad_scale_reduce_bf16_chunked_stage1")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             residual_add_scale_grad_scale_reduce_chunks: module
                 .load_function("residual_add_scale_grad_scale_reduce_chunks")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
@@ -9057,6 +9415,12 @@ impl GpuKernels {
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             embedding_bigram_project_merge: module
                 .load_function("embedding_bigram_project_merge")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            embedding_bigram_project_merge_bwd_proj_scale: module
+                .load_function("embedding_bigram_project_merge_backward_proj_scale")
+                .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
+            embedding_bigram_project_merge_bwd_embed: module
+                .load_function("embedding_bigram_project_merge_backward_embed")
                 .map_err(|e| PgError::InvalidOp(format!("Failed to load kernel {}", e)))?,
             embedding_gather_bwd: module
                 .load_function("embedding_gather_backward")
@@ -10044,6 +10408,9 @@ impl GpuKernels {
         if n == 0 {
             return Ok(());
         }
+        self.bridge_launch_counts
+            .f32_to_bf16
+            .fetch_add(1, Ordering::Relaxed);
         let block = 256u32;
         let grid = (n + block - 1) / block;
         unsafe {
@@ -10066,6 +10433,9 @@ impl GpuKernels {
         if n == 0 {
             return Ok(());
         }
+        self.bridge_launch_counts
+            .bf16_to_f32
+            .fetch_add(1, Ordering::Relaxed);
         let block = 256u32;
         let grid = (n + block - 1) / block;
         unsafe {
@@ -10082,6 +10452,19 @@ impl GpuKernels {
                 .map_err(|e| PgError::InvalidOp(format!("bf16_to_f32 failed: {:?}", e)))?;
         }
         Ok(())
+    }
+
+    pub fn bridge_launch_counts(&self) -> GpuBridgeLaunchCounts {
+        GpuBridgeLaunchCounts {
+            f32_to_bf16: self
+                .bridge_launch_counts
+                .f32_to_bf16
+                .load(Ordering::Relaxed),
+            bf16_to_f32: self
+                .bridge_launch_counts
+                .bf16_to_f32
+                .load(Ordering::Relaxed),
+        }
     }
 
     pub fn normalize_matrices(
@@ -10439,6 +10822,165 @@ impl GpuKernels {
                 .map_err(|e| {
                     PgError::InvalidOp(format!(
                         "rms_norm_bwd_residual_mix_go_bf16_add_compact launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact(
+        &self,
+        x_norm: CudaPtr,
+        grad_norm_bf16: CudaPtr,
+        grad_norm_extra_compact: CudaPtr,
+        residual_x: CudaPtr,
+        residual_x0: CudaPtr,
+        mix: CudaPtr,
+        base_grad: CudaPtr,
+        grad_mid: CudaPtr,
+        grad_x0: CudaPtr,
+        grad_mix: CudaPtr,
+        pass1_mlp_out_bf16: CudaPtr,
+        pass1_mlp_scale: CudaPtr,
+        pass1_grad_mlp_out_bf16: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        extra_width: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        beta: f32,
+    ) -> PgResult<()> {
+        if extra_width == 0 || extra_width > dim {
+            return Err(PgError::InvalidOp(format!(
+                "recurrent compact residual-mix extra width {extra_width} must be in 1..={dim}"
+            )));
+        }
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(&self.recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact)
+                .arg(&x_norm)
+                .arg(&grad_norm_bf16)
+                .arg(&grad_norm_extra_compact)
+                .arg(&residual_x)
+                .arg(&residual_x0)
+                .arg(&mix)
+                .arg(&base_grad)
+                .arg(&grad_mid)
+                .arg(&grad_x0)
+                .arg(&grad_mix)
+                .arg(&pass1_mlp_out_bf16)
+                .arg(&pass1_mlp_scale)
+                .arg(&pass1_grad_mlp_out_bf16)
+                .arg(&(dim as i32))
+                .arg(&(extra_width as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&beta)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_compact launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact(
+        &self,
+        x_norm: CudaPtr,
+        grad_norm_bf16: CudaPtr,
+        grad_norm_extra_compact: CudaPtr,
+        residual_x: CudaPtr,
+        residual_x0: CudaPtr,
+        mix: CudaPtr,
+        base_grad: CudaPtr,
+        grad_mid: CudaPtr,
+        grad_x0: CudaPtr,
+        grad_mix_chunks: CudaPtr,
+        grad_mix: CudaPtr,
+        pass1_mlp_out_bf16: CudaPtr,
+        pass1_mlp_scale: CudaPtr,
+        pass1_grad_mlp_out_bf16: CudaPtr,
+        num_rows: u32,
+        dim: u32,
+        extra_width: u32,
+        num_chunks: u32,
+        chunk_rows: u32,
+        ln_scale_factor: f32,
+        eps: f32,
+        beta: f32,
+    ) -> PgResult<()> {
+        if extra_width == 0 || extra_width > dim {
+            return Err(PgError::InvalidOp(format!(
+                "recurrent compact residual-mix extra width {extra_width} must be in 1..={dim}"
+            )));
+        }
+        let n = num_rows * dim;
+        let block = 32u32.max(256u32.min(dim.next_power_of_two()));
+        unsafe {
+            self.stream
+                .launch_builder(
+                    &self.recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact,
+                )
+                .arg(&x_norm)
+                .arg(&grad_norm_bf16)
+                .arg(&grad_norm_extra_compact)
+                .arg(&residual_x)
+                .arg(&residual_x0)
+                .arg(&mix)
+                .arg(&base_grad)
+                .arg(&grad_mid)
+                .arg(&grad_x0)
+                .arg(&grad_mix_chunks)
+                .arg(&pass1_mlp_out_bf16)
+                .arg(&pass1_mlp_scale)
+                .arg(&pass1_grad_mlp_out_bf16)
+                .arg(&(dim as i32))
+                .arg(&(extra_width as i32))
+                .arg(&(num_chunks as i32))
+                .arg(&(chunk_rows as i32))
+                .arg(&ln_scale_factor)
+                .arg(&eps)
+                .arg(&beta)
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (num_rows, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "recurrent_qkv_tail_mlp_residual_bwd_go_bf16_add_chunked_compact launch: {:?}",
+                        e
+                    ))
+                })?;
+
+            self.stream
+                .launch_builder(&self.residual_mix_grad_reduce_chunks)
+                .arg(&grad_mix_chunks)
+                .arg(&grad_mix)
+                .arg(&((2 * dim) as i32))
+                .arg(&(num_chunks as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (2 * dim, 1, 1).into(),
+                    block_dim: (256, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "recurrent residual_mix_grad_reduce_chunks compact launch: {:?}",
                         e
                     ))
                 })?;
@@ -12538,6 +13080,100 @@ impl GpuKernels {
         Ok(())
     }
 
+    pub fn residual_add_scale_grad_scale_reduce_bf16_only(
+        &self,
+        proj_bf16: CudaPtr,
+        grad_output: CudaPtr,
+        grad_scale: CudaPtr,
+        dim: u32,
+        n: u32,
+    ) -> PgResult<()> {
+        let block = 256u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_grad_scale_reduce_bf16)
+                .arg(&proj_bf16)
+                .arg(&grad_output)
+                .arg(&grad_scale)
+                .arg(&(dim as i32))
+                .arg(&(n as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (dim, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_grad_scale_reduce_bf16_only launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn residual_add_scale_grad_scale_reduce_bf16_only_chunked(
+        &self,
+        proj_bf16: CudaPtr,
+        grad_output: CudaPtr,
+        partial: CudaPtr,
+        grad_scale: CudaPtr,
+        dim: u32,
+        n: u32,
+        rows_per_chunk: u32,
+    ) -> PgResult<()> {
+        if dim == 0 || n == 0 {
+            return Ok(());
+        }
+        if dim > 1024 {
+            return Err(PgError::InvalidOp(format!(
+                "chunked residual scale reduce supports dim <= 1024, got {dim}"
+            )));
+        }
+        let rows = n / dim;
+        let chunks = rows.div_ceil(rows_per_chunk.max(1));
+        let block = 256u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.residual_add_scale_grad_scale_reduce_bf16_chunked_stage1)
+                .arg(&proj_bf16)
+                .arg(&grad_output)
+                .arg(&partial)
+                .arg(&(dim as i32))
+                .arg(&(rows as i32))
+                .arg(&(rows_per_chunk as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (chunks, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: dim * std::mem::size_of::<f32>() as u32,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_grad_scale_reduce_bf16_only_chunked stage1 launch: {:?}",
+                        e
+                    ))
+                })?;
+            self.stream
+                .launch_builder(&self.residual_add_scale_grad_scale_reduce_chunks)
+                .arg(&partial)
+                .arg(&grad_scale)
+                .arg(&(dim as i32))
+                .arg(&(chunks as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: (dim, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "residual_add_scale_grad_scale_reduce_bf16_only_chunked reduce launch: {:?}",
+                        e
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn residual_add_scale_bwd_from_bf16_only_chunked(
         &self,
@@ -13119,6 +13755,90 @@ impl GpuKernels {
                 })
                 .map_err(|e| {
                     PgError::InvalidOp(format!("embedding_bigram_project_merge launch: {:?}", e))
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn embedding_bigram_project_merge_bwd(
+        &self,
+        ids: CudaPtr,
+        grad_out: CudaPtr,
+        bigram_embed: CudaPtr,
+        bigram_proj: CudaPtr,
+        bigram_scale: CudaPtr,
+        grad_tok_emb: CudaPtr,
+        grad_bigram_embed: CudaPtr,
+        grad_bigram_proj: CudaPtr,
+        grad_bigram_scale: CudaPtr,
+        model_dim: u32,
+        bigram_dim: u32,
+        bigram_vocab: u32,
+        tokens: u32,
+        seq_len: u32,
+    ) -> PgResult<()> {
+        if bigram_vocab < 2 {
+            return Err(PgError::InvalidOp(
+                "embedding_bigram_project_merge_bwd requires at least 2 bigram buckets".into(),
+            ));
+        }
+        let proj_n = tokens.checked_mul(model_dim).ok_or_else(|| {
+            PgError::InvalidOp("embedding_bigram_project_merge_bwd proj overflow".into())
+        })?;
+        let embed_n = tokens.checked_mul(bigram_dim).ok_or_else(|| {
+            PgError::InvalidOp("embedding_bigram_project_merge_bwd embed overflow".into())
+        })?;
+        let block = 256u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.embedding_bigram_project_merge_bwd_proj_scale)
+                .arg(&ids)
+                .arg(&grad_out)
+                .arg(&bigram_embed)
+                .arg(&bigram_proj)
+                .arg(&bigram_scale)
+                .arg(&grad_tok_emb)
+                .arg(&grad_bigram_proj)
+                .arg(&grad_bigram_scale)
+                .arg(&(model_dim as i32))
+                .arg(&(bigram_dim as i32))
+                .arg(&(bigram_vocab as i32))
+                .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: ((proj_n + block - 1) / block, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "embedding_bigram_project_merge_bwd_proj_scale launch: {:?}",
+                        e
+                    ))
+                })?;
+            self.stream
+                .launch_builder(&self.embedding_bigram_project_merge_bwd_embed)
+                .arg(&ids)
+                .arg(&grad_out)
+                .arg(&bigram_proj)
+                .arg(&bigram_scale)
+                .arg(&grad_bigram_embed)
+                .arg(&(model_dim as i32))
+                .arg(&(bigram_dim as i32))
+                .arg(&(bigram_vocab as i32))
+                .arg(&(tokens as i32))
+                .arg(&(seq_len as i32))
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: ((embed_n + block - 1) / block, 1, 1).into(),
+                    block_dim: (block, 1, 1).into(),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| {
+                    PgError::InvalidOp(format!(
+                        "embedding_bigram_project_merge_bwd_embed launch: {:?}",
+                        e
+                    ))
                 })?;
         }
         Ok(())

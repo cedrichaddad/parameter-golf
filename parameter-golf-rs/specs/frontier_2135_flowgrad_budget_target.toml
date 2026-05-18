@@ -180,6 +180,7 @@ precompute_inside_eval_timer = true
 record_profile = "frontier2135_speed_probe"
 backward_chain_profile = "bf16_direct_compact"
 recurrent_backward_profile = "full"
+recurrent_fused_pass_boundary_backward = true
 recurrent_straight_through_layers = 0
 skip_recurrent_bank_grads = true
 skip_recurrent_pass1_bank_grads = true

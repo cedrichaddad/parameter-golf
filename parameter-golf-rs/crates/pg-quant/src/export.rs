@@ -653,13 +653,24 @@ fn metadata_json(
     let n = c.num_layers;
     let d = c.model_dim;
     let mlp = c.mlp_dim;
+    let layout_manifest = crate::layout::compile_quant_layout_manifest(quant_spec, Some(c)).ok();
+    let layout_manifest_json = layout_manifest
+        .as_ref()
+        .map(|manifest| manifest.metadata_json())
+        .unwrap_or_else(|| "null".to_string());
+    let layout_manifest_crc32 = layout_manifest
+        .as_ref()
+        .map(|manifest| format!(r#""{}""#, manifest.fingerprint_crc32))
+        .unwrap_or_else(|| "null".to_string());
     let prune = quant_spec
         .prune_keep_ratio
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","scheme":"{:?}","compression":"{:?}","matrix_bits":{},"mlp_bits":{},"embed_bits":{},"attn_gate_bits":{},"mlp_clip_sigmas":{},"attn_clip_sigmas":{},"embed_clip_sigmas":{},"gptq_calibration_batches":{},"prune_keep_ratio":{},"lqer_enabled":{},"lqer_rank":{},"lqer_top_k":{},"lqer_a_bits":{},"lqer_b_bits":{},"lqer_group_size":{},"lqer_asymmetric":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"sparse_attn_gate_enabled":{},"sparse_attn_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
+        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","quant_layout_manifest_crc32":{},"quant_layout_manifest":{},"scheme":"{:?}","compression":"{:?}","matrix_bits":{},"mlp_bits":{},"embed_bits":{},"attn_gate_bits":{},"mlp_clip_sigmas":{},"attn_clip_sigmas":{},"embed_clip_sigmas":{},"gptq_calibration_batches":{},"prune_keep_ratio":{},"lqer_enabled":{},"lqer_rank":{},"lqer_top_k":{},"lqer_a_bits":{},"lqer_b_bits":{},"lqer_group_size":{},"lqer_asymmetric":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"sparse_attn_gate_enabled":{},"sparse_attn_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
         variant_fingerprint,
+        layout_manifest_crc32,
+        layout_manifest_json,
         quant_spec.scheme,
         quant_spec.compression,
         quant_spec.matrix_bits,

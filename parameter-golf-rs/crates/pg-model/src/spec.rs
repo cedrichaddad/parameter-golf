@@ -160,6 +160,15 @@ pub enum BackwardChainProfile {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum QkvNormResidReducerProfile {
+    #[default]
+    DirectCompact,
+    SplitCompact,
+    ChunkedCompact,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum CudaGraphProfile {
     #[default]
     Off,
@@ -516,6 +525,7 @@ pub struct RuntimeSpec {
     pub backward_chain_profile: BackwardChainProfile,
     pub recurrent_backward_profile: RecurrentBackwardProfile,
     pub recurrent_straight_through_layers: usize,
+    pub recurrent_fused_pass_boundary_backward: bool,
     pub skip_recurrent_bank_grads: bool,
     pub skip_recurrent_pass1_bank_grads: bool,
     pub recurrence_active_required: bool,
@@ -526,10 +536,13 @@ pub struct RuntimeSpec {
     pub nccl_overlap_mode: NcclOverlapMode,
     pub bigram_embedding_merge: bool,
     pub combined_qkv_rope_tail_backward: bool,
+    pub qkv_norm_resid_reducer_profile: QkvNormResidReducerProfile,
+    pub qkv_norm_resid_rows_per_chunk: usize,
     pub graph_side_gemm_capture: bool,
     pub sharded_muon_local_graph: bool,
     pub sharded_muon_pre_norm_graph: bool,
     pub sharded_muon_fused_global_clip: bool,
+    pub sharded_muon_parallel_local: bool,
     pub sharded_muon_bf16_shadow_all_gather: bool,
     pub timing_skip_steps: Option<usize>,
     pub max_ms_per_step: Option<f64>,
@@ -542,6 +555,7 @@ impl Default for RuntimeSpec {
             backward_chain_profile: BackwardChainProfile::Off,
             recurrent_backward_profile: RecurrentBackwardProfile::Full,
             recurrent_straight_through_layers: 0,
+            recurrent_fused_pass_boundary_backward: false,
             skip_recurrent_bank_grads: false,
             skip_recurrent_pass1_bank_grads: false,
             recurrence_active_required: false,
@@ -552,10 +566,13 @@ impl Default for RuntimeSpec {
             nccl_overlap_mode: NcclOverlapMode::Off,
             bigram_embedding_merge: false,
             combined_qkv_rope_tail_backward: false,
+            qkv_norm_resid_reducer_profile: QkvNormResidReducerProfile::DirectCompact,
+            qkv_norm_resid_rows_per_chunk: 1024,
             graph_side_gemm_capture: false,
             sharded_muon_local_graph: false,
             sharded_muon_pre_norm_graph: false,
             sharded_muon_fused_global_clip: false,
+            sharded_muon_parallel_local: false,
             sharded_muon_bf16_shadow_all_gather: false,
             timing_skip_steps: None,
             max_ms_per_step: None,
