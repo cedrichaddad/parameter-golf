@@ -56,8 +56,6 @@ WORKDIR /build
 # can compile pg-train after startup. This intentionally trades image size for
 # reliable validation.
 FROM builder
-
-COPY specs /specs
 # Data directory mount point
 # VOLUME /data removed since Modal handles volumes via @app.function(volumes={...})
 

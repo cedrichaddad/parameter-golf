@@ -1189,7 +1189,8 @@ impl GpuRuntimeProfile {
             combined_qkv_rope_tail_backward: runtime.combined_qkv_rope_tail_backward,
             qkv_norm_resid_reducer_profile: runtime.qkv_norm_resid_reducer_profile,
             qkv_norm_resid_rows_per_chunk: runtime.qkv_norm_resid_rows_per_chunk.max(256),
-            graph_side_gemm_capture: runtime.graph_side_gemm_capture,
+            graph_side_gemm_capture: runtime.graph_side_gemm_capture
+                || gpu_env_enabled("PG_GPU_GRAPH_SIDE_GEMM_CAPTURE", false),
         }
     }
 
@@ -3032,8 +3033,6 @@ impl GpuModel {
         self.compute_precision == ModelComputePrecision::Bf16TensorCore
             && self.use_bf16_output_gemm()
             && self.use_bf16_output_backward_gemm()
-            && !self.use_tiled_output_ce()
-            && !self.use_chunked_bf16_output_ce_cache()
             && !matches!(
                 std::env::var("PG_GPU_BF16_LOGITS")
                     .unwrap_or_else(|_| "0".to_string())

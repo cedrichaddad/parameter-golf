@@ -32,13 +32,16 @@ fn scored_validation_targets_for_seq_len(raw_tokens: usize, seq_len: usize) -> u
     raw_tokens.saturating_sub(1) / seq_len * seq_len
 }
 
-fn frontier_scored_validation_targets(run_spec: &RunSpec, raw_tokens: usize) -> usize {
-    if matches!(
+fn uses_frontier_2135_scored_caseops(run_spec: &RunSpec) -> bool {
+    matches!(
         run_spec.runtime.record_profile,
-        RecordProfile::Frontier2135Audit
+        RecordProfile::Frontier2135Audit | RecordProfile::Frontier2135SpeedProbe
     ) && run_spec.model.caseops.enabled
         && run_spec.model.caseops.byte_sidecar
-    {
+}
+
+fn frontier_scored_validation_targets(run_spec: &RunSpec, raw_tokens: usize) -> usize {
+    if uses_frontier_2135_scored_caseops(run_spec) {
         scored_validation_targets_for_seq_len(raw_tokens, run_spec.model.eval_seq_len.max(1))
     } else {
         raw_tokens
@@ -364,12 +367,7 @@ fn validation_data_audit(run_spec: &RunSpec) -> ValidationDataAudit {
         data_shard_token_count(&sidecar_paths).ok()
     };
     let sidecar_token_count = raw_sidecar_token_count.map(|raw| {
-        if matches!(
-            run_spec.runtime.record_profile,
-            RecordProfile::Frontier2135Audit
-        ) && run_spec.model.caseops.enabled
-            && run_spec.model.caseops.byte_sidecar
-        {
+        if uses_frontier_2135_scored_caseops(run_spec) {
             token_count.min(raw)
         } else {
             raw
@@ -3065,11 +3063,22 @@ impl VariantRunner {
                 .map(|(model_bytes, code_bytes)| {
                     self.plan.submission_budget_ok(code_bytes, model_bytes)
                 });
-        if mode == RunMode::Record && artifact_budget_ok != Some(true) {
+        if mode == RunMode::Record
+            && !self.run_spec.allow_unsupported_variants
+            && artifact_budget_ok != Some(true)
+        {
             return Err(pg_core::PgError::InvalidOp(format!(
                 "record artifact budget failed: artifact_bytes={artifact_bytes:?} submission_code_bytes={submission_code_bytes:?} submission_total_bytes={submission_total_bytes:?} limit={}",
                 self.plan.quant_layout.target_artifact_bytes
             )));
+        } else if mode == RunMode::Record
+            && self.run_spec.allow_unsupported_variants
+            && artifact_budget_ok != Some(true)
+        {
+            eprintln!(
+                "WARNING: unsupported record diagnostic continues despite artifact budget failure: artifact_bytes={artifact_bytes:?} submission_code_bytes={submission_code_bytes:?} submission_total_bytes={submission_total_bytes:?} limit={}",
+                self.plan.quant_layout.target_artifact_bytes
+            );
         }
         if mode == RunMode::Record
             && (artifact_model_sha256.is_none()
@@ -3232,16 +3241,28 @@ impl VariantRunner {
                         .into(),
                 ));
             };
-            if validation_audit.token_count == 0 || scored_tokens != validation_audit.token_count {
+            if !self.run_spec.allow_unsupported_variants
+                && (validation_audit.token_count == 0
+                    || scored_tokens != validation_audit.token_count)
+            {
                 return Err(pg_core::PgError::InvalidOp(format!(
                     "record mode must score the full validation stream: eval_tokens={scored_tokens} validation_tokens={}",
                     validation_audit.token_count
                 )));
+            } else if self.run_spec.allow_unsupported_variants
+                && validation_audit.token_count != 0
+                && scored_tokens != validation_audit.token_count
+            {
+                eprintln!(
+                    "WARNING: unsupported record diagnostic continues with partial validation scoring: eval_tokens={scored_tokens} validation_tokens={}",
+                    validation_audit.token_count
+                );
             }
             if matches!(
                 self.run_spec.runtime.record_profile,
                 RecordProfile::Frontier2135Audit
-            ) && scored_tokens != FRONTIER_2135_CASEOPS_VAL_TOKENS
+            ) && !self.run_spec.allow_unsupported_variants
+                && scored_tokens != FRONTIER_2135_CASEOPS_VAL_TOKENS
             {
                 return Err(pg_core::PgError::InvalidOp(format!(
                     "frontier_2135_audit record requires canonical CaseOps validation token count 47851520, got {scored_tokens}"
@@ -3257,7 +3278,8 @@ impl VariantRunner {
                 if matches!(
                     self.run_spec.runtime.record_profile,
                     RecordProfile::Frontier2135Audit
-                ) && validation_audit.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS)
+                ) && !self.run_spec.allow_unsupported_variants
+                    && validation_audit.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS)
                 {
                     return Err(pg_core::PgError::InvalidOp(format!(
                         "frontier_2135_audit record requires canonical CaseOps val_docs=50000, got {:?}",
@@ -3268,7 +3290,8 @@ impl VariantRunner {
             if matches!(
                 self.run_spec.runtime.record_profile,
                 RecordProfile::Frontier2135Audit
-            ) {
+            ) && !self.run_spec.allow_unsupported_variants
+            {
                 if validation_audit.train_shard_count != FRONTIER_2135_TRAIN_SHARDS {
                     return Err(pg_core::PgError::InvalidOp(format!(
                         "frontier_2135_audit record requires train_shards=80, got {}",
@@ -6839,6 +6862,9 @@ fn final_frontier_record_ready(
     if mode != RunMode::Record || !frontier_record_gaps(run_spec).is_empty() {
         return false;
     }
+    if !leaderboard_algorithm_gaps(run_spec).is_empty() {
+        return false;
+    }
     if steps_completed < required_steps {
         return false;
     }
@@ -7782,32 +7808,47 @@ fn record_path_audit_json(
         "\"chunked_residual_mix_backward\":{}",
         chunked_residual_mix_backward_enabled_for_audit()
     ));
+    let qkv_norm_resid_reducer = qkv_norm_resid_reducer_for_audit(run_spec);
+    let chunked_qkv_norm_resid_backward = matches!(
+        qkv_norm_resid_reducer,
+        QkvNormResidReducerProfile::ChunkedCompact
+    );
+    let split_qkv_norm_resid_backward = matches!(
+        qkv_norm_resid_reducer,
+        QkvNormResidReducerProfile::SplitCompact
+    );
+    let direct_compact_qkv_norm_resid_backward = matches!(
+        qkv_norm_resid_reducer,
+        QkvNormResidReducerProfile::DirectCompact
+    );
     fields.push(format!(
         "\"chunked_qkv_norm_resid_backward\":{}",
-        chunked_qkv_norm_resid_backward_enabled_for_audit()
+        chunked_qkv_norm_resid_backward
     ));
     fields.push(format!(
         "\"bf16_backward_chain_qkv_norm_resid_reducer\":\"{}\"",
-        bf16_backward_chain_qkv_norm_resid_reducer_for_audit()
+        qkv_norm_resid_reducer_label(qkv_norm_resid_reducer)
     ));
     fields.push(format!(
         "\"direct_compact_qkv_norm_resid_backward\":{}",
-        direct_compact_qkv_norm_resid_backward_enabled_for_audit()
+        direct_compact_qkv_norm_resid_backward
     ));
     fields.push(format!(
         "\"split_qkv_norm_resid_backward\":{}",
-        split_qkv_norm_resid_backward_enabled_for_audit()
+        split_qkv_norm_resid_backward
     ));
     fields.push(format!(
         "\"split_compact_qkv_norm_resid_backward\":{}",
-        split_compact_qkv_norm_resid_backward_enabled_for_audit()
+        split_qkv_norm_resid_backward
     ));
     fields.push(format!(
         "\"qkv_norm_resid_backward_rows_per_chunk\":{}",
-        if chunked_qkv_norm_resid_backward_enabled_for_audit()
-            || split_qkv_norm_resid_backward_enabled_for_audit()
-        {
-            qkv_norm_resid_backward_rows_per_chunk_for_audit()
+        if chunked_qkv_norm_resid_backward || split_qkv_norm_resid_backward {
+            if run_spec.runtime.backward_chain_profile != BackwardChainProfile::Off {
+                run_spec.runtime.qkv_norm_resid_rows_per_chunk.max(256)
+            } else {
+                qkv_norm_resid_backward_rows_per_chunk_for_audit()
+            }
         } else {
             0
         }
@@ -8713,6 +8754,7 @@ fn bf16_backward_chain_strict_for_audit() -> bool {
         && env_flag_enabled("PG_GPU_BF16_BACKWARD_CHAIN_STRICT", true)
 }
 
+#[allow(dead_code)]
 fn bf16_backward_chain_qkv_norm_resid_reducer_for_audit() -> &'static str {
     if let Ok(raw) = std::env::var("PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER") {
         match raw.to_ascii_lowercase().as_str() {
@@ -8733,6 +8775,36 @@ fn bf16_backward_chain_qkv_norm_resid_reducer_for_audit() -> &'static str {
         "chunked_compact"
     } else {
         "direct_compact"
+    }
+}
+
+fn qkv_norm_resid_reducer_for_audit(run_spec: &RunSpec) -> QkvNormResidReducerProfile {
+    if run_spec.runtime.backward_chain_profile != BackwardChainProfile::Off {
+        return run_spec.runtime.qkv_norm_resid_reducer_profile;
+    }
+    if let Ok(raw) = std::env::var("PG_GPU_BF16_BACKWARD_CHAIN_QKV_NORM_RESID_REDUCER") {
+        return match raw.to_ascii_lowercase().as_str() {
+            "split" | "split_compact" | "split_reduce" => QkvNormResidReducerProfile::SplitCompact,
+            "chunked" | "chunked_compact" | "chunked_reduce" => {
+                QkvNormResidReducerProfile::ChunkedCompact
+            }
+            _ => QkvNormResidReducerProfile::DirectCompact,
+        };
+    }
+    if env_flag_enabled("PG_GPU_SPLIT_QKV_NORM_RESID_BWD", false) {
+        QkvNormResidReducerProfile::SplitCompact
+    } else if env_flag_enabled("PG_GPU_CHUNKED_QKV_NORM_RESID_BWD", false) {
+        QkvNormResidReducerProfile::ChunkedCompact
+    } else {
+        QkvNormResidReducerProfile::DirectCompact
+    }
+}
+
+fn qkv_norm_resid_reducer_label(profile: QkvNormResidReducerProfile) -> &'static str {
+    match profile {
+        QkvNormResidReducerProfile::DirectCompact => "direct_compact",
+        QkvNormResidReducerProfile::SplitCompact => "split_compact",
+        QkvNormResidReducerProfile::ChunkedCompact => "chunked_compact",
     }
 }
 
@@ -8780,6 +8852,7 @@ fn chunked_residual_mix_backward_enabled_for_audit() -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn chunked_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     if bf16_backward_chain_requested_for_audit() {
         return bf16_backward_chain_qkv_norm_resid_reducer_for_audit() == "chunked_compact";
@@ -8787,6 +8860,7 @@ fn chunked_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     env_flag_enabled("PG_GPU_CHUNKED_QKV_NORM_RESID_BWD", false)
 }
 
+#[allow(dead_code)]
 fn split_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     if bf16_backward_chain_requested_for_audit() {
         return bf16_backward_chain_qkv_norm_resid_reducer_for_audit() == "split_compact";
@@ -8794,11 +8868,13 @@ fn split_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     env_flag_enabled("PG_GPU_SPLIT_QKV_NORM_RESID_BWD", false)
 }
 
+#[allow(dead_code)]
 fn split_compact_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     split_qkv_norm_resid_backward_enabled_for_audit()
         && compact_attn_gate_grad_input_enabled_for_audit()
 }
 
+#[allow(dead_code)]
 fn direct_compact_qkv_norm_resid_backward_enabled_for_audit() -> bool {
     bf16_backward_chain_qkv_norm_resid_reducer_for_audit() == "direct_compact"
         && compact_attn_gate_grad_input_enabled_for_audit()
@@ -9103,6 +9179,7 @@ fn bf16_attention_backward_bhsd_do_enabled_for_audit(run_spec: &RunSpec) -> bool
 fn bf16_backward_chain_complete_for_audit(run_spec: &RunSpec) -> bool {
     let sparse_xsa_requires_bhsd_do = run_spec.model.sparse_attn_gate.enabled
         && run_spec.model.xsa_last_n >= run_spec.model.num_layers;
+    let qkv_norm_resid_reducer = qkv_norm_resid_reducer_for_audit(run_spec);
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && run_spec.model.attention_backend == AttentionBackend::CudnnSdpaBf16
         && bf16_backward_projection_gemm_enabled(run_spec)
@@ -9119,10 +9196,13 @@ fn bf16_backward_chain_complete_for_audit(run_spec: &RunSpec) -> bool {
         && bf16_attention_tail_direct_qkv_pack_enabled_for_audit(run_spec)
         && (!sparse_xsa_requires_bhsd_do
             || bf16_attention_backward_bhsd_do_enabled_for_audit(run_spec))
-        && (direct_compact_qkv_norm_resid_backward_enabled_for_audit()
-            || split_compact_qkv_norm_resid_backward_enabled_for_audit()
-            || (chunked_qkv_norm_resid_backward_enabled_for_audit()
-                && compact_attn_gate_grad_input_enabled_for_audit()))
+        && (matches!(
+            qkv_norm_resid_reducer,
+            QkvNormResidReducerProfile::DirectCompact | QkvNormResidReducerProfile::SplitCompact
+        ) || (matches!(
+            qkv_norm_resid_reducer,
+            QkvNormResidReducerProfile::ChunkedCompact
+        ) && compact_attn_gate_grad_input_enabled_for_audit()))
         && (!run_spec.model.sparse_attn_gate.enabled
             || compact_attn_gate_grad_input_enabled_for_audit())
         && !recompute_residual_mix_norm_inputs_enabled_for_audit()
@@ -9472,9 +9552,6 @@ fn bf16_output_logits_enabled_for_audit(run_spec: &RunSpec) -> bool {
     run_spec.model.compute_precision == ModelComputePrecision::Bf16TensorCore
         && bf16_output_projection_gemm_enabled(run_spec)
         && bf16_output_backward_gemm_enabled(run_spec)
-        && !fused_exact_output_ce_enabled_for_audit(run_spec)
-        && !tiled_output_cross_entropy_enabled_for_audit(run_spec)
-        && !chunked_bf16_output_ce_cache_enabled_for_audit(run_spec)
         && matches!(
             std::env::var("PG_GPU_BF16_LOGITS")
                 .unwrap_or_else(|_| "0".to_string())
@@ -10326,10 +10403,15 @@ fn validate_backend_request(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> {
                 "record mode requires --tokenizer-vocab; placeholder BPB bytes are not leaderboard-valid".into(),
             ));
         }
-        if run_spec.eval.max_tokens.is_some() {
+        if run_spec.eval.max_tokens.is_some() && !run_spec.allow_unsupported_variants {
             return Err(pg_core::PgError::InvalidOp(
                 "record mode cannot set --eval-max-tokens; leaderboard eval must score the full validation stream".into(),
             ));
+        } else if run_spec.eval.max_tokens.is_some() {
+            log::warn!(
+                "unsupported record diagnostic is using --eval-max-tokens={:?}; this run cannot be used as leaderboard evidence",
+                run_spec.eval.max_tokens
+            );
         }
     }
     if is_record_shaped_mode(mode) {
@@ -10351,7 +10433,14 @@ fn validate_backend_request(run_spec: &RunSpec, mode: RunMode) -> PgResult<()> {
     }
     if mode == RunMode::Record {
         let algorithm_gaps = leaderboard_algorithm_gaps(run_spec);
-        if !algorithm_gaps.is_empty() {
+        if !algorithm_gaps.is_empty()
+            && (run_spec.allow_unsupported_variants || allow_frontier_record_gaps_for_development())
+        {
+            log::warn!(
+                "record mode is running a non-final unsupported algorithm variant: {}",
+                algorithm_gaps.join("; ")
+            );
+        } else if !algorithm_gaps.is_empty() {
             return Err(pg_core::PgError::InvalidOp(format!(
                 "record mode is not leaderboard-algorithm-ready: {}. Use record-shaped-proxy for systems benchmarking until these P1 algorithm gaps are closed.",
                 algorithm_gaps.join("; ")
@@ -11224,6 +11313,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("--eval-max-tokens"), "{msg}");
+
+        spec.allow_unsupported_variants = true;
+        if let Err(err) = validate_backend_request(&spec, RunMode::Record) {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("--eval-max-tokens"),
+                "diagnostic record variants may cap eval for cheap BPB probes, but got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -11690,6 +11788,20 @@ mod tests {
         assert!(
             json.contains("\"canonical_caseops_dataset\":false"),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn frontier_2135_speed_probe_uses_scored_caseops_validation_targets() {
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135SpeedProbe;
+        spec.model.caseops.enabled = true;
+        spec.model.caseops.byte_sidecar = true;
+        spec.model.eval_seq_len = 2560;
+
+        assert_eq!(
+            frontier_scored_validation_targets(&spec, 47_853_344),
+            FRONTIER_2135_CASEOPS_VAL_TOKENS
         );
     }
 
@@ -13022,6 +13134,49 @@ mod tests {
         assert!(!production_fused_output_projection_ce_enabled_for_audit(
             &spec
         ));
+
+        match old_backend {
+            Some(value) => unsafe { std::env::set_var("PG_GPU_OUTPUT_CE_BACKEND", value) },
+            None => unsafe { std::env::remove_var("PG_GPU_OUTPUT_CE_BACKEND") },
+        }
+        match old_tiled {
+            Some(value) => unsafe { std::env::set_var("PG_GPU_TILED_OUTPUT_CE", value) },
+            None => unsafe { std::env::remove_var("PG_GPU_TILED_OUTPUT_CE") },
+        }
+        match old_bf16_logits {
+            Some(value) => unsafe { std::env::set_var("PG_GPU_BF16_LOGITS", value) },
+            None => unsafe { std::env::remove_var("PG_GPU_BF16_LOGITS") },
+        }
+        match old_bf16_bwd {
+            Some(value) => unsafe { std::env::set_var("PG_GPU_BF16_OUTPUT_BACKWARD_GEMM", value) },
+            None => unsafe { std::env::remove_var("PG_GPU_BF16_OUTPUT_BACKWARD_GEMM") },
+        }
+    }
+
+    #[test]
+    fn chunked_ce_does_not_suppress_materialized_bf16_logits_audit() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let old_backend = std::env::var("PG_GPU_OUTPUT_CE_BACKEND").ok();
+        let old_tiled = std::env::var("PG_GPU_TILED_OUTPUT_CE").ok();
+        let old_bf16_logits = std::env::var("PG_GPU_BF16_LOGITS").ok();
+        let old_bf16_bwd = std::env::var("PG_GPU_BF16_OUTPUT_BACKWARD_GEMM").ok();
+        unsafe {
+            std::env::set_var("PG_GPU_OUTPUT_CE_BACKEND", "chunked_bf16_cache");
+            std::env::set_var("PG_GPU_TILED_OUTPUT_CE", "0");
+            std::env::set_var("PG_GPU_BF16_LOGITS", "1");
+            std::env::set_var("PG_GPU_BF16_OUTPUT_BACKWARD_GEMM", "1");
+        }
+
+        let mut spec = RunSpec::default();
+        spec.model.compute_precision = ModelComputePrecision::Bf16TensorCore;
+        spec.model.vocab_size = 8192;
+
+        assert!(chunked_bf16_output_ce_cache_enabled_for_audit(&spec));
+        assert!(bf16_output_logits_enabled_for_audit(&spec));
+        assert_eq!(
+            output_loss_backend_for_audit(&spec),
+            "chunked_bf16_logits_cache"
+        );
 
         match old_backend {
             Some(value) => unsafe { std::env::set_var("PG_GPU_OUTPUT_CE_BACKEND", value) },

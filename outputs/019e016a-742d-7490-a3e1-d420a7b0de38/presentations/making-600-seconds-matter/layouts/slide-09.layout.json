@@ -1,0 +1,998 @@
+{
+  "schema": "openai.presentation.layout/v4",
+  "unit": "px",
+  "slide": {
+    "aid": "sl/wa0hhx",
+    "id": "wa0hhx",
+    "slide": 9,
+    "layoutId": "2225610f-b35b-47f0-a477-6751b1de254c",
+    "layoutName": "Title Slide",
+    "layoutType": "title",
+    "masterLayoutId": "409bad8f-fe8d-4dc5-b122-67042137e3b5",
+    "masterLayoutName": "Master",
+    "frame": {
+      "left": 0,
+      "top": 0,
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "theme": {
+    "colorSchemeName": "ChatGPT",
+    "colors": {
+      "accent1": "#156082",
+      "accent2": "#E97132",
+      "accent3": "#196B24",
+      "accent4": "#0F9ED5",
+      "accent5": "#A02B93",
+      "accent6": "#4EA72E",
+      "bg1": "#FFFFFF",
+      "bg2": "#000000",
+      "tx1": "#1F1F1F",
+      "tx2": "#FFFFFF",
+      "dk1": "#000000",
+      "lt1": "#FFFFFF",
+      "dk2": "#0E2841",
+      "lt2": "#E8E8E8",
+      "hlink": "#467886",
+      "folHlink": "#96607D"
+    },
+    "typefaces": [
+      "Aptos",
+      "Aptos Display",
+      "Aptos Mono"
+    ]
+  },
+  "inheritedLayers": [
+    {
+      "scope": "layout",
+      "id": "2225610f-b35b-47f0-a477-6751b1de254c",
+      "name": "Title Slide",
+      "type": "title",
+      "parentLayoutId": "409bad8f-fe8d-4dc5-b122-67042137e3b5",
+      "elements": []
+    },
+    {
+      "scope": "master",
+      "id": "409bad8f-fe8d-4dc5-b122-67042137e3b5",
+      "name": "Master",
+      "type": "master",
+      "elements": []
+    }
+  ],
+  "elements": [
+    {
+      "order": 1,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/6dcbulwv",
+      "id": "1",
+      "bbox": [
+        0,
+        0,
+        1280,
+        720
+      ],
+      "geometry": "rect",
+      "fillColor": "#F7F3EA",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 2,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/d4vmtwra",
+      "id": "2",
+      "bbox": [
+        58,
+        42,
+        620,
+        22
+      ],
+      "geometry": "rect",
+      "text": "COMPILER BOUNDARY",
+      "textPreview": "COMPILER BOUNDARY",
+      "resolvedFontSize": 10.51,
+      "resolvedTextStyle": {
+        "fontSize": 10.51,
+        "typeface": "Aptos Mono",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "COMPILER BOUNDARY"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "COMPILER BOUNDARY",
+          "runs": [
+            {
+              "index": 1,
+              "text": "COMPILER BOUNDARY",
+              "fontSize": 10.51,
+              "typeface": "Aptos Mono",
+              "color": "#2D6CDF",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 3,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/oj2t83it",
+      "id": "3",
+      "bbox": [
+        58,
+        76,
+        960,
+        92
+      ],
+      "geometry": "rect",
+      "text": "Why this was not automatic compiler work",
+      "textPreview": "Why this was not automatic compiler work",
+      "resolvedFontSize": 38,
+      "resolvedTextStyle": {
+        "fontSize": 38,
+        "typeface": "Aptos Display",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Why this was not automatic compiler work"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Why this was not automatic compiler work",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Why this was not automatic compiler work",
+              "fontSize": 38,
+              "typeface": "Aptos Display",
+              "color": "#17212B",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 4,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/vmtwra5g",
+      "id": "4",
+      "bbox": [
+        58,
+        176,
+        880,
+        44
+      ],
+      "geometry": "rect",
+      "text": "torch.compile can fuse many graph patterns. These changes cross boundaries that ordinary PyTorch does not expose as one region.",
+      "textPreview": "torch.compile can fuse many graph patterns. These changes cross boundaries that ordinary PyTorch does not expose as one region.",
+      "resolvedFontSize": 17,
+      "resolvedTextStyle": {
+        "fontSize": 17,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 2,
+        "lines": [
+          {
+            "index": 1,
+            "text": "torch.compile can fuse many graph patterns. These changes cross boundaries that ordinary PyTorch does not"
+          },
+          {
+            "index": 2,
+            "text": "expose as one region."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "torch.compile can fuse many graph patterns. These changes cross boundaries that ordinary PyTorch does not expose as one region.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "torch.compile can fuse many graph patterns. These changes cross boundaries that ordinary PyTorch does not expose as one region.",
+              "fontSize": 17,
+              "typeface": "Aptos",
+              "color": "#5B6573"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 5,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/61032lsz",
+      "id": "5",
+      "bbox": [
+        58,
+        232,
+        1164,
+        1
+      ],
+      "geometry": "rect",
+      "fillColor": "#D7D0C3",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 6,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/dsji5sne",
+      "id": "6",
+      "bbox": [
+        92,
+        312,
+        300,
+        150
+      ],
+      "geometry": "rect",
+      "fillColor": "#FFFFFF",
+      "lineColor": "#D7D0C3",
+      "lineWidth": 1
+    },
+    {
+      "order": 7,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/o7qpg3ex",
+      "id": "7",
+      "bbox": [
+        92,
+        312,
+        300,
+        7
+      ],
+      "geometry": "rect",
+      "fillColor": "#2D6CDF",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 8,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/vahoza1g",
+      "id": "8",
+      "bbox": [
+        116,
+        342,
+        240,
+        28
+      ],
+      "geometry": "rect",
+      "text": "Library calls",
+      "textPreview": "Library calls",
+      "resolvedFontSize": 23,
+      "resolvedTextStyle": {
+        "fontSize": 23,
+        "typeface": "Aptos Display",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Library calls"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Library calls",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Library calls",
+              "fontSize": 23,
+              "typeface": "Aptos Display",
+              "color": "#17212B",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 9,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/6tovahoz",
+      "id": "9",
+      "bbox": [
+        116,
+        386,
+        238,
+        48
+      ],
+      "geometry": "rect",
+      "text": "cuDNN SDPA and cuBLASLt are not transparent graph regions.",
+      "textPreview": "cuDNN SDPA and cuBLASLt are not transparent graph regions.",
+      "resolvedFontSize": 15,
+      "resolvedTextStyle": {
+        "fontSize": 15,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 2,
+        "lines": [
+          {
+            "index": 1,
+            "text": "cuDNN SDPA and cuBLASLt are"
+          },
+          {
+            "index": 2,
+            "text": "not transparent graph regions."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "cuDNN SDPA and cuBLASLt are not transparent graph regions.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "cuDNN SDPA and cuBLASLt are not transparent graph regions.",
+              "fontSize": 15,
+              "typeface": "Aptos",
+              "color": "#5B6573"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 10,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/c3ylc7u5",
+      "id": "10",
+      "bbox": [
+        490,
+        312,
+        300,
+        150
+      ],
+      "geometry": "rect",
+      "fillColor": "#FFFFFF",
+      "lineColor": "#D7D0C3",
+      "lineWidth": 1
+    },
+    {
+      "order": 11,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/1kre1w7m",
+      "id": "11",
+      "bbox": [
+        490,
+        312,
+        300,
+        7
+      ],
+      "geometry": "rect",
+      "fillColor": "#D9822B",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 12,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/uxc3ylc7",
+      "id": "12",
+      "bbox": [
+        514,
+        342,
+        240,
+        28
+      ],
+      "geometry": "rect",
+      "text": "Runtime state",
+      "textPreview": "Runtime state",
+      "resolvedFontSize": 23,
+      "resolvedTextStyle": {
+        "fontSize": 23,
+        "typeface": "Aptos Display",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Runtime state"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Runtime state",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Runtime state",
+              "fontSize": 23,
+              "typeface": "Aptos Display",
+              "color": "#17212B",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 13,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/ji5snelo",
+      "id": "13",
+      "bbox": [
+        514,
+        386,
+        238,
+        48
+      ],
+      "geometry": "rect",
+      "text": "Profiles control BF16 layout, graph capture, recurrent replay, and audit gates.",
+      "textPreview": "Profiles control BF16 layout, graph capture, recurrent replay, and audit gates.",
+      "resolvedFontSize": 15,
+      "resolvedTextStyle": {
+        "fontSize": 15,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 3,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Profiles control BF16 layout, graph"
+          },
+          {
+            "index": 2,
+            "text": "capture, recurrent replay, and audit"
+          },
+          {
+            "index": 3,
+            "text": "gates."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Profiles control BF16 layout, graph capture, recurrent replay, and audit gates.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Profiles control BF16 layout, graph capture, recurrent replay, and audit gates.",
+              "fontSize": 15,
+              "typeface": "Aptos",
+              "color": "#5B6573"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 14,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/crmhk3q5",
+      "id": "14",
+      "bbox": [
+        888,
+        312,
+        300,
+        150
+      ],
+      "geometry": "rect",
+      "fillColor": "#FFFFFF",
+      "lineColor": "#D7D0C3",
+      "lineWidth": 1
+    },
+    {
+      "order": 15,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/1cfa9w3m",
+      "id": "15",
+      "bbox": [
+        888,
+        312,
+        300,
+        7
+      ],
+      "geometry": "rect",
+      "fillColor": "#0A8F64",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 16,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/ulwval87",
+      "id": "16",
+      "bbox": [
+        912,
+        342,
+        240,
+        28
+      ],
+      "geometry": "rect",
+      "text": "Custom layouts",
+      "textPreview": "Custom layouts",
+      "resolvedFontSize": 23,
+      "resolvedTextStyle": {
+        "fontSize": 23,
+        "typeface": "Aptos Display",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Custom layouts"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Custom layouts",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Custom layouts",
+              "fontSize": 23,
+              "typeface": "Aptos Display",
+              "color": "#17212B",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 17,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/j6tovaho",
+      "id": "17",
+      "bbox": [
+        912,
+        386,
+        238,
+        48
+      ],
+      "geometry": "rect",
+      "text": "Packed BF16 activations and export bytes affect legality and speed.",
+      "textPreview": "Packed BF16 activations and export bytes affect legality and speed.",
+      "resolvedFontSize": 15,
+      "resolvedTextStyle": {
+        "fontSize": 15,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 3,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Packed BF16 activations and"
+          },
+          {
+            "index": 2,
+            "text": "export bytes affect legality and"
+          },
+          {
+            "index": 3,
+            "text": "speed."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Packed BF16 activations and export bytes affect legality and speed.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Packed BF16 activations and export bytes affect legality and speed.",
+              "fontSize": 15,
+              "typeface": "Aptos",
+              "color": "#5B6573"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 18,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/8nqxs72x",
+      "id": "18",
+      "bbox": [
+        148,
+        530,
+        984,
+        74
+      ],
+      "geometry": "rect",
+      "fillColor": "#FFFCF5",
+      "lineColor": "#D7D0C3",
+      "lineWidth": 1
+    },
+    {
+      "order": 19,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/18jqh0fe",
+      "id": "19",
+      "bbox": [
+        178,
+        554,
+        164,
+        25
+      ],
+      "geometry": "rect",
+      "fillColor": "#D9822B",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 20,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/1032lszq",
+      "id": "20",
+      "bbox": [
+        178,
+        559,
+        164,
+        15
+      ],
+      "geometry": "rect",
+      "text": "CAREFUL FRAMING",
+      "textPreview": "CAREFUL FRAMING",
+      "resolvedFontSize": 8.2,
+      "resolvedTextStyle": {
+        "fontSize": 8.2,
+        "typeface": "Aptos Mono",
+        "bold": true,
+        "alignment": "center"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "CAREFUL FRAMING"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "CAREFUL FRAMING",
+          "runs": [
+            {
+              "index": 1,
+              "text": "CAREFUL FRAMING",
+              "fontSize": 8.2,
+              "typeface": "Aptos Mono",
+              "color": "#FFFFFF",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 21,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/cfa9w3m9",
+      "id": "21",
+      "bbox": [
+        366,
+        546,
+        654,
+        42
+      ],
+      "geometry": "rect",
+      "text": "Not impossible for compilers; just not automatically recovered from ordinary PyTorch code without custom-op integration.",
+      "textPreview": "Not impossible for compilers; just not automatically recovered from ordinary PyTorch code without custom-op integration.",
+      "resolvedFontSize": 20,
+      "resolvedTextStyle": {
+        "fontSize": 20,
+        "typeface": "Aptos Display",
+        "bold": true,
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 2,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Not impossible for compilers; just not automatically recovered from"
+          },
+          {
+            "index": 2,
+            "text": "ordinary PyTorch code without custom-op integration."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Not impossible for compilers; just not automatically recovered from ordinary PyTorch code without custom-op integration.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Not impossible for compilers; just not automatically recovered from ordinary PyTorch code without custom-op integration.",
+              "fontSize": 20,
+              "typeface": "Aptos Display",
+              "color": "#17212B",
+              "bold": true
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 22,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/judg7ads",
+      "id": "22",
+      "bbox": [
+        178,
+        629,
+        8,
+        8
+      ],
+      "geometry": "rect",
+      "fillColor": "#87909D",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 23,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/u9knih4b",
+      "id": "23",
+      "bbox": [
+        196,
+        620,
+        760,
+        24
+      ],
+      "geometry": "rect",
+      "text": "Sources: torch.compile API/troubleshooting and torch.library custom-op docs.",
+      "textPreview": "Sources: torch.compile API/troubleshooting and torch.library custom-op docs.",
+      "resolvedFontSize": 12.51,
+      "resolvedTextStyle": {
+        "fontSize": 12.51,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Sources: torch.compile API/troubleshooting and torch.library custom-op docs."
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Sources: torch.compile API/troubleshooting and torch.library custom-op docs.",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Sources: torch.compile API/troubleshooting and torch.library custom-op docs.",
+              "fontSize": 12.51,
+              "typeface": "Aptos",
+              "color": "#17212B"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 24,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/1orytsvu",
+      "id": "24",
+      "bbox": [
+        58,
+        670,
+        1164,
+        1
+      ],
+      "geometry": "rect",
+      "fillColor": "#D7D0C3",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 25,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/c7u54zid",
+      "id": "25",
+      "bbox": [
+        58,
+        684,
+        820,
+        20
+      ],
+      "geometry": "rect",
+      "text": "Rust/CUDA Parameter Golf systems deck",
+      "textPreview": "Rust/CUDA Parameter Golf systems deck",
+      "resolvedFontSize": 9,
+      "resolvedTextStyle": {
+        "fontSize": 9,
+        "typeface": "Aptos",
+        "alignment": "left"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Rust/CUDA Parameter Golf systems deck"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Rust/CUDA Parameter Golf systems deck",
+          "runs": [
+            {
+              "index": 1,
+              "text": "Rust/CUDA Parameter Golf systems deck",
+              "fontSize": 9,
+              "typeface": "Aptos",
+              "color": "#87909D"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 26,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/jm1cfa9w",
+      "id": "26",
+      "bbox": [
+        1184,
+        684,
+        38,
+        20
+      ],
+      "geometry": "rect",
+      "text": "09",
+      "textPreview": "09",
+      "resolvedFontSize": 9,
+      "resolvedTextStyle": {
+        "fontSize": 9,
+        "typeface": "Aptos Mono",
+        "alignment": "right"
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "09"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "09",
+          "runs": [
+            {
+              "index": 1,
+              "text": "09",
+              "fontSize": 9,
+              "typeface": "Aptos Mono",
+              "color": "#87909D"
+            }
+          ]
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    }
+  ],
+  "composeRuns": []
+}

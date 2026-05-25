@@ -346,6 +346,9 @@ pub fn eval_gpu_lora_phased_ttt(
     let mut activations = GpuActivations::new_for_plan_for_ttt(plan, seq_len, stream.clone())?;
     let mut backward_state = GpuBackwardState::new_for_plan_for_ttt(plan, seq_len, stream.clone())?;
     let mut grads = GpuGradBuffers::new(&cpu_model.config, stream.clone())?;
+    let lora_grad_numel = model.q_lora_grad_numel()?;
+    let mut lora_grad_pack = GpuTensor::zeros_gpu(stream.clone(), &[lora_grad_numel], DType::F32)?;
+    let mut lora_grad_sum_sq = GpuTensor::zeros_gpu(stream.clone(), &[1], DType::F32)?;
     let mut host_workspace = GpuLoraHostWorkspace::new(seq_len);
 
     let total_tokens = val_tokens.len() - 1;
@@ -366,9 +369,10 @@ pub fn eval_gpu_lora_phased_ttt(
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
     let deadline = TttEvalDeadline::from_env();
     let ngram_tilt = NgramTiltHints::build(plan, val_tokens)?;
+    let lora_grad_clip_norm = gpu_lora_ttt_grad_clip_norm()?;
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"lora_grad_clip_norm\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
             mutation_guard,
             total_tokens,
             seq_len,
@@ -380,6 +384,7 @@ pub fn eval_gpu_lora_phased_ttt(
             cfg.lr,
             cfg.lora_targets.label(),
             cfg.lora_targets.rust_gpu_runtime_supported(),
+            format_optional_f32_json(lora_grad_clip_norm),
             cfg.phases,
             cfg.prefix_docs,
             prefix_docs_seen,
@@ -442,6 +447,12 @@ pub fn eval_gpu_lora_phased_ttt(
             &mut host_workspace,
             ngram_tilt.as_ref(),
         )?;
+        if !loss.is_finite() {
+            return Err(PgError::InvalidOp(format!(
+                "gpu_lora_phased_ttt produced non-finite score before update at chunk {ci}: loss_sum={loss} scored={scored} chunk_start={} chunk_end={}",
+                chunk.chunk_start, chunk.chunk_end,
+            )));
+        }
         if let Some(before) = lora_state_before_score.as_ref() {
             assert_q_lora_state_unchanged(&model.q_lora_state_to_host()?, before, ci, 0)?;
         }
@@ -493,6 +504,9 @@ pub fn eval_gpu_lora_phased_ttt(
                 &mut activations,
                 &mut backward_state,
                 &mut grads,
+                &mut lora_grad_pack,
+                &mut lora_grad_sum_sq,
+                lora_grad_clip_norm,
                 &mut host_workspace,
             )?;
         }
@@ -587,9 +601,10 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
     let mutation_guard = ttt_score_mutation_guard_enabled(audit);
     let deadline = TttEvalDeadline::from_env();
     let ngram_tilt = NgramTiltHints::build(plan, val_tokens)?;
+    let lora_grad_clip_norm = gpu_lora_ttt_grad_clip_norm()?;
     if audit {
         println!(
-            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
+            "ttt_audit_json={{\"event\":\"gpu_lora_phased_ttt_start\",\"distributed_eval\":true,\"world_size\":{},\"score_parallelism\":\"chunk_windows\",\"ttt_update_parallelism\":\"packed_data_parallel_lora_gradient_allreduce\",\"lora_grad_packed_all_reduce\":true,\"lora_grad_grouped_all_reduce\":true,\"fully_distributed_ttt_update\":true,\"fully_sharded_ttt_update\":false,\"score_first\":true,\"future_token_access\":false,\"score_phase_lora_mutation_guard\":{},\"tokens\":{},\"seq_len\":{},\"stride\":{},\"chunk_tokens\":{},\"chunks\":{},\"lora_rank\":{},\"lora_alpha\":{},\"lora_lr\":{:.9},\"lora_targets\":\"{}\",\"lora_targets_runtime_supported\":{},\"lora_grad_clip_norm\":{},\"phases\":{},\"prefix_docs\":{},\"prefix_docs_seen\":{},\"prefix_token_end\":{},\"boundary_token_id\":{},\"weight_decay\":{:.6},\"ttt_beta2\":{:.6},\"tiled_output_cross_entropy\":{},\"chunked_bf16_output_ce_cache\":{},\"materializes_full_logits\":{},\"forward_hidden_without_logits\":{},\"loss_window_reduction_gpu\":true,\"loss_scalar_downloads\":\"{}\",\"ngram_tilt_enabled\":{},\"ngram_tilt_gated\":{}}}",
             world_size,
             mutation_guard,
             total_tokens,
@@ -602,6 +617,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
             cfg.lr,
             cfg.lora_targets.label(),
             cfg.lora_targets.rust_gpu_runtime_supported(),
+            format_optional_f32_json(lora_grad_clip_norm),
             cfg.phases,
             cfg.prefix_docs,
             prefix_docs_seen,
@@ -665,23 +681,32 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
             let mut handles = Vec::with_capacity(world_size);
             for (rank, replica) in replicas.iter_mut().enumerate() {
                 let windows = windows_by_rank[rank].clone();
-                handles.push(scope.spawn(move || {
-                    replica.score_windows(
-                        val_tokens,
-                        base_bytes,
-                        &windows,
-                        cfg.stride,
-                        ngram_tilt_ref,
-                    )
-                }));
+                handles.push((
+                    rank,
+                    scope.spawn(move || {
+                        replica.score_windows(
+                            val_tokens,
+                            base_bytes,
+                            &windows,
+                            cfg.stride,
+                            ngram_tilt_ref,
+                        )
+                    }),
+                ));
             }
             let mut results = Vec::with_capacity(world_size);
-            for handle in handles {
+            for (rank, handle) in handles {
                 let result = handle.join().map_err(|_| {
                     PgError::InvalidOp(
                         "distributed gpu_lora_phased_ttt scoring worker panicked".into(),
                     )
                 })??;
+                if !result.0.is_finite() {
+                    return Err(PgError::InvalidOp(format!(
+                        "distributed gpu_lora_phased_ttt produced non-finite score before update at chunk {ci} rank {rank}: loss_sum={} scored={} chunk_start={} chunk_end={}",
+                        result.0, result.1, chunk.chunk_start, chunk.chunk_end,
+                    )));
+                }
                 results.push(result);
             }
             Ok(results)
@@ -747,6 +772,7 @@ pub fn eval_gpu_lora_phased_ttt_distributed(
                 chunk.chunk_end.min(val_tokens.len() - 1),
                 cfg.lr * phase_lr_scale,
                 cfg.weight_decay,
+                lora_grad_clip_norm,
             )?;
             debug_verify_q_lora_replicas_synced(&mut replicas)?;
         }
@@ -786,6 +812,7 @@ fn train_chunk_distributed_lora(
     chunk_end: usize,
     lr: f32,
     weight_decay: f32,
+    lora_grad_clip_norm: Option<f32>,
 ) -> PgResult<()> {
     let world_size = replicas.len();
     if world_size == 0 || comms.len() != world_size {
@@ -827,10 +854,14 @@ fn train_chunk_distributed_lora(
             }
             Ok(())
         })?;
-        all_reduce_q_lora_grads(replicas, comms)?;
         let inv_participants = 1.0f32 / group.len().max(1) as f32;
+        all_reduce_scale_clip_unpack_q_lora_grads(
+            replicas,
+            comms,
+            inv_participants,
+            lora_grad_clip_norm,
+        )?;
         for replica in replicas.iter() {
-            replica.model.scale_q_lora_grads(inv_participants)?;
             replica.model.step_q_lora_sgd(lr, weight_decay)?;
         }
     }
@@ -838,9 +869,11 @@ fn train_chunk_distributed_lora(
 }
 
 #[cfg(feature = "cuda")]
-fn all_reduce_q_lora_grads(
+fn all_reduce_scale_clip_unpack_q_lora_grads(
     replicas: &mut [GpuLoraEvalReplica],
     comms: &[pg_core::nccl::NcclComm],
+    scale: f32,
+    clip_norm: Option<f32>,
 ) -> PgResult<()> {
     for replica in replicas.iter_mut() {
         replica.model.pack_q_lora_grads(&replica.lora_grad_pack)?;
@@ -851,7 +884,81 @@ fn all_reduce_q_lora_grads(
     }
     cudarc::nccl::group_end().map_err(|e| PgError::Nccl(format!("group_end failed: {e:?}")))?;
     for replica in replicas.iter_mut() {
+        scale_and_maybe_clip_q_lora_pack(
+            &replica.model,
+            &replica.lora_grad_pack,
+            &mut replica.lora_grad_sum_sq,
+            scale,
+            clip_norm,
+        )?;
         replica.model.unpack_q_lora_grads(&replica.lora_grad_pack)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn clip_q_lora_grads_from_pack(
+    model: &GpuModel,
+    pack: &mut GpuTensor,
+    sum_sq: &mut GpuTensor,
+    clip_norm: Option<f32>,
+) -> PgResult<()> {
+    let Some(clip_norm) = clip_norm else {
+        return Ok(());
+    };
+    model.pack_q_lora_grads(pack)?;
+    scale_and_maybe_clip_q_lora_pack(model, pack, sum_sq, 1.0, Some(clip_norm))?;
+    model.unpack_q_lora_grads(pack)
+}
+
+#[cfg(feature = "cuda")]
+fn scale_and_maybe_clip_q_lora_pack(
+    model: &GpuModel,
+    pack: &GpuTensor,
+    sum_sq: &mut GpuTensor,
+    scale: f32,
+    clip_norm: Option<f32>,
+) -> PgResult<()> {
+    let n = pack.numel() as u32;
+    if n == 0 {
+        return Ok(());
+    }
+    if pack.dtype() != DType::F32 {
+        return Err(PgError::InvalidOp(format!(
+            "q LoRA gradient pack must be F32, got {:?}",
+            pack.dtype()
+        )));
+    }
+    if sum_sq.dtype() != DType::F32 || sum_sq.numel() != 1 {
+        return Err(PgError::InvalidOp(
+            "q LoRA grad norm scratch must be one F32 scalar".into(),
+        ));
+    }
+    let stream = model.kernels.stream();
+    model.kernels.scale_inplace(
+        pg_kernels::gpu_kernels::CudaPtr(pack.cu_ptr(stream)?),
+        scale,
+        n,
+    )?;
+    if let Some(clip_norm) = clip_norm {
+        model.kernels.scale_inplace(
+            pg_kernels::gpu_kernels::CudaPtr(sum_sq.cu_ptr(stream)?),
+            0.0,
+            1,
+        )?;
+        model.kernels.dot_accumulate(
+            pg_kernels::gpu_kernels::CudaPtr(pack.cu_ptr(stream)?),
+            pg_kernels::gpu_kernels::CudaPtr(pack.cu_ptr(stream)?),
+            pg_kernels::gpu_kernels::CudaPtr(sum_sq.cu_ptr(stream)?),
+            1.0,
+            n,
+        )?;
+        model.kernels.clip_by_global_norm(
+            pg_kernels::gpu_kernels::CudaPtr(pack.cu_ptr(stream)?),
+            pg_kernels::gpu_kernels::CudaPtr(sum_sq.cu_ptr(stream)?),
+            clip_norm,
+            n,
+        )?;
     }
     Ok(())
 }
@@ -1153,6 +1260,31 @@ fn ttt_audit_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_lora_ttt_grad_clip_norm() -> PgResult<Option<f32>> {
+    let Ok(raw) = std::env::var("PG_GPU_LORA_TTT_GRAD_CLIP_NORM") else {
+        return Ok(None);
+    };
+    let value = raw.parse::<f32>().map_err(|_| {
+        PgError::InvalidOp(format!(
+            "PG_GPU_LORA_TTT_GRAD_CLIP_NORM must be a finite positive f32, got {raw:?}"
+        ))
+    })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(PgError::InvalidOp(format!(
+            "PG_GPU_LORA_TTT_GRAD_CLIP_NORM must be finite and > 0, got {value}"
+        )));
+    }
+    Ok(Some(value))
+}
+
+#[cfg(feature = "cuda")]
+fn format_optional_f32_json(value: Option<f32>) -> String {
+    value
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+#[cfg(feature = "cuda")]
 struct GpuLoraHostWorkspace {
     input: Vec<u32>,
     target: Vec<u32>,
@@ -1170,6 +1302,7 @@ struct GpuLoraEvalReplica {
     backward_state: GpuBackwardState,
     grads: GpuGradBuffers,
     lora_grad_pack: GpuTensor,
+    lora_grad_sum_sq: GpuTensor,
     host_workspace: GpuLoraHostWorkspace,
     seq_len: usize,
 }
@@ -1202,6 +1335,7 @@ impl GpuLoraEvalReplica {
             backward_state: GpuBackwardState::new_for_plan_for_ttt(plan, seq_len, stream.clone())?,
             grads: GpuGradBuffers::new(&cpu_model.config, stream.clone())?,
             lora_grad_pack: GpuTensor::zeros_gpu(stream.clone(), &[lora_grad_numel], DType::F32)?,
+            lora_grad_sum_sq: GpuTensor::zeros_gpu(stream.clone(), &[1], DType::F32)?,
             host_workspace: GpuLoraHostWorkspace::new(seq_len),
             seq_len,
         })
@@ -1392,6 +1526,13 @@ fn score_chunk_gpu(
     } else {
         gpu_loss_sum
     };
+    if !loss_sum.is_finite() {
+        return Err(PgError::InvalidOp(format!(
+            "gpu_lora_phased_ttt score_chunk produced non-finite loss_sum={loss_sum} gpu_loss_sum={gpu_loss_sum} host_loss_sum={host_loss_sum} windows={} token_count={} used_host_tilt_sum={used_host_tilt_sum}",
+            chunk.windows.len(),
+            token_count,
+        )));
+    }
     Ok((loss_sum, token_count, byte_count))
 }
 
@@ -1425,6 +1566,9 @@ fn train_chunk_gpu_lora(
     activations: &mut GpuActivations,
     backward_state: &mut GpuBackwardState,
     grads: &mut GpuGradBuffers,
+    lora_grad_pack: &mut GpuTensor,
+    lora_grad_sum_sq: &mut GpuTensor,
+    lora_grad_clip_norm: Option<f32>,
     host: &mut GpuLoraHostWorkspace,
 ) -> PgResult<()> {
     let mut ws = chunk_start;
@@ -1445,6 +1589,7 @@ fn train_chunk_gpu_lora(
             grads,
             seq_len,
         )?;
+        clip_q_lora_grads_from_pack(model, lora_grad_pack, lora_grad_sum_sq, lora_grad_clip_norm)?;
         model.step_q_lora_sgd(lr, weight_decay)?;
         ws += seq_len;
     }

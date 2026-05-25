@@ -829,6 +829,26 @@ mod tests {
         assert!(allst.runtime.sharded_muon_bf16_shadow_all_gather);
         ExecutionPlan::from_run_spec(&allst).unwrap();
 
+        let allst_quality_probe =
+            RunSpec::load(&specs_dir.join("frontier_2135_eval_compat_target.toml")).unwrap();
+        assert_eq!(
+            allst_quality_probe.runtime.record_profile,
+            RecordProfile::Frontier2135SpeedProbe
+        );
+        assert_eq!(
+            allst_quality_probe.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::AllStraightThrough
+        );
+        assert_eq!(allst_quality_probe.quant.matrix_bits, 6);
+        assert_eq!(allst_quality_probe.quant.mlp_bits, 6);
+        assert_eq!(allst_quality_probe.quant.embed_bits, 7);
+        assert_eq!(allst_quality_probe.quant.gptq_calibration_batches, 32);
+        assert!(
+            allst_quality_probe.allow_unsupported_variants,
+            "quality probe is intentionally diagnostic and must not masquerade as a clean record spec"
+        );
+        ExecutionPlan::from_run_spec(&allst_quality_probe).unwrap();
+
         let hybrid =
             RunSpec::load(&specs_dir.join("frontier_2135_hybridst_budget_target.toml")).unwrap();
         assert_eq!(

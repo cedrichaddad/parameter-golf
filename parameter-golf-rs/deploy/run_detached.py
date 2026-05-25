@@ -7,6 +7,7 @@ import shutil
 import shlex
 import json
 import tomllib
+import math
 from array import array
 from collections import deque
 
@@ -126,10 +127,11 @@ def _write_finish_status_json(result: dict, result_json: str | None):
         "source_command": " ".join(result.get("command", [])),
         "exact_profile": "frontier_2135_audit_target.toml",
         "speed_floor_profile": "frontier_2135_allst_budget_target.toml",
+        "quality_bpb_probe_profile": "frontier_2135_eval_compat_target.toml",
         "known_speed_floor_ms_per_step": 113.476857,
         "known_speed_floor_source": "frontier_2135_allst_combinedtail_full_v1",
         "known_exact_active_blocker": "exact frontier_2135_audit profile remains above 120 ms/step until exact recurrent replay is reduced",
-        "known_dataset_blocker": "Modal SP8192 fallback validation currently measures 40541268 tokens; canonical PR2135 requires 47851520",
+        "known_dataset_blocker": None,
         "timing_measured_ms_per_step": _first_known(
             metrics.get("timing_measured_ms_per_step"),
             run_timing.get("timing_measured_ms_per_step"),
@@ -146,7 +148,18 @@ def _write_finish_status_json(result: dict, result_json: str | None):
             metrics.get("timing_recurrent_active_ms_per_step"),
             run_timing.get("timing_recurrent_active_ms_per_step"),
         ),
-        "final_bpb": _first_known(metrics.get("final_bpb"), run_timing.get("final_bpb")),
+        "final_bpb": _first_known(
+            metrics.get("final_bpb"),
+            run_timing.get("final_bpb"),
+            metrics.get("eval_bpb"),
+        ),
+        "bpb_source": (
+            "final_bpb"
+            if _first_known(metrics.get("final_bpb"), run_timing.get("final_bpb")) is not None
+            else "eval_bpb"
+            if metrics.get("eval_bpb") is not None
+            else None
+        ),
         "eval_tokens": _first_known(metrics.get("eval_tokens"), run_timing.get("eval_tokens")),
         "artifact_model_bytes": _first_known(
             metrics.get("artifact_model_bytes"),
@@ -243,6 +256,10 @@ def _write_finish_status_json(result: dict, result_json: str | None):
     blocking_reasons = []
     if status.get("preflight_ready") is False:
         blocking_reasons.append("canonical_caseops_dataset_not_ready")
+        status["known_dataset_blocker"] = (
+            f"canonical CaseOps not ready: val_tokens={status.get('preflight_val_tokens')} "
+            f"required={FRONTIER_2135_VAL_TOKENS}"
+        )
     measured_ms = status.get("timing_measured_ms_per_step")
     if measured_ms is not None and measured_ms > 120.0:
         blocking_reasons.append("exact_profile_over_120ms")
@@ -250,6 +267,8 @@ def _write_finish_status_json(result: dict, result_json: str | None):
         blocking_reasons.append("full_bpb_not_validated")
     if status.get("artifact_total_bytes") is None:
         blocking_reasons.append("artifact_total_bytes_not_proven")
+    if status.get("artifact_budget_ok") is False:
+        blocking_reasons.append("artifact_budget_failed")
     if status.get("frontier_record_ready") is False:
         blocking_reasons.append("frontier_record_ready_false")
     status["blocking_reasons"] = blocking_reasons
@@ -447,6 +466,20 @@ def _forwarded_option(args: list[str], name: str) -> str | None:
     return args[idx + 1]
 
 
+def _prefer_live_mounted_spec(forwarded: list[str]) -> None:
+    if "--spec" not in forwarded:
+        return
+    idx = forwarded.index("--spec")
+    if idx + 1 >= len(forwarded):
+        return
+    spec_path = forwarded[idx + 1]
+    if not spec_path.startswith("/specs/"):
+        return
+    live_spec = os.path.join("/build/specs", os.path.relpath(spec_path, "/specs"))
+    if os.path.exists(live_spec):
+        forwarded[idx + 1] = live_spec
+
+
 def _spec_total_iterations(args: list[str]) -> int | None:
     spec_path = _forwarded_option(args, "--spec")
     if not spec_path:
@@ -522,6 +555,7 @@ def _merge_json_event_metrics(metrics: dict, json_events: dict) -> dict:
         "record_data_preflight_json": "preflight",
         "submission_budget_json": "submission",
         "record_audit_json": "audit",
+        "eval_audit_json": "eval",
         "run_timing_json": "timing",
     }
     for event_key, prefix in promoted_prefixes.items():
@@ -588,6 +622,10 @@ def _apply_frontier_fast_record_env(stage_timing: bool, poison_prepacked_qkv: bo
     os.environ["PG_GPU_TOKEN_RING_SAMPLER"] = "1"
     os.environ["PG_GPU_TOKEN_RING_FULL_SCHEDULE"] = "1"
     os.environ["PG_RECORD_REQUIRE_DEVICE_BATCH"] = "1"
+    # The eval runner has its own final wall-clock audit. The old 2s internal
+    # TTT guard rejected otherwise legal frontier runs at ~598.5s, before the
+    # official 600s budget. Keep the deadline exact for record-profile runs.
+    os.environ.setdefault("PG_EVAL_DEADLINE_GUARD_SECONDS", "0.0")
     os.environ["PG_GPU_RESIDUAL_SCALE_REDUCE"] = "1"
     os.environ["PG_GPU_CHUNKED_RESIDUAL_SCALE_BWD"] = "1"
     os.environ["PG_GPU_TILED_RESIDUAL_SCALE_BWD"] = "1"
@@ -639,12 +677,25 @@ def _apply_gpu_env_flags(forwarded: list[str]):
     if "--force-cargo-clean" in forwarded:
         forwarded.remove("--force-cargo-clean")
         os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
+    if "--reuse-cargo-cache" in forwarded:
+        forwarded.remove("--reuse-cargo-cache")
+        os.environ["PG_REUSE_CARGO_CACHE"] = "1"
+        os.environ["PG_FORCE_CARGO_CLEAN"] = "0"
     if "--ttt-audit" in forwarded:
         forwarded.remove("--ttt-audit")
         os.environ["PG_TTT_AUDIT"] = "1"
     if "--assert-score-no-mutation" in forwarded:
         forwarded.remove("--assert-score-no-mutation")
         os.environ["PG_TTT_ASSERT_SCORE_NO_MUTATION"] = "1"
+    if "--lora-ttt-grad-clip-norm" in forwarded:
+        idx = forwarded.index("--lora-ttt-grad-clip-norm")
+        if idx + 1 >= len(forwarded):
+            raise RuntimeError("--lora-ttt-grad-clip-norm requires a positive float")
+        value = float(forwarded[idx + 1])
+        if not math.isfinite(value) or value <= 0.0:
+            raise RuntimeError("--lora-ttt-grad-clip-norm requires a finite positive float")
+        os.environ["PG_GPU_LORA_TTT_GRAD_CLIP_NORM"] = str(value)
+        del forwarded[idx : idx + 2]
     if "--frontier-throughput-stage-profile" in forwarded:
         forwarded.remove("--frontier-throughput-stage-profile")
         _apply_frontier_fast_record_env(stage_timing=True, poison_prepacked_qkv=False)
@@ -1298,6 +1349,9 @@ def _apply_gpu_env_flags(forwarded: list[str]):
         forwarded.remove("--enable-deferred-weight-gemms")
         os.environ["PG_GPU_DEFER_MLP_UP_BWD_DW"] = "1"
         os.environ["PG_GPU_DEFER_ATTN_OUT_BWD_DW"] = "1"
+    if "--enable-deferred-qkv-weight-gemms" in forwarded:
+        forwarded.remove("--enable-deferred-qkv-weight-gemms")
+        os.environ["PG_GPU_DEFER_QKV_BWD_DW"] = "1"
     if "--enable-deferred-all-weight-gemms" in forwarded:
         forwarded.remove("--enable-deferred-all-weight-gemms")
         os.environ["PG_GPU_DEFER_LINEAR_BACKWARD_WEIGHT_GEMMS"] = "1"
@@ -1568,13 +1622,18 @@ def _run_pg_train(args: list[str], label: str):
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
+    _prefer_live_mounted_spec(forwarded)
     _apply_gpu_env_flags(forwarded)
     mode = "smoke"
     if "--mode" in forwarded:
         mode_idx = forwarded.index("--mode")
         if mode_idx + 1 < len(forwarded):
             mode = forwarded[mode_idx + 1]
-    if mode == "record" and "PG_FORCE_CARGO_CLEAN" not in os.environ:
+    if (
+        mode == "record"
+        and "PG_FORCE_CARGO_CLEAN" not in os.environ
+        and os.environ.get("PG_REUSE_CARGO_CACHE") != "1"
+    ):
         os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
     if (
         (mode == "record" or os.environ.get("PG_RECORD_SHAPED_EXPORT_ARTIFACT") == "1")
@@ -1669,6 +1728,7 @@ def _run_pg_preflight(args: list[str], label: str):
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
+    _prefer_live_mounted_spec(forwarded)
     # Preflight is the gate that decides whether a full record run is allowed
     # to allocate GPUs. The persistent Modal target cache can otherwise reuse an
     # older pg-train binary whose CLI/audit surface predates the current
@@ -1729,6 +1789,7 @@ def _run_pg_eval(args: list[str]):
     os.environ.setdefault("DATA_DIR", "/data/datasets/fineweb10B_sp8192")
     _maybe_seed_data_env()
     forwarded, result_json = _pop_result_json(args)
+    _prefer_live_mounted_spec(forwarded)
     if "--force-cargo-clean" in forwarded:
         forwarded.remove("--force-cargo-clean")
         os.environ["PG_FORCE_CARGO_CLEAN"] = "1"
@@ -2298,7 +2359,7 @@ def preflight_caseops_string(args: str):
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H100:1",
     timeout=1800,
     startup_timeout=900,
     volumes={
@@ -2312,7 +2373,35 @@ def run_eval_command(args: list[str]):
 
 @app.function(
     image=image,
-    gpu="H100:1",
+    gpu="H100:8",
+    timeout=1800,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+        "/build/target": build_cache_volume,
+    },
+)
+def run_eval_command_multi(args: list[str]):
+    return _run_pg_eval(args)
+
+@app.function(
+    image=image,
+    gpu="H100:8",
+    timeout=1800,
+    startup_timeout=900,
+    volumes={
+        "/data": data_volume,
+        "/output": output_volume,
+        "/build/target": build_cache_volume,
+    },
+)
+def run_eval_command_multi_string(args: str):
+    return _run_pg_eval(shlex.split(args))
+
+@app.function(
+    image=image,
+    gpu="H100:8",
     timeout=1800,
     startup_timeout=900,
     volumes={
@@ -2323,6 +2412,19 @@ def run_eval_command(args: list[str]):
 )
 def run_bench_command(args: list[str]):
     return _run_pg_bench(args)
+
+def _eval_command_function(forwarded: list[str]):
+    if forwarded and forwarded[0] == "eval-multi":
+        return run_eval_command_multi, forwarded[1:]
+    eval_args = forwarded[1:] if forwarded and forwarded[0] == "eval" else forwarded
+    world_size = _forwarded_option(eval_args, "--eval-gpu-world-size")
+    if world_size is not None:
+        try:
+            if int(world_size) > 1:
+                return run_eval_command_multi, eval_args
+        except ValueError:
+            pass
+    return run_eval_command, eval_args
 
 @app.local_entrypoint()
 def main(*args: str):
@@ -2341,14 +2443,25 @@ def main(*args: str):
         call_id = getattr(call, "object_id", None) or getattr(call, "id", None)
         print("Spawned seed-data Modal call:", call_id or call, flush=True)
         return
-    if forwarded and forwarded[0] == "eval":
+    if forwarded and forwarded[0] in {"eval", "eval-multi"}:
+        eval_fn, eval_args = _eval_command_function(forwarded)
         if wait_for_result:
-            result = run_eval_command.remote(forwarded[1:])
+            result = eval_fn.remote(eval_args)
             print("Eval result:", result, flush=True)
             return
-        call = run_eval_command.spawn(forwarded[1:])
+        call = eval_fn.spawn(eval_args)
         call_id = getattr(call, "object_id", None) or getattr(call, "id", None)
         print("Spawned eval Modal call:", call_id or call, flush=True)
+        return
+    if forwarded and forwarded[0] in {"preflight", "preflight-caseops", "preflight-record-data"}:
+        preflight_args = forwarded[1:] if forwarded[0] == "preflight" else forwarded
+        if wait_for_result:
+            result = preflight_caseops.remote(preflight_args)
+            print("Preflight result:", result, flush=True)
+            return
+        call = preflight_caseops.spawn(preflight_args)
+        call_id = getattr(call, "object_id", None) or getattr(call, "id", None)
+        print("Spawned preflight Modal call:", call_id or call, flush=True)
         return
     if forwarded and forwarded[0] == "bench":
         if wait_for_result:
