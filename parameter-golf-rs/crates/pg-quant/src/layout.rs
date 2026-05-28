@@ -34,6 +34,7 @@ pub struct CompiledQuantLayoutManifest {
     pub generated_from: &'static str,
     pub pack_format: &'static str,
     pub dequant_format: &'static str,
+    pub arch_profile: &'static str,
     pub groups: Vec<CompiledQuantGroupManifest>,
     pub estimated_raw_weight_bytes: Option<usize>,
     pub target_artifact_bytes: usize,
@@ -121,11 +122,12 @@ impl CompiledQuantLayoutManifest {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"layout\":\"{}\",\"generated_from\":\"{}\",\"pack_format\":\"{}\",\"dequant_format\":\"{}\",\"target_artifact_bytes\":{},\"estimated_raw_weight_bytes\":{},\"fingerprint_crc32\":\"{}\",\"groups\":[{}]}}",
+            "{{\"layout\":\"{}\",\"generated_from\":\"{}\",\"pack_format\":\"{}\",\"dequant_format\":\"{}\",\"arch_profile\":\"{}\",\"target_artifact_bytes\":{},\"estimated_raw_weight_bytes\":{},\"fingerprint_crc32\":\"{}\",\"groups\":[{}]}}",
             self.layout.name,
             self.generated_from,
             self.pack_format,
             self.dequant_format,
+            self.arch_profile,
             self.target_artifact_bytes,
             json_usize_or_null(self.estimated_raw_weight_bytes),
             self.fingerprint_crc32,
@@ -274,6 +276,7 @@ pub fn compile_quant_layout_manifest(
         generated_from,
         pack_format: "signed_packed_int_per_row_f16_scale",
         dequant_format: "per_row_scale_dequant_add_optional_lqer",
+        arch_profile: "sm90_h100",
         groups,
         estimated_raw_weight_bytes,
         target_artifact_bytes: layout.target_artifact_bytes,
@@ -304,8 +307,30 @@ fn group_manifest(
         packed_weight_bytes,
         scale_bytes,
         lqer_bytes,
-        pack_kernel: "pack_signed_values",
-        dequant_kernel: "dequant_packed_group",
+        pack_kernel: pack_kernel_for_bits(bits),
+        dequant_kernel: dequant_kernel_for_bits(bits),
+    }
+}
+
+fn pack_kernel_for_bits(bits: u8) -> &'static str {
+    match bits {
+        4 => "pack_signed_i4_per_row_sm90",
+        5 => "pack_signed_i5_per_row_sm90",
+        6 => "pack_signed_i6_per_row_sm90",
+        7 => "pack_signed_i7_per_row_sm90",
+        8 => "pack_signed_i8_per_row_sm90",
+        _ => "pack_signed_unsupported",
+    }
+}
+
+fn dequant_kernel_for_bits(bits: u8) -> &'static str {
+    match bits {
+        4 => "dequant_i4_per_row_f16_scale_sm90",
+        5 => "dequant_i5_per_row_f16_scale_sm90",
+        6 => "dequant_i6_per_row_f16_scale_sm90",
+        7 => "dequant_i7_per_row_f16_scale_sm90",
+        8 => "dequant_i8_per_row_f16_scale_sm90",
+        _ => "dequant_unsupported",
     }
 }
 
@@ -355,6 +380,7 @@ fn manifest_crc32(manifest: &CompiledQuantLayoutManifest) -> String {
     hasher.update(manifest.generated_from.as_bytes());
     hasher.update(manifest.pack_format.as_bytes());
     hasher.update(manifest.dequant_format.as_bytes());
+    hasher.update(manifest.arch_profile.as_bytes());
     hasher.update(&manifest.target_artifact_bytes.to_le_bytes());
     if let Some(bytes) = manifest.estimated_raw_weight_bytes {
         hasher.update(&bytes.to_le_bytes());
@@ -362,6 +388,8 @@ fn manifest_crc32(manifest: &CompiledQuantLayoutManifest) -> String {
     for group in &manifest.groups {
         hasher.update(group.name.as_bytes());
         hasher.update(&[group.bits]);
+        hasher.update(group.pack_kernel.as_bytes());
+        hasher.update(group.dequant_kernel.as_bytes());
         for value in [
             group.rows,
             group.cols,
@@ -466,11 +494,32 @@ mod tests {
         let config = pg_model::ModelConfig::default();
         let manifest = compile_quant_layout_manifest(&quant_spec, Some(&config)).unwrap();
         assert_eq!(manifest.layout.name, "frontier_2135_mixed_int5_int4");
+        assert_eq!(manifest.arch_profile, "sm90_h100");
         assert_eq!(manifest.groups.len(), 7);
         assert!(manifest.estimated_raw_weight_bytes.unwrap() > 0);
         assert_eq!(manifest.fingerprint_crc32.len(), 8);
+        let mlp_down = manifest
+            .groups
+            .iter()
+            .find(|group| group.name == "mlp_down_bank")
+            .expect("mlp_down_bank manifest group");
+        assert_eq!(mlp_down.bits, 4);
+        assert_eq!(mlp_down.pack_kernel, "pack_signed_i4_per_row_sm90");
+        assert_eq!(
+            mlp_down.dequant_kernel,
+            "dequant_i4_per_row_f16_scale_sm90"
+        );
+        let q_bank = manifest
+            .groups
+            .iter()
+            .find(|group| group.name == "qo_bank.q")
+            .expect("qo_bank.q manifest group");
+        assert_eq!(q_bank.bits, 5);
+        assert_eq!(q_bank.pack_kernel, "pack_signed_i5_per_row_sm90");
         let metadata = manifest.metadata_json();
         assert!(metadata.contains("\"pack_format\":\"signed_packed_int_per_row_f16_scale\""));
+        assert!(metadata.contains("\"arch_profile\":\"sm90_h100\""));
+        assert!(metadata.contains("\"pack_kernel\":\"pack_signed_i4_per_row_sm90\""));
         assert!(metadata.contains("\"name\":\"mlp_down_bank\""));
     }
 
