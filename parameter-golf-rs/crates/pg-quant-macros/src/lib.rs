@@ -13,6 +13,7 @@ fn compile_quant_layout(input: TokenStream) -> Result<TokenStream, String> {
     let tokens = unwrap_single_group(input);
     let fields = parse_fields(tokens)?;
     let name = required_string(&fields, "name")?;
+    let arch_profile = optional_string(&fields, "arch_profile", "sm90_h100")?;
     let matrix_bits = required_u8(&fields, "matrix_bits")?;
     let mlp_bits = required_u8(&fields, "mlp_bits")?;
     let embed_bits = required_u8(&fields, "embed_bits")?;
@@ -24,6 +25,7 @@ fn compile_quant_layout(input: TokenStream) -> Result<TokenStream, String> {
         &fields,
         &[
             "name",
+            "arch_profile",
             "matrix_bits",
             "mlp_bits",
             "embed_bits",
@@ -45,8 +47,17 @@ fn compile_quant_layout(input: TokenStream) -> Result<TokenStream, String> {
             ));
         }
     }
+    let arch_profile_tokens = match arch_profile.as_str() {
+        "portable_cpu" => "QuantArchProfile::PortableCpu",
+        "sm90_h100" => "QuantArchProfile::Sm90H100",
+        other => {
+            return Err(format!(
+                "arch_profile={other:?} is unsupported; expected \"portable_cpu\" or \"sm90_h100\""
+            ));
+        }
+    };
     let output = format!(
-        "CompiledQuantLayout {{ name: {name:?}, matrix_bits: {matrix_bits}, mlp_bits: {mlp_bits}, embed_bits: {embed_bits}, attn_gate_bits: {attn_gate_bits}, gptq_calibration_batches: {gptq_calibration_batches}, target_artifact_bytes: {target_artifact_bytes}, lqer_enabled: {lqer_enabled} }}"
+        "CompiledQuantLayout {{ name: {name:?}, arch_profile: {arch_profile_tokens}, matrix_bits: {matrix_bits}, mlp_bits: {mlp_bits}, embed_bits: {embed_bits}, attn_gate_bits: {attn_gate_bits}, gptq_calibration_batches: {gptq_calibration_batches}, target_artifact_bytes: {target_artifact_bytes}, lqer_enabled: {lqer_enabled} }}"
     );
     output
         .parse()
@@ -106,6 +117,23 @@ fn required_string(fields: &BTreeMap<String, TokenTree>, key: &str) -> Result<St
     let token = fields
         .get(key)
         .ok_or_else(|| format!("missing required quant_layout field `{key}`"))?;
+    match token {
+        TokenTree::Literal(lit) => literal_string(lit)
+            .ok_or_else(|| format!("quant_layout field `{key}` must be a string literal")),
+        other => Err(format!(
+            "quant_layout field `{key}` must be a string literal, got `{other}`"
+        )),
+    }
+}
+
+fn optional_string(
+    fields: &BTreeMap<String, TokenTree>,
+    key: &str,
+    default_value: &str,
+) -> Result<String, String> {
+    let Some(token) = fields.get(key) else {
+        return Ok(default_value.to_string());
+    };
     match token {
         TokenTree::Literal(lit) => literal_string(lit)
             .ok_or_else(|| format!("quant_layout field `{key}` must be a string literal")),

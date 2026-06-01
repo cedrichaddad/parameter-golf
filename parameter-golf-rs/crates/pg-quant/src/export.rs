@@ -9,6 +9,7 @@
 ///   - Embedding (tok_emb): int8 (higher precision needed for tied output)
 ///   - Scalar params: f16 (small, precision-sensitive)
 ///   - zstd-22 compression on the whole artifact
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -16,12 +17,106 @@ use pg_core::error::{PgError, PgResult};
 use pg_model::model::GptModel;
 use pg_model::spec::LqerSpec;
 use pg_model::{CompressionMode, QuantScheme, QuantSpec};
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::compress::{compress_pergroup, compress_zstd, decompress_artifact_payload};
-use crate::layout::compiled_layout_for_quant_spec;
+use crate::layout::{QuantArchProfile, compiled_layout_for_quant_spec};
+use crate::pack::{CompiledQuantKernelSet, qmax_for_bits, qmin_for_bits};
 use crate::prune::{PruneConfig, PruneStrategy, prune_then_quantize};
 use crate::scheme::{Bits, Block, GroupConfig, PackedWeight, Scheme, quantize_with};
 use crate::serialize::{SerializedTensor, write_artifact};
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ArtifactMetadata {
+    format: Option<String>,
+    version: Option<usize>,
+    variant_fingerprint: Option<String>,
+    quant_layout_manifest_crc32: Option<String>,
+    arch_profile: Option<String>,
+    quant_kernel_ids: Option<String>,
+    matrix_bits: Option<usize>,
+    mlp_bits: Option<usize>,
+    embed_bits: Option<usize>,
+    attn_gate_bits: Option<usize>,
+    gptq_calibration_batches: Option<usize>,
+    lqer_enabled: Option<usize>,
+    lqer_rank: Option<usize>,
+    lqer_a_bits: Option<usize>,
+    lqer_b_bits: Option<usize>,
+    vocab_size: Option<usize>,
+    num_layers: Option<usize>,
+    model_dim: Option<usize>,
+    num_heads: Option<usize>,
+    num_kv_heads: Option<usize>,
+    head_dim: Option<usize>,
+    mlp_dim: Option<usize>,
+    attn_out_gate_enabled: Option<usize>,
+    attn_out_gate_width: Option<usize>,
+    sparse_attn_gate_enabled: Option<usize>,
+    sparse_attn_gate_width: Option<usize>,
+    groups: Option<BTreeMap<String, usize>>,
+}
+
+impl ArtifactMetadata {
+    fn parse(raw: &str, strict: bool) -> PgResult<Self> {
+        match serde_json::from_str(raw) {
+            Ok(metadata) => Ok(metadata),
+            Err(err) if !strict => {
+                eprintln!(
+                    "WARNING: artifact metadata is not structured JSON ({err}); loading as a legacy artifact without compiled quant manifest validation"
+                );
+                Ok(Self::default())
+            }
+            Err(err) => Err(PgError::DataFormat(format!(
+                "artifact metadata is not valid JSON: {err}"
+            ))),
+        }
+    }
+
+    fn is_quant_format(&self) -> bool {
+        matches!(
+            self.format.as_deref(),
+            Some("pgrs_quant") | Some("pgrs_int6")
+        )
+    }
+
+    fn usize_field(&self, key: &str) -> Option<usize> {
+        match key {
+            "matrix_bits" => self.matrix_bits,
+            "mlp_bits" => self.mlp_bits,
+            "embed_bits" => self.embed_bits,
+            "attn_gate_bits" => self.attn_gate_bits,
+            "gptq_calibration_batches" => self.gptq_calibration_batches,
+            "lqer_enabled" => self.lqer_enabled,
+            "lqer_rank" => self.lqer_rank,
+            "lqer_a_bits" => self.lqer_a_bits,
+            "lqer_b_bits" => self.lqer_b_bits,
+            "vocab_size" => self.vocab_size,
+            "num_layers" => self.num_layers,
+            "model_dim" => self.model_dim,
+            "num_heads" => self.num_heads,
+            "num_kv_heads" => self.num_kv_heads,
+            "head_dim" => self.head_dim,
+            "mlp_dim" => self.mlp_dim,
+            "attn_out_gate_enabled" => self.attn_out_gate_enabled,
+            "attn_out_gate_width" => self.attn_out_gate_width,
+            "sparse_attn_gate_enabled" => self.sparse_attn_gate_enabled,
+            "sparse_attn_gate_width" => self.sparse_attn_gate_width,
+            _ => None,
+        }
+    }
+
+    fn group_bits(&self, group: &str) -> PgResult<usize> {
+        self.groups
+            .as_ref()
+            .and_then(|groups| groups.get(group).copied())
+            .ok_or_else(|| {
+                PgError::DataFormat(format!("artifact metadata missing bits for {group}"))
+            })
+    }
+}
 
 /// Quantize and export the model to a compressed binary artifact.
 /// Returns the artifact size in bytes.
@@ -43,6 +138,8 @@ pub fn export_model_with_spec(
     let d = c.model_dim;
     let kv = c.kv_dim();
     let mlp = c.mlp_dim;
+    let layout_manifest = crate::layout::compile_quant_layout_manifest(quant_spec, Some(c))?;
+    let kernel_set = CompiledQuantKernelSet::for_manifest(&layout_manifest);
 
     let mut tensors = Vec::new();
 
@@ -58,6 +155,7 @@ pub fn export_model_with_spec(
         &scheme.attn_q,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
     push_packed_group(
         &mut tensors,
@@ -68,6 +166,7 @@ pub fn export_model_with_spec(
         &scheme.attn_o,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
 
     let kv_split = n * kv * d;
@@ -80,6 +179,7 @@ pub fn export_model_with_spec(
         &scheme.attn_k,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
     push_packed_group(
         &mut tensors,
@@ -90,6 +190,7 @@ pub fn export_model_with_spec(
         &scheme.attn_v,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
 
     push_packed_group(
@@ -101,6 +202,7 @@ pub fn export_model_with_spec(
         &scheme.mlp_up,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
     push_packed_group(
         &mut tensors,
@@ -111,6 +213,7 @@ pub fn export_model_with_spec(
         &scheme.mlp_down,
         quant_spec.prune_keep_ratio,
         &quant_spec.lqer,
+        &kernel_set,
     );
 
     // 2. Embeddings use their own QuantSpec group because tied output quality
@@ -124,6 +227,7 @@ pub fn export_model_with_spec(
         &scheme.embed,
         None,
         &quant_spec.lqer,
+        &kernel_set,
     );
 
     // 3. Bigram params → f16
@@ -223,11 +327,12 @@ pub fn export_model_with_spec(
 }
 
 fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
-    let int4 = GroupConfig::new(Bits::B4, Block::PerRow);
-    let int7 = GroupConfig::new(Bits::B7, Block::PerRow);
-    let int8 = GroupConfig::new(Bits::B8, Block::PerRow);
     let matrix = GroupConfig::new(
         bits_from_quant_spec_nbits(quant_spec.matrix_bits, "matrix_bits")?,
+        Block::PerRow,
+    );
+    let mlp = GroupConfig::new(
+        bits_from_quant_spec_nbits(quant_spec.mlp_bits, "mlp_bits")?,
         Block::PerRow,
     );
     let embed = GroupConfig::new(
@@ -262,10 +367,6 @@ fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
                     quant_spec.gptq_calibration_batches
                 );
             }
-            let mlp = GroupConfig::new(
-                bits_from_quant_spec_nbits(quant_spec.mlp_bits, "mlp_bits")?,
-                Block::PerRow,
-            );
             Ok(Scheme {
                 attn_q: matrix.clone(),
                 attn_k: matrix.clone(),
@@ -277,22 +378,22 @@ fn scheme_from_quant_spec(quant_spec: &QuantSpec) -> PgResult<Scheme> {
             })
         }
         QuantScheme::Aggressive => Ok(Scheme {
-            attn_q: int8.clone(),
-            attn_k: int8.clone(),
-            attn_v: int8.clone(),
-            attn_o: int8.clone(),
-            mlp_up: int4.clone(),
-            mlp_down: int4,
-            embed: int8,
+            attn_q: matrix.clone(),
+            attn_k: matrix.clone(),
+            attn_v: matrix.clone(),
+            attn_o: matrix.clone(),
+            mlp_up: mlp.clone(),
+            mlp_down: mlp,
+            embed,
         }),
         QuantScheme::TightInt7Int4 => Ok(Scheme {
-            attn_q: int7.clone(),
-            attn_k: int7.clone(),
-            attn_v: int7.clone(),
-            attn_o: int7,
-            mlp_up: int4.clone(),
-            mlp_down: int4,
-            embed: int8,
+            attn_q: matrix.clone(),
+            attn_k: matrix.clone(),
+            attn_v: matrix.clone(),
+            attn_o: matrix,
+            mlp_up: mlp.clone(),
+            mlp_down: mlp,
+            embed,
         }),
     }
 }
@@ -319,6 +420,7 @@ fn push_packed_group(
     cfg: &GroupConfig,
     prune_keep_ratio: Option<f32>,
     lqer: &LqerSpec,
+    kernel_set: &CompiledQuantKernelSet,
 ) {
     let quant_source = if let Some(keep_ratio) = prune_keep_ratio {
         let mut pruned = weights.to_vec();
@@ -332,10 +434,14 @@ fn push_packed_group(
     };
 
     if lqer.enabled && lqer.rank > 0 {
-        push_lqer_tensors(tensors, name, weights, &quant_source, lqer);
+        push_lqer_tensors(tensors, name, weights, &quant_source, lqer, kernel_set);
     }
 
-    tensors.push(packed_tensor(&format!("{name}.weight"), &quant_source));
+    tensors.push(packed_tensor(
+        &format!("{name}.weight"),
+        &quant_source,
+        kernel_set,
+    ));
     tensors.push(packed_scale_tensor(&format!("{name}.scale"), &quant_source));
 }
 
@@ -345,6 +451,7 @@ fn push_lqer_tensors(
     weights: &[f32],
     packed: &PackedWeight,
     lqer: &LqerSpec,
+    kernel_set: &CompiledQuantKernelSet,
 ) {
     let recon = packed.dequantize();
     let residual: Vec<f32> = weights
@@ -361,6 +468,7 @@ fn push_lqer_tensors(
         packed.rows,
         lqer.rank,
         lqer.a_bits,
+        kernel_set,
     ));
     tensors.push(quantized_lqer_scale_tensor(
         &format!("{name}.lqer.a.scale"),
@@ -373,6 +481,7 @@ fn push_lqer_tensors(
         lqer.rank,
         packed.cols,
         lqer.b_bits,
+        kernel_set,
     ));
     tensors.push(quantized_lqer_scale_tensor(
         &format!("{name}.lqer.b.scale"),
@@ -381,12 +490,18 @@ fn push_lqer_tensors(
     ));
 }
 
-fn packed_tensor(name: &str, packed: &PackedWeight) -> SerializedTensor {
+fn packed_tensor(
+    name: &str,
+    packed: &PackedWeight,
+    kernel_set: &CompiledQuantKernelSet,
+) -> SerializedTensor {
     SerializedTensor {
         name: name.to_string(),
         shape: vec![packed.rows, packed.cols],
         dtype: pg_core::DType::I8,
-        data: pack_signed_values(&packed.data, packed.bits),
+        data: kernel_set
+            .pack_signed(&packed.data, packed.bits.nbits() as u8)
+            .expect("packed quant bit width should be validated by scheme construction"),
     }
 }
 
@@ -410,12 +525,15 @@ fn quantized_lqer_tensor(
     rows: usize,
     cols: usize,
     nbits: u8,
+    kernel_set: &CompiledQuantKernelSet,
 ) -> SerializedTensor {
     SerializedTensor {
         name: name.to_string(),
         shape: vec![rows, cols],
         dtype: pg_core::DType::I8,
-        data: pack_signed_nbits(quantized, nbits as usize),
+        data: kernel_set
+            .pack_signed(quantized, nbits)
+            .expect("LQER bit width should be validated by layout compiler"),
     }
 }
 
@@ -440,8 +558,8 @@ fn quantize_lqer_factor(
 ) -> (Vec<i8>, Vec<f32>) {
     assert_eq!(weights.len(), rows * cols);
     assert!((2..=8).contains(&nbits), "unsupported LQER bits: {nbits}");
-    let qmax = qmax_for_nbits(nbits);
-    let qmin = qmin_for_nbits(nbits);
+    let qmax = qmax_for_bits(nbits);
+    let qmin = qmin_for_bits(nbits);
     let mut q = Vec::with_capacity(weights.len());
     let mut scales = Vec::with_capacity(rows);
     for r in 0..rows {
@@ -560,89 +678,6 @@ fn normalize_with_norm(values: &mut [f32]) -> f32 {
     norm
 }
 
-fn pack_signed_values(values: &[i8], bits: Bits) -> Vec<u8> {
-    let nbits = bits.nbits();
-    let qmin = bits.qmin();
-    let mut out = vec![0u8; (values.len() * nbits + 7) / 8];
-    let mut bit_pos = 0usize;
-    for &value in values {
-        let encoded = (value as i32 - qmin) as u32;
-        for b in 0..nbits {
-            if ((encoded >> b) & 1) != 0 {
-                let dst = bit_pos + b;
-                out[dst / 8] |= 1u8 << (dst % 8);
-            }
-        }
-        bit_pos += nbits;
-    }
-    out
-}
-
-fn pack_signed_nbits(values: &[i8], nbits: usize) -> Vec<u8> {
-    assert!((2..=8).contains(&nbits));
-    let qmin = qmin_for_nbits(nbits as u8);
-    let mut out = vec![0u8; (values.len() * nbits + 7) / 8];
-    let mut bit_pos = 0usize;
-    for &value in values {
-        let encoded = (value as i32 - qmin) as u32;
-        for b in 0..nbits {
-            if ((encoded >> b) & 1) != 0 {
-                let dst = bit_pos + b;
-                out[dst / 8] |= 1u8 << (dst % 8);
-            }
-        }
-        bit_pos += nbits;
-    }
-    out
-}
-
-fn unpack_signed_values(data: &[u8], count: usize, bits: Bits) -> Vec<i8> {
-    let nbits = bits.nbits();
-    let qmin = bits.qmin();
-    let mut out = Vec::with_capacity(count);
-    let mut bit_pos = 0usize;
-    for _ in 0..count {
-        let mut encoded = 0u32;
-        for b in 0..nbits {
-            let src = bit_pos + b;
-            if src / 8 < data.len() && (data[src / 8] & (1u8 << (src % 8))) != 0 {
-                encoded |= 1u32 << b;
-            }
-        }
-        out.push((encoded as i32 + qmin) as i8);
-        bit_pos += nbits;
-    }
-    out
-}
-
-fn unpack_signed_nbits(data: &[u8], count: usize, nbits: u8) -> Vec<i8> {
-    assert!((2..=8).contains(&nbits));
-    let nbits_usize = nbits as usize;
-    let qmin = qmin_for_nbits(nbits);
-    let mut out = Vec::with_capacity(count);
-    let mut bit_pos = 0usize;
-    for _ in 0..count {
-        let mut encoded = 0u32;
-        for b in 0..nbits_usize {
-            let src = bit_pos + b;
-            if src / 8 < data.len() && (data[src / 8] & (1u8 << (src % 8))) != 0 {
-                encoded |= 1u32 << b;
-            }
-        }
-        out.push((encoded as i32 + qmin) as i8);
-        bit_pos += nbits_usize;
-    }
-    out
-}
-
-fn qmax_for_nbits(nbits: u8) -> i32 {
-    (1i32 << (nbits - 1)) - 1
-}
-
-fn qmin_for_nbits(nbits: u8) -> i32 {
-    -(1i32 << (nbits - 1))
-}
-
 fn metadata_json(
     model: &GptModel,
     quant_spec: &QuantSpec,
@@ -654,64 +689,111 @@ fn metadata_json(
     let d = c.model_dim;
     let mlp = c.mlp_dim;
     let layout_manifest = crate::layout::compile_quant_layout_manifest(quant_spec, Some(c)).ok();
-    let layout_manifest_json = layout_manifest
+    let layout_manifest_value = layout_manifest
         .as_ref()
-        .map(|manifest| manifest.metadata_json())
-        .unwrap_or_else(|| "null".to_string());
+        .and_then(|manifest| {
+            serde_json::from_str::<serde_json::Value>(&manifest.metadata_json()).ok()
+        })
+        .unwrap_or(serde_json::Value::Null);
     let layout_manifest_crc32 = layout_manifest
         .as_ref()
-        .map(|manifest| format!(r#""{}""#, manifest.fingerprint_crc32))
-        .unwrap_or_else(|| "null".to_string());
+        .map(|manifest| manifest.fingerprint_crc32.as_str());
+    let layout_arch_profile = layout_manifest
+        .as_ref()
+        .map(|manifest| manifest.arch_profile.as_str())
+        .unwrap_or("uncompiled");
+    let quant_kernel_ids = layout_manifest
+        .as_ref()
+        .map(|manifest| {
+            let mut ids: Vec<&str> = Vec::new();
+            for group in &manifest.groups {
+                if !ids.contains(&group.pack_kernel) {
+                    ids.push(group.pack_kernel);
+                }
+                if !ids.contains(&group.dequant_kernel) {
+                    ids.push(group.dequant_kernel);
+                }
+            }
+            ids.join(",")
+        })
+        .unwrap_or_default();
     let prune = quant_spec
         .prune_keep_ratio
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    format!(
-        r#"{{"format":"pgrs_quant","version":2,"variant_fingerprint":"{}","quant_layout_manifest_crc32":{},"quant_layout_manifest":{},"scheme":"{:?}","compression":"{:?}","matrix_bits":{},"mlp_bits":{},"embed_bits":{},"attn_gate_bits":{},"mlp_clip_sigmas":{},"attn_clip_sigmas":{},"embed_clip_sigmas":{},"gptq_calibration_batches":{},"prune_keep_ratio":{},"lqer_enabled":{},"lqer_rank":{},"lqer_top_k":{},"lqer_a_bits":{},"lqer_b_bits":{},"lqer_group_size":{},"lqer_asymmetric":{},"vocab_size":{},"num_layers":{},"model_dim":{},"num_heads":{},"num_kv_heads":{},"head_dim":{},"mlp_dim":{},"attn_out_gate_enabled":{},"attn_out_gate_width":{},"sparse_attn_gate_enabled":{},"sparse_attn_gate_width":{},"groups":{{"qo_bank.q":{},"qo_bank.o":{},"kv_bank.k":{},"kv_bank.v":{},"mlp_up_bank":{},"mlp_down_bank":{},"tok_emb":{}}}}}"#,
-        variant_fingerprint,
-        layout_manifest_crc32,
-        layout_manifest_json,
-        quant_spec.scheme,
-        quant_spec.compression,
-        quant_spec.matrix_bits,
-        quant_spec.mlp_bits,
-        quant_spec.embed_bits,
-        quant_spec.attn_gate_bits,
-        quant_spec.mlp_clip_sigmas,
-        quant_spec.attn_clip_sigmas,
-        quant_spec.embed_clip_sigmas,
-        quant_spec.gptq_calibration_batches,
-        prune,
-        if quant_spec.lqer.enabled { 1 } else { 0 },
-        quant_spec.lqer.rank,
-        quant_spec.lqer.top_k,
-        quant_spec.lqer.a_bits,
-        quant_spec.lqer.b_bits,
-        quant_spec.lqer.group_size,
-        if quant_spec.lqer.asymmetric { 1 } else { 0 },
-        c.vocab_size,
-        n,
-        d,
-        c.num_heads,
-        c.num_kv_heads,
-        c.head_dim,
-        mlp,
-        if c.attn_out_gate_enabled { 1 } else { 0 },
-        c.attn_out_gate_width,
-        if c.sparse_attn_gate_enabled { 1 } else { 0 },
-        c.sparse_attn_gate_width,
-        scheme.attn_q.bits.nbits(),
-        scheme.attn_o.bits.nbits(),
-        scheme.attn_k.bits.nbits(),
-        scheme.attn_v.bits.nbits(),
-        scheme.mlp_up.bits.nbits(),
-        scheme.mlp_down.bits.nbits(),
-        scheme.embed.bits.nbits(),
-    )
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "format": "pgrs_quant",
+        "version": 2,
+        "variant_fingerprint": variant_fingerprint,
+        "quant_layout_manifest_crc32": layout_manifest_crc32,
+        "quant_layout_manifest": layout_manifest_value,
+        "arch_profile": layout_arch_profile,
+        "quant_kernel_ids": quant_kernel_ids,
+        "scheme": format!("{:?}", quant_spec.scheme),
+        "compression": format!("{:?}", quant_spec.compression),
+        "matrix_bits": quant_spec.matrix_bits,
+        "mlp_bits": quant_spec.mlp_bits,
+        "embed_bits": quant_spec.embed_bits,
+        "attn_gate_bits": quant_spec.attn_gate_bits,
+        "mlp_clip_sigmas": quant_spec.mlp_clip_sigmas,
+        "attn_clip_sigmas": quant_spec.attn_clip_sigmas,
+        "embed_clip_sigmas": quant_spec.embed_clip_sigmas,
+        "gptq_calibration_batches": quant_spec.gptq_calibration_batches,
+        "prune_keep_ratio": prune,
+        "lqer_enabled": if quant_spec.lqer.enabled { 1 } else { 0 },
+        "lqer_rank": quant_spec.lqer.rank,
+        "lqer_top_k": quant_spec.lqer.top_k,
+        "lqer_a_bits": quant_spec.lqer.a_bits,
+        "lqer_b_bits": quant_spec.lqer.b_bits,
+        "lqer_group_size": quant_spec.lqer.group_size,
+        "lqer_asymmetric": if quant_spec.lqer.asymmetric { 1 } else { 0 },
+        "vocab_size": c.vocab_size,
+        "num_layers": n,
+        "model_dim": d,
+        "num_heads": c.num_heads,
+        "num_kv_heads": c.num_kv_heads,
+        "head_dim": c.head_dim,
+        "mlp_dim": mlp,
+        "attn_out_gate_enabled": if c.attn_out_gate_enabled { 1 } else { 0 },
+        "attn_out_gate_width": c.attn_out_gate_width,
+        "sparse_attn_gate_enabled": if c.sparse_attn_gate_enabled { 1 } else { 0 },
+        "sparse_attn_gate_width": c.sparse_attn_gate_width,
+        "groups": {
+            "qo_bank.q": scheme.attn_q.bits.nbits(),
+            "qo_bank.o": scheme.attn_o.bits.nbits(),
+            "kv_bank.k": scheme.attn_k.bits.nbits(),
+            "kv_bank.v": scheme.attn_v.bits.nbits(),
+            "mlp_up_bank": scheme.mlp_up.bits.nbits(),
+            "mlp_down_bank": scheme.mlp_down.bits.nbits(),
+            "tok_emb": scheme.embed.bits.nbits(),
+        }
+    })
+    .to_string()
 }
 
 /// Load a compressed artifact back into a GptModel.
 pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
+    load_artifact_inner(path, model, None, false)
+}
+
+/// Load an artifact and validate its compiled quantization manifest against the
+/// expected QuantSpec. Strict mode is intended for record/eval paths where
+/// legacy or mismatched artifacts must fail closed.
+pub fn load_artifact_with_spec(
+    path: &Path,
+    model: &mut GptModel,
+    quant_spec: &QuantSpec,
+    strict_manifest: bool,
+) -> PgResult<()> {
+    load_artifact_inner(path, model, Some(quant_spec), strict_manifest)
+}
+
+fn load_artifact_inner(
+    path: &Path,
+    model: &mut GptModel,
+    quant_spec: Option<&QuantSpec>,
+    strict_manifest: bool,
+) -> PgResult<()> {
     let compressed = std::fs::read(path)?;
     let raw = decompress_artifact_payload(&compressed)?;
 
@@ -724,7 +806,11 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
     let kv = c.kv_dim();
     let mlp = c.mlp_dim;
 
+    let metadata = ArtifactMetadata::parse(&metadata, strict_manifest)?;
     validate_artifact_metadata(&metadata, model)?;
+    if let Some(quant_spec) = quant_spec {
+        validate_artifact_quant_manifest(&metadata, model, quant_spec, strict_manifest)?;
+    }
     if c.attn_out_gate_enabled {
         for i in 0..n {
             find_tensor_result(&tensors, &format!("blocks.{i}.attn_gate_weight"))?;
@@ -738,6 +824,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
     }
 
     let has_split_quant = find_tensor_opt(&tensors, "qo_bank.q.weight").is_some();
+    let kernel_set = artifact_kernel_set_from_metadata(&metadata)?;
     if has_split_quant {
         let qo_split = n * d * d;
         dequant_packed_group(
@@ -747,6 +834,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * d,
             d,
             &mut model.qo_bank[..qo_split],
+            &kernel_set,
         )?;
         dequant_packed_group(
             &tensors,
@@ -755,6 +843,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * d,
             d,
             &mut model.qo_bank[qo_split..],
+            &kernel_set,
         )?;
         let kv_split = n * kv * d;
         dequant_packed_group(
@@ -764,6 +853,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * kv,
             d,
             &mut model.kv_bank[..kv_split],
+            &kernel_set,
         )?;
         dequant_packed_group(
             &tensors,
@@ -772,6 +862,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * kv,
             d,
             &mut model.kv_bank[kv_split..],
+            &kernel_set,
         )?;
         dequant_packed_group(
             &tensors,
@@ -780,6 +871,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * mlp,
             d,
             &mut model.mlp_up_bank,
+            &kernel_set,
         )?;
         dequant_packed_group(
             &tensors,
@@ -788,6 +880,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             n * d,
             mlp,
             &mut model.mlp_down_bank,
+            &kernel_set,
         )?;
         dequant_packed_group(
             &tensors,
@@ -796,6 +889,7 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
             c.vocab_size,
             d,
             &mut model.tok_emb,
+            &kernel_set,
         )?;
     }
 
@@ -898,30 +992,32 @@ pub fn load_artifact(path: &Path, model: &mut GptModel) -> PgResult<()> {
 
 fn dequant_packed_group(
     tensors: &[SerializedTensor],
-    metadata: &str,
+    metadata: &ArtifactMetadata,
     name: &str,
     rows: usize,
     cols: usize,
     dest: &mut [f32],
+    kernel_set: &CompiledQuantKernelSet,
 ) -> PgResult<()> {
     let weight = find_tensor_result(tensors, &format!("{name}.weight"))?;
     let scale = find_tensor_result(tensors, &format!("{name}.scale"))?;
-    let bits = bits_from_nbits(metadata_group_bits(metadata, name)?);
-    dequant_packed_into(&weight.data, &scale.data, rows, cols, bits, dest);
-    apply_lqer_if_present(tensors, metadata, name, rows, cols, dest)?;
+    let bits = metadata_group_bits(metadata, name)? as u8;
+    kernel_set.dequant_per_row(&weight.data, &scale.data, rows, cols, bits, dest)?;
+    apply_lqer_if_present(tensors, metadata, name, rows, cols, dest, kernel_set)?;
     Ok(())
 }
 
 fn apply_lqer_if_present(
     tensors: &[SerializedTensor],
-    metadata: &str,
+    metadata: &ArtifactMetadata,
     name: &str,
     rows: usize,
     cols: usize,
     dest: &mut [f32],
+    kernel_set: &CompiledQuantKernelSet,
 ) -> PgResult<()> {
     let Some(a_weight) = find_tensor_opt(tensors, &format!("{name}.lqer.a.weight")) else {
-        if metadata_usize(metadata, "lqer_enabled").unwrap_or(0) != 0 {
+        if metadata.usize_field("lqer_enabled").unwrap_or(0) != 0 {
             return Err(PgError::DataFormat(format!(
                 "artifact metadata enables LQER but tensor {name}.lqer.a.weight is missing"
             )));
@@ -932,7 +1028,7 @@ fn apply_lqer_if_present(
     let b_weight = find_tensor_result(tensors, &format!("{name}.lqer.b.weight"))?;
     let b_scale = find_tensor_result(tensors, &format!("{name}.lqer.b.scale"))?;
 
-    let rank = metadata_usize(metadata, "lqer_rank").unwrap_or(0);
+    let rank = metadata.usize_field("lqer_rank").unwrap_or(0);
     if rank == 0 {
         return Ok(());
     }
@@ -949,10 +1045,24 @@ fn apply_lqer_if_present(
         )));
     }
 
-    let a_bits = metadata_usize(metadata, "lqer_a_bits").unwrap_or(2) as u8;
-    let b_bits = metadata_usize(metadata, "lqer_b_bits").unwrap_or(4) as u8;
-    let a = dequant_lqer_factor(&a_weight.data, &a_scale.data, rows, rank, a_bits)?;
-    let b = dequant_lqer_factor(&b_weight.data, &b_scale.data, rank, cols, b_bits)?;
+    let a_bits = metadata.usize_field("lqer_a_bits").unwrap_or(2) as u8;
+    let b_bits = metadata.usize_field("lqer_b_bits").unwrap_or(4) as u8;
+    let a = dequant_lqer_factor(
+        &a_weight.data,
+        &a_scale.data,
+        rows,
+        rank,
+        a_bits,
+        kernel_set,
+    )?;
+    let b = dequant_lqer_factor(
+        &b_weight.data,
+        &b_scale.data,
+        rank,
+        cols,
+        b_bits,
+        kernel_set,
+    )?;
 
     for r in 0..rows {
         for c in 0..cols {
@@ -972,6 +1082,7 @@ fn dequant_lqer_factor(
     rows: usize,
     cols: usize,
     nbits: u8,
+    kernel_set: &CompiledQuantKernelSet,
 ) -> PgResult<Vec<f32>> {
     if !(2..=8).contains(&nbits) {
         return Err(PgError::DataFormat(format!(
@@ -985,7 +1096,7 @@ fn dequant_lqer_factor(
             scale_data.len()
         )));
     }
-    let q = unpack_signed_nbits(data, rows * cols, nbits);
+    let q = kernel_set.unpack_signed(data, rows * cols, nbits)?;
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         let scale_bits = u16::from_le_bytes([scale_data[r * 2], scale_data[r * 2 + 1]]);
@@ -997,55 +1108,28 @@ fn dequant_lqer_factor(
     Ok(out)
 }
 
-fn dequant_packed_into(
-    data: &[u8],
-    scale_data: &[u8],
-    rows: usize,
-    cols: usize,
-    bits: Bits,
-    dest: &mut [f32],
-) {
-    assert_eq!(dest.len(), rows * cols);
-    assert_eq!(scale_data.len(), rows * 2);
-    let q = unpack_signed_values(data, rows * cols, bits);
-    for r in 0..rows {
-        let scale_bits = u16::from_le_bytes([scale_data[r * 2], scale_data[r * 2 + 1]]);
-        let scale = half::f16::from_bits(scale_bits).to_f32();
-        for c in 0..cols {
-            dest[r * cols + c] = q[r * cols + c] as f32 * scale;
-        }
-    }
+fn metadata_group_bits(metadata: &ArtifactMetadata, group: &str) -> PgResult<usize> {
+    metadata.group_bits(group)
 }
 
-fn metadata_group_bits(metadata: &str, group: &str) -> PgResult<usize> {
-    let key = format!("\"{group}\":");
-    let start = metadata.find(&key).ok_or_else(|| {
-        PgError::DataFormat(format!("artifact metadata missing bits for {group}"))
-    })? + key.len();
-    let digits: String = metadata[start..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits
-        .parse::<usize>()
-        .map_err(|e| PgError::DataFormat(format!("invalid artifact bits for group {group}: {e}")))
+fn artifact_kernel_set_from_metadata(
+    metadata: &ArtifactMetadata,
+) -> PgResult<CompiledQuantKernelSet> {
+    let Some(label) = metadata.arch_profile.as_deref() else {
+        return Ok(CompiledQuantKernelSet::from_arch_profile(
+            QuantArchProfile::record_default(),
+        ));
+    };
+    let arch_profile = QuantArchProfile::from_label(label).ok_or_else(|| {
+        PgError::DataFormat(format!(
+            "artifact metadata contains unsupported quant arch profile: {label}"
+        ))
+    })?;
+    Ok(CompiledQuantKernelSet::from_arch_profile(arch_profile))
 }
 
-fn bits_from_nbits(nbits: usize) -> Bits {
-    match nbits {
-        4 => Bits::B4,
-        5 => Bits::B5,
-        6 => Bits::B6,
-        7 => Bits::B7,
-        8 => Bits::B8,
-        _ => panic!("unsupported quantized bit width: {nbits}"),
-    }
-}
-
-fn validate_artifact_metadata(metadata: &str, model: &GptModel) -> PgResult<()> {
-    if metadata.contains(r#""format":"pgrs_quant""#) || metadata.contains(r#""format":"pgrs_int6""#)
-    {
+fn validate_artifact_metadata(metadata: &ArtifactMetadata, model: &GptModel) -> PgResult<()> {
+    if metadata.is_quant_format() {
         let c = &model.config;
         for (key, expected) in [
             ("vocab_size", c.vocab_size),
@@ -1066,7 +1150,7 @@ fn validate_artifact_metadata(metadata: &str, model: &GptModel) -> PgResult<()> 
             ),
             ("sparse_attn_gate_width", c.sparse_attn_gate_width),
         ] {
-            if let Some(got) = metadata_usize(metadata, key) {
+            if let Some(got) = metadata.usize_field(key) {
                 if got != expected {
                     return Err(PgError::DataFormat(format!(
                         "artifact metadata mismatch for {key}: expected {expected}, got {got}"
@@ -1078,15 +1162,65 @@ fn validate_artifact_metadata(metadata: &str, model: &GptModel) -> PgResult<()> 
     Ok(())
 }
 
-fn metadata_usize(metadata: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\":");
-    let start = metadata.find(&needle)? + needle.len();
-    let digits: String = metadata[start..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+fn validate_artifact_quant_manifest(
+    metadata: &ArtifactMetadata,
+    model: &GptModel,
+    quant_spec: &QuantSpec,
+    strict_manifest: bool,
+) -> PgResult<()> {
+    if !metadata.is_quant_format() {
+        if strict_manifest {
+            return Err(PgError::DataFormat(
+                "strict quant manifest validation requires a pgrs quant artifact".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let expected_manifest =
+        crate::layout::compile_quant_layout_manifest(quant_spec, Some(&model.config))?;
+    for (key, expected) in [
+        ("matrix_bits", quant_spec.matrix_bits as usize),
+        ("mlp_bits", quant_spec.mlp_bits as usize),
+        ("embed_bits", quant_spec.embed_bits as usize),
+        ("attn_gate_bits", quant_spec.attn_gate_bits as usize),
+        (
+            "gptq_calibration_batches",
+            quant_spec.gptq_calibration_batches,
+        ),
+    ] {
+        match metadata.usize_field(key) {
+            Some(got) if got == expected => {}
+            Some(got) => {
+                return Err(PgError::DataFormat(format!(
+                    "artifact quant metadata mismatch for {key}: expected {expected}, got {got}"
+                )));
+            }
+            None if strict_manifest => {
+                return Err(PgError::DataFormat(format!(
+                    "artifact quant metadata missing required field {key}"
+                )));
+            }
+            None => {}
+        }
+    }
+
+    match metadata.quant_layout_manifest_crc32.as_deref() {
+        Some(got) if got == expected_manifest.fingerprint_crc32 => {}
+        Some(got) => {
+            return Err(PgError::DataFormat(format!(
+                "artifact quant layout manifest CRC mismatch: expected {}, got {}",
+                expected_manifest.fingerprint_crc32, got
+            )));
+        }
+        None if strict_manifest => {
+            return Err(PgError::DataFormat(
+                "artifact quant metadata missing quant_layout_manifest_crc32".into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn f16_tensor(name: &str, weights: &[f32]) -> SerializedTensor {
@@ -1272,6 +1406,213 @@ mod tests {
         assert!(loaded.qo_bank.iter().all(|v| v.is_finite()));
         assert!(loaded.mlp_up_bank.iter().all(|v| v.is_finite()));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn export_metadata_embeds_compiled_quant_manifest_and_kernel_ids() {
+        let config = small_config();
+        let model = GptModel::new(config);
+        let spec = QuantSpec {
+            scheme: QuantScheme::Aggressive,
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            gptq_calibration_batches: 32,
+            lqer: LqerSpec {
+                enabled: true,
+                ..Default::default()
+            },
+            ..QuantSpec::default()
+        };
+        let scheme = scheme_from_quant_spec(&spec).unwrap();
+        let metadata = metadata_json(&model, &spec, &scheme, "metadata_test");
+        assert!(metadata.contains("\"quant_layout_manifest_crc32\":\""));
+        assert!(metadata.contains("\"quant_layout_manifest\":{"));
+        assert!(metadata.contains("\"arch_profile\":\"sm90_h100\""));
+        assert!(metadata.contains("\"quant_kernel_ids\":\""));
+        assert!(metadata.contains("pack_signed_i4_per_row_sm90"));
+        assert!(metadata.contains("dequant_i4_per_row_f16_scale_sm90"));
+    }
+
+    #[test]
+    fn artifact_kernel_set_rejects_unknown_arch_profile() {
+        let metadata = ArtifactMetadata::parse(r#"{"arch_profile":"sm123_future"}"#, true).unwrap();
+        let err = artifact_kernel_set_from_metadata(&metadata)
+            .expect_err("unknown arch profile must fail closed for compiled artifacts");
+        assert!(err.to_string().contains("unsupported quant arch profile"));
+    }
+
+    #[test]
+    fn artifact_metadata_parser_fails_strict_and_allows_legacy_non_strict() {
+        let err = ArtifactMetadata::parse("not-json", true)
+            .expect_err("strict record/eval paths must reject malformed metadata");
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
+
+        let legacy = ArtifactMetadata::parse("not-json", false).unwrap();
+        assert!(!legacy.is_quant_format());
+        assert!(legacy.groups.is_none());
+    }
+
+    #[test]
+    fn strict_quant_manifest_validation_rejects_missing_crc() {
+        let config = small_config();
+        let model = GptModel::new(config);
+        let spec = QuantSpec {
+            scheme: QuantScheme::Aggressive,
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            gptq_calibration_batches: 32,
+            lqer: LqerSpec {
+                enabled: true,
+                ..Default::default()
+            },
+            ..QuantSpec::default()
+        };
+        let metadata = ArtifactMetadata::parse(
+            r#"{"format":"pgrs_quant","version":2,"matrix_bits":5,"mlp_bits":4,"embed_bits":6,"attn_gate_bits":8,"gptq_calibration_batches":32}"#,
+            true,
+        )
+        .unwrap();
+        let err = validate_artifact_quant_manifest(&metadata, &model, &spec, true)
+            .expect_err("strict record/eval paths require manifest CRC");
+        assert!(
+            err.to_string()
+                .contains("missing quant_layout_manifest_crc32"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn strict_artifact_loader_rejects_quant_manifest_mismatch() {
+        let config = small_config();
+        let model = GptModel::new(config.clone());
+        let spec = QuantSpec {
+            scheme: QuantScheme::Aggressive,
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            gptq_calibration_batches: 32,
+            lqer: LqerSpec {
+                enabled: true,
+                ..Default::default()
+            },
+            ..QuantSpec::default()
+        };
+        let tmp = std::env::temp_dir().join("pg_test_artifact_manifest_mismatch.pgrs");
+        export_model_with_spec(&model, &spec, "manifest_mismatch", &tmp).unwrap();
+
+        let mut mismatched_spec = spec.clone();
+        mismatched_spec.matrix_bits = 6;
+        let mut loaded = GptModel::new(config);
+        let err = load_artifact_with_spec(&tmp, &mut loaded, &mismatched_spec, true)
+            .expect_err("strict loader must reject mismatched QuantSpec");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            err.to_string().contains("artifact quant metadata mismatch")
+                || err.to_string().contains("compiled quant layout"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn compiled_manifest_byte_estimate_matches_exported_tensor_payloads() {
+        let config = small_config();
+        let model = GptModel::new(config.clone());
+        let spec = QuantSpec {
+            scheme: QuantScheme::Aggressive,
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            gptq_calibration_batches: 32,
+            lqer: LqerSpec {
+                enabled: true,
+                rank: 2,
+                top_k: 3,
+                a_bits: 2,
+                b_bits: 4,
+                group_size: 64,
+                asymmetric: true,
+            },
+            ..QuantSpec::default()
+        };
+        let tmp = std::env::temp_dir().join("pg_test_artifact_byte_estimate.pgrs");
+        export_model_with_spec(&model, &spec, "byte_estimate", &tmp).unwrap();
+
+        let compressed = std::fs::read(&tmp).unwrap();
+        let raw = decompress_artifact_payload(&compressed).unwrap();
+        let mut cursor = std::io::Cursor::new(raw);
+        let (tensors, metadata_raw) = crate::serialize::read_artifact(&mut cursor).unwrap();
+        let metadata = ArtifactMetadata::parse(&metadata_raw, true).unwrap();
+        let manifest = crate::layout::compile_quant_layout_manifest(&spec, Some(&config)).unwrap();
+
+        let mut actual = 0usize;
+        for group in &manifest.groups {
+            actual += find_tensor(&tensors, &format!("{}.weight", group.name))
+                .data
+                .len();
+            actual += find_tensor(&tensors, &format!("{}.scale", group.name))
+                .data
+                .len();
+            if spec.lqer.enabled {
+                actual += find_tensor(&tensors, &format!("{}.lqer.a.weight", group.name))
+                    .data
+                    .len();
+                actual += find_tensor(&tensors, &format!("{}.lqer.a.scale", group.name))
+                    .data
+                    .len();
+                actual += find_tensor(&tensors, &format!("{}.lqer.b.weight", group.name))
+                    .data
+                    .len();
+                actual += find_tensor(&tensors, &format!("{}.lqer.b.scale", group.name))
+                    .data
+                    .len();
+            }
+            assert_eq!(
+                metadata.group_bits(group.name).unwrap(),
+                group.bits as usize
+            );
+        }
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(Some(actual), manifest.estimated_raw_weight_bytes);
+    }
+
+    #[test]
+    fn strict_export_reload_tiny_eval_smoke_produces_finite_loss() {
+        let config = small_config();
+        let model = GptModel::new(config.clone());
+        let spec = QuantSpec {
+            scheme: QuantScheme::Aggressive,
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            gptq_calibration_batches: 32,
+            lqer: LqerSpec {
+                enabled: true,
+                rank: 2,
+                ..Default::default()
+            },
+            ..QuantSpec::default()
+        };
+        let tmp = std::env::temp_dir().join("pg_test_artifact_tiny_eval_smoke.pgrs");
+        export_model_with_spec(&model, &spec, "tiny_eval_smoke", &tmp).unwrap();
+
+        let mut loaded = GptModel::new(config.clone());
+        load_artifact_with_spec(&tmp, &mut loaded, &spec, true).unwrap();
+        let inputs = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        let targets = vec![2u32, 3, 4, 5, 6, 7, 8, 9];
+        let mut buf = pg_model::model::ForwardBuffer::new(&config, inputs.len());
+        loaded.forward(&inputs, &mut buf);
+        let loss = loaded.compute_loss(&targets, &buf);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            loss.is_finite(),
+            "strict exported artifact loss is not finite"
+        );
+        assert!(
+            loss > 0.0,
+            "strict exported artifact loss should be positive"
+        );
     }
 
     #[test]

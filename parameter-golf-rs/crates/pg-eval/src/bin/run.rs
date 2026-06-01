@@ -154,7 +154,13 @@ fn main() {
         let mut model = GptModel::new(run_spec.model.to_model_config());
         model.fill_deterministic();
         if let Some(path) = artifact.as_ref() {
-            pg_quant::export::load_artifact(path, &mut model).expect("failed to load artifact");
+            pg_quant::export::load_artifact_with_spec(
+                path,
+                &mut model,
+                &run_spec.quant,
+                leaderboard_mode,
+            )
+            .expect("failed to load artifact");
         }
         let tokens = pg_data::token_stream::load_validation_tokens_limited(
             pattern,

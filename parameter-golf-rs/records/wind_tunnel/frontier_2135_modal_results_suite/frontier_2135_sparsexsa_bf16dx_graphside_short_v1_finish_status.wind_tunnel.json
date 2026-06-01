@@ -1,0 +1,702 @@
+{
+  "kind": "pg_local_wind_tunnel",
+  "spec_fingerprint": "b33646024b31d3df",
+  "estimate_only": true,
+  "prediction_source": "trace_total_calibrated",
+  "trace_path": "../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_sparsexsa_bf16dx_graphside_short_v1.finish_status.json",
+  "trace_total_ms": 127.99365,
+  "trace_coverage": {
+    "trace_supplied": true,
+    "has_total_timing": true,
+    "expected_fields": [
+      "timing_measured_ms_per_step",
+      "backward_block_mlp_ms",
+      "backward_block_qkv_ms",
+      "backward_block_attention_sdpa_ms",
+      "backward_block_attn_out_gate_xsa_ms",
+      "timing_cuda_backward_recurrent_pass2_ms_per_step",
+      "timing_cuda_backward_recurrent_pass1_ms_per_step",
+      "output_ms",
+      "bank_update_ms_per_step",
+      "non_bank_update_ms_per_step",
+      "timing_recurrent_active_ms_per_step",
+      "timing_recurrent_inactive_ms_per_step"
+    ],
+    "present_fields": [
+      "timing_measured_ms_per_step"
+    ],
+    "missing_fields": [
+      "backward_block_mlp_ms",
+      "backward_block_qkv_ms",
+      "backward_block_attention_sdpa_ms",
+      "backward_block_attn_out_gate_xsa_ms",
+      "timing_cuda_backward_recurrent_pass2_ms_per_step",
+      "timing_cuda_backward_recurrent_pass1_ms_per_step",
+      "output_ms",
+      "bank_update_ms_per_step",
+      "non_bank_update_ms_per_step",
+      "timing_recurrent_active_ms_per_step",
+      "timing_recurrent_inactive_ms_per_step"
+    ],
+    "mapped_stage_count": 0,
+    "nonzero_mapped_stage_count": 0,
+    "defaulted_stage_count": 10,
+    "coverage_ratio": 0.08333333333333333,
+    "useful_stage_coverage_ratio": 0.0,
+    "nonzero_stage_fields": [],
+    "zero_stage_fields": [],
+    "traced_stage_ms": -0.0,
+    "traced_stage_ms_ratio": -0.0,
+    "signal_quality": "total_only"
+  },
+  "recurrent_backward_profile": "exact_fused",
+  "exact_recurrent_boundary_fusion": "enabled_exact_boundary_only",
+  "exact_recurrent_boundary_layers": [
+    3,
+    4,
+    5
+  ],
+  "persistent_cta_block_backward": "not_implemented_unclaimed",
+  "train_step_ms_estimate": 127.99365,
+  "expected_train_wall_seconds": 639.2002881,
+  "active_recurrent_step_ms_estimate": 145.99365,
+  "inactive_recurrent_step_ms_estimate": 123.49365,
+  "active_recurrent_trace_ms_per_step": null,
+  "inactive_recurrent_trace_ms_per_step": null,
+  "recurrent_split": {
+    "recurrent_enabled": true,
+    "active_step_ms": 145.99365,
+    "inactive_step_ms": 123.49365,
+    "active_minus_inactive_ms": 22.5,
+    "active_source": "shape_model_default_recurrent_penalty",
+    "inactive_source": "shape_model_default_recurrent_penalty",
+    "exact_boundary_fusion": "enabled_exact_boundary_only",
+    "exact_boundary_layers": [
+      3,
+      4,
+      5
+    ]
+  },
+  "optimizer_update_ms_estimate": 15.0,
+  "output_ce_ms_estimate": 7.2,
+  "expected_train_steps_in_600s": 4687,
+  "eval_time_ms_estimate": 512.0,
+  "artifact_bytes_estimate": 27736120,
+  "budget_status": [
+    {
+      "name": "train",
+      "status": "fail",
+      "estimate": 639.2002881,
+      "budget": 600.0,
+      "unit": "seconds",
+      "source": "total_iterations*127.994ms_step_estimate"
+    },
+    {
+      "name": "eval",
+      "status": "unknown_budget",
+      "estimate": 0.512,
+      "budget": null,
+      "unit": "seconds",
+      "source": "chunk_tokens/64000_local_proxy_no_run_spec_wall_budget"
+    },
+    {
+      "name": "artifact",
+      "status": "fail",
+      "estimate": 27736120.0,
+      "budget": 16000000.0,
+      "unit": "bytes",
+      "source": "quant_layout_manifest_estimated_raw_weight_bytes"
+    }
+  ],
+  "top_bottleneck": "forward_replay",
+  "top_bottlenecks": [
+    {
+      "rank": 1,
+      "stage": "forward_replay",
+      "ms": 42.0,
+      "pct_of_step": 32.814127888375715,
+      "source": "shape_model_default"
+    },
+    {
+      "rank": 2,
+      "stage": "qkv_backward",
+      "ms": 21.0,
+      "pct_of_step": 16.407063944187858,
+      "source": "shape_model_default"
+    },
+    {
+      "rank": 3,
+      "stage": "mlp_backward",
+      "ms": 20.0,
+      "pct_of_step": 15.625775184940816,
+      "source": "shape_model_default"
+    }
+  ],
+  "next_recommended_experiment": "try exact_recurrent_replay_cut (estimated -17.000 ms/step; train budget pass)",
+  "recommendations": [
+    "collect a stage-timing trace and update the local calibration",
+    "try exact recurrent QKV tail deferral or compact pack fusion",
+    "try BF16 MLP backward bridge removal and fused activation tail",
+    "add missing trace markers for qkv/mlp/attention/output/optimizer stages",
+    "use this trace for total-step calibration only; collect graph-disabled stage timing for attribution",
+    "record active and inactive recurrent timings in the next trace",
+    "reduce step time or total iterations before relying on train budget fit",
+    "tighten quantization or compression before artifact verification"
+  ],
+  "risk_flags": [
+    "estimate_only_not_record_claim",
+    "low_trace_field_coverage",
+    "trace_total_only_no_stage_attribution",
+    "recurrent_active_inactive_split_defaulted",
+    "train_wall_budget_risk",
+    "artifact_budget_risk"
+  ],
+  "what_if_scenarios": [
+    {
+      "name": "exact_recurrent_replay_cut",
+      "description": "Exact recurrent replay fusion reduces active-window replay work without straight-through gradients.",
+      "status": "candidate_unimplemented_or_partially_implemented",
+      "delta_ms_per_step": 17.0,
+      "train_step_ms_estimate": 110.99365,
+      "active_recurrent_step_ms_estimate": 128.99365,
+      "expected_train_steps_in_600s": 5405,
+      "expected_train_wall_seconds": 554.3022881,
+      "train_budget_status": "pass",
+      "rationale": "Uses active/inactive recurrent gap and caps the estimate at the known ~8-17 ms blocker band.",
+      "estimate_only": true
+    },
+    {
+      "name": "persistent_cta_recurrent_boundary",
+      "description": "Persistent-CTA recurrent boundary kernel removes launch/HBM replay around recurrent layers.",
+      "status": "speculative_requires_kernel_and_h100_validation",
+      "delta_ms_per_step": 23.0,
+      "train_step_ms_estimate": 104.99365,
+      "active_recurrent_step_ms_estimate": 122.99365,
+      "expected_train_steps_in_600s": 5714,
+      "expected_train_wall_seconds": 524.3382881,
+      "train_budget_status": "pass",
+      "rationale": "Upper-bound planning scenario for the proposal kernel; not implementation evidence.",
+      "estimate_only": true
+    },
+    {
+      "name": "optimizer_launch_collapse",
+      "description": "Collapse/capture optimizer launch groups after recurrent speed is under control.",
+      "status": "candidate_needs_trace_ab",
+      "delta_ms_per_step": 6.0,
+      "train_step_ms_estimate": 121.99365,
+      "active_recurrent_step_ms_estimate": null,
+      "expected_train_steps_in_600s": 4918,
+      "expected_train_wall_seconds": 609.2362881,
+      "train_budget_status": "fail",
+      "rationale": "Uses the optimizer stage estimate; capped because prior bank-update work already removed the largest wall-time issue.",
+      "estimate_only": true
+    },
+    {
+      "name": "output_ce_retest",
+      "description": "Retest fused output projection/CE only if stage timing keeps CE in the top bottlenecks.",
+      "status": "low_priority_unless_trace_shows_ce_hot",
+      "delta_ms_per_step": 4.0,
+      "train_step_ms_estimate": 123.99365,
+      "active_recurrent_step_ms_estimate": null,
+      "expected_train_steps_in_600s": 4838,
+      "expected_train_wall_seconds": 619.2242881,
+      "train_budget_status": "fail",
+      "rationale": "Chunked BF16 CE is normally not the limiting stage; this is a bounded diagnostic scenario.",
+      "estimate_only": true
+    },
+    {
+      "name": "full_train_step_graph",
+      "description": "Extend graph capture from no-loss backward to the full train-step boundary.",
+      "status": "future_work_graph_safety_required",
+      "delta_ms_per_step": 5.119746000000006,
+      "train_step_ms_estimate": 122.873904,
+      "active_recurrent_step_ms_estimate": null,
+      "expected_train_steps_in_600s": 4883,
+      "expected_train_wall_seconds": 613.632276576,
+      "train_budget_status": "fail",
+      "rationale": "Planning estimate for host launch overhead; requires numerical parity and graph-safe updates.",
+      "estimate_only": true
+    }
+  ],
+  "experiment_rankings": [
+    {
+      "rank": 1,
+      "scenario": "exact_recurrent_replay_cut",
+      "priority_score": 6.785,
+      "delta_ms_per_step": 17.0,
+      "train_step_ms_estimate": 110.99365,
+      "train_budget_status": "pass",
+      "trace_confidence": "low_trace_coverage",
+      "rationale": "Uses active/inactive recurrent gap and caps the estimate at the known ~8-17 ms blocker band.",
+      "recommended_validation": "run exact #2135 record-shaped proxy with active recurrent timed steps and BF16/F32 bridge counters"
+    },
+    {
+      "rank": 2,
+      "scenario": "persistent_cta_recurrent_boundary",
+      "priority_score": 6.56975,
+      "delta_ms_per_step": 23.0,
+      "train_step_ms_estimate": 104.99365,
+      "train_budget_status": "pass",
+      "trace_confidence": "low_trace_coverage",
+      "rationale": "Upper-bound planning scenario for the proposal kernel; not implementation evidence.",
+      "recommended_validation": "first run CUDA parity smoke for recurrent boundary kernel, then a short active-window H100 A/B"
+    },
+    {
+      "rank": 3,
+      "scenario": "optimizer_launch_collapse",
+      "priority_score": 0.9000000000000001,
+      "delta_ms_per_step": 6.0,
+      "train_step_ms_estimate": 121.99365,
+      "train_budget_status": "fail",
+      "trace_confidence": "low_trace_coverage",
+      "rationale": "Uses the optimizer stage estimate; capped because prior bank-update work already removed the largest wall-time issue.",
+      "recommended_validation": "run graph-on/off and sharded Muon update timing A/B under the exact recurrent profile"
+    },
+    {
+      "rank": 4,
+      "scenario": "full_train_step_graph",
+      "priority_score": 0.6143695200000009,
+      "delta_ms_per_step": 5.119746000000006,
+      "train_step_ms_estimate": 122.873904,
+      "train_budget_status": "fail",
+      "trace_confidence": "low_trace_coverage",
+      "rationale": "Planning estimate for host launch overhead; requires numerical parity and graph-safe updates.",
+      "recommended_validation": "run numerical parity smoke before any wall-clock A/B because the graph boundary changes update ordering"
+    },
+    {
+      "rank": 5,
+      "scenario": "output_ce_retest",
+      "priority_score": 0.6000000000000001,
+      "delta_ms_per_step": 4.0,
+      "train_step_ms_estimate": 123.99365,
+      "train_budget_status": "fail",
+      "trace_confidence": "low_trace_coverage",
+      "rationale": "Chunked BF16 CE is normally not the limiting stage; this is a bounded diagnostic scenario.",
+      "recommended_validation": "run stage-timing A/B only if output_ce remains a top-three measured bottleneck"
+    }
+  ],
+  "stage_estimates": [
+    {
+      "name": "forward_replay",
+      "ms": 42.0,
+      "pct_of_step": 32.814127888375715,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "mlp_backward",
+      "ms": 20.0,
+      "pct_of_step": 15.625775184940816,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "qkv_backward",
+      "ms": 21.0,
+      "pct_of_step": 16.407063944187858,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "attention_backward",
+      "ms": 14.0,
+      "pct_of_step": 10.93804262945857,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "gate_xsa_backward",
+      "ms": 12.5,
+      "pct_of_step": 9.76610949058801,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "output_ce",
+      "ms": 7.2,
+      "pct_of_step": 5.625279066578694,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "optimizer_update",
+      "ms": 15.0,
+      "pct_of_step": 11.719331388705612,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "non_bank_update",
+      "ms": 2.5,
+      "pct_of_step": 1.953221898117602,
+      "source": "shape_model_default"
+    },
+    {
+      "name": "recurrent_pass2_backward",
+      "ms": 0.0,
+      "pct_of_step": 0.0,
+      "source": "trace_only_recurrent_stage"
+    },
+    {
+      "name": "recurrent_pass1_backward",
+      "ms": 0.0,
+      "pct_of_step": 0.0,
+      "source": "trace_only_recurrent_stage"
+    }
+  ],
+  "operation_dag": [
+    {
+      "name": "token_embedding",
+      "op_kind": "embedding_lookup",
+      "status": "implemented",
+      "layer": null,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 536870912,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_0_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 0,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_0_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 0,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_0_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 0,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_1_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 1,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_1_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 1,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_1_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 1,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_2_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 2,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_2_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 2,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_2_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 2,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_3_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 3,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_3_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 3,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_3_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 3,
+      "flops_estimate": 4398046511104,
+      "hbm_bytes_estimate": 5368709120,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_3_recurrent_pass_boundary",
+      "op_kind": "exact_recurrent_boundary_fusion",
+      "status": "enabled_exact_boundary_only",
+      "layer": 3,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 0,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_4_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 4,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_4_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 4,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_4_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 4,
+      "flops_estimate": 4398046511104,
+      "hbm_bytes_estimate": 5368709120,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_4_recurrent_pass_boundary",
+      "op_kind": "exact_recurrent_boundary_fusion",
+      "status": "enabled_exact_boundary_only",
+      "layer": 4,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 0,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_5_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 5,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_5_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 5,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2147483648,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_5_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 5,
+      "flops_estimate": 4398046511104,
+      "hbm_bytes_estimate": 5368709120,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_5_recurrent_pass_boundary",
+      "op_kind": "exact_recurrent_boundary_fusion",
+      "status": "enabled_exact_boundary_only",
+      "layer": 5,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 0,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_6_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 6,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_6_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 6,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_6_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 6,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_7_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 7,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_7_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 7,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_7_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 7,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_8_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 8,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_8_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 8,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_8_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 8,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_9_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 9,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_9_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 9,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_9_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 9,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_10_qkv_projection",
+      "op_kind": "bf16_gemm_qkv",
+      "status": "implemented",
+      "layer": 10,
+      "flops_estimate": 549755813888,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_10_sdpa",
+      "op_kind": "sdpa_adjacent_xsa",
+      "status": "adjacent_sparse_xsa",
+      "layer": 10,
+      "flops_estimate": 1099511627776,
+      "hbm_bytes_estimate": 1073741824,
+      "record_relevant": true
+    },
+    {
+      "name": "layer_10_mlp",
+      "op_kind": "bf16_mlp_up_down",
+      "status": "implemented",
+      "layer": 10,
+      "flops_estimate": 2199023255552,
+      "hbm_bytes_estimate": 2684354560,
+      "record_relevant": true
+    },
+    {
+      "name": "output_projection_ce",
+      "op_kind": "chunked_bf16_cache_ce",
+      "status": "implemented",
+      "layer": null,
+      "flops_estimate": 4398046511104,
+      "hbm_bytes_estimate": 536870912,
+      "record_relevant": true
+    },
+    {
+      "name": "sharded_parallel_muon",
+      "op_kind": "optimizer_reduce_scatter_update_all_gather",
+      "status": "implemented",
+      "layer": null,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 126877696,
+      "record_relevant": true
+    },
+    {
+      "name": "persistent_cta_block_backward",
+      "op_kind": "persistent_cta_recurrent_backward",
+      "status": "not_implemented_unclaimed",
+      "layer": null,
+      "flops_estimate": 0,
+      "hbm_bytes_estimate": 0,
+      "record_relevant": false
+    }
+  ]
+}

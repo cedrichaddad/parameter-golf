@@ -3155,9 +3155,11 @@ impl VariantRunner {
                     let mut eval_model = GptModel::new(model_config.clone());
                     eval_model.fill_deterministic();
                     if !matches!(mode, RunMode::Smoke) && artifact_bytes.is_some() {
-                        pg_quant::export::load_artifact(
+                        pg_quant::export::load_artifact_with_spec(
                             std::path::Path::new(&self.run_spec.train.artifact_path),
                             &mut eval_model,
+                            &self.run_spec.quant,
+                            matches!(mode, RunMode::Record),
                         )?;
                     } else {
                         eval_model = model;
@@ -7467,6 +7469,34 @@ fn record_path_audit_json(
     let model_config = run_spec.model.to_model_config();
     let quant_layout_manifest =
         pg_quant::layout::compile_quant_layout_manifest(&run_spec.quant, Some(&model_config)).ok();
+    let quant_kernel_ids = quant_layout_manifest.as_ref().map(|manifest| {
+        let mut ids: Vec<&str> = Vec::new();
+        for group in &manifest.groups {
+            if !ids.contains(&group.pack_kernel) {
+                ids.push(group.pack_kernel);
+            }
+            if !ids.contains(&group.dequant_kernel) {
+                ids.push(group.dequant_kernel);
+            }
+        }
+        ids.join(",")
+    });
+    let adjacent_sparse_xsa_active = run_spec.model.sparse_attn_gate.enabled
+        && run_spec.model.xsa_last_n > 0
+        && bf16_sparse_xsa_forward_enabled_for_audit()
+        && (sparse_xsa_warphead_backward_enabled_for_audit()
+            || sparse_xsa_grouped_kv_backward_enabled_for_audit());
+    let xsa_fusion_kind = if adjacent_sparse_xsa_active {
+        "adjacent_sparse_xsa"
+    } else {
+        "none"
+    };
+    let exact_recurrent_boundary_fusion_active = run_spec.model.recurrence.enabled
+        && matches!(
+            run_spec.runtime.recurrent_backward_profile,
+            RecurrentBackwardProfile::ExactFused
+        )
+        && recurrent_fused_pass_boundary_backward_enabled_for_audit();
     let mut fields = Vec::with_capacity(30);
     fields.push(json_str_field("event", "record_path_audit"));
     fields.push(json_str_field("mode", run_mode_label(mode)));
@@ -8360,6 +8390,41 @@ fn record_path_audit_json(
             .as_ref()
             .map(|manifest| manifest.fingerprint_crc32.as_str()),
     ));
+    fields.push(json_opt_str_field(
+        "quant_layout_manifest_crc32",
+        quant_layout_manifest
+            .as_ref()
+            .map(|manifest| manifest.fingerprint_crc32.as_str()),
+    ));
+    fields.push(json_opt_str_field(
+        "proposal_quantization_layout_arch_profile",
+        quant_layout_manifest
+            .as_ref()
+            .map(|manifest| manifest.arch_profile.as_str()),
+    ));
+    fields.push(json_opt_str_field(
+        "proposal_quantization_kernel_ids",
+        quant_kernel_ids.as_deref(),
+    ));
+    fields.push(json_opt_str_field(
+        "quant_kernel_ids",
+        quant_kernel_ids.as_deref(),
+    ));
+    fields.push(json_str_field(
+        "quant_arch_profile",
+        quant_layout_manifest
+            .as_ref()
+            .map(|manifest| manifest.arch_profile.as_str())
+            .unwrap_or("uncompiled"),
+    ));
+    fields.push(json_str_field(
+        "compiled_cuda_arches",
+        pg_kernels::COMPILED_CUDA_ARCHES.unwrap_or("unknown"),
+    ));
+    fields.push(json_str_field(
+        "compiled_arch_profile",
+        pg_kernels::COMPILED_ARCH_PROFILE.unwrap_or("unknown"),
+    ));
     fields.push(json_opt_usize_field(
         "proposal_quantization_layout_estimated_raw_weight_bytes",
         quant_layout_manifest
@@ -8379,21 +8444,31 @@ fn record_path_audit_json(
         run_spec.model.bigram.enabled && run_spec.runtime.bigram_embedding_merge
     ));
     fields.push(format!(
-        "\"proposal_sparse_xsa_gate_fusion_active\":{}",
-        run_spec.model.sparse_attn_gate.enabled
-            && run_spec.model.xsa_last_n > 0
-            && bf16_sparse_xsa_forward_enabled_for_audit()
-            && (sparse_xsa_warphead_backward_enabled_for_audit()
-                || sparse_xsa_grouped_kv_backward_enabled_for_audit())
+        "\"bigram_enabled\":{}",
+        run_spec.model.bigram.enabled
     ));
+    fields.push(format!(
+        "\"bigram_embedding_merge_active\":{}",
+        run_spec.model.bigram.enabled && run_spec.runtime.bigram_embedding_merge
+    ));
+    fields.push(format!(
+        "\"bigram_fused_backward_tested\":{}",
+        run_spec.model.bigram.enabled && run_spec.runtime.bigram_embedding_merge
+    ));
+    fields.push("\"bigram_h100_validated\":false".to_string());
+    fields.push(format!(
+        "\"proposal_sparse_xsa_gate_fusion_active\":{}",
+        adjacent_sparse_xsa_active
+    ));
+    fields.push(json_str_field("xsa_fusion_kind", xsa_fusion_kind));
+    fields.push("\"true_xsa_in_attention_fusion\":false".to_string());
     fields.push(format!(
         "\"proposal_sparse_xsa_attn_proj_dx_bf16_fusion_active\":{}",
         sparse_xsa_attn_proj_dx_bf16_fusion_enabled_for_audit(run_spec)
     ));
     fields.push(format!(
         "\"proposal_exact_recurrent_boundary_fusion_active\":{}",
-        run_spec.model.recurrence.enabled
-            && recurrent_fused_pass_boundary_backward_enabled_for_audit()
+        exact_recurrent_boundary_fusion_active
     ));
     fields.push(format!(
         "\"proposal_exact_recurrent_mlp_norm_accum_fusion_active\":{}",
@@ -8402,6 +8477,12 @@ fn record_path_audit_json(
             RecurrentBackwardProfile::ExactFused
         ) && bf16_norm_grad_path_enabled_for_audit(run_spec)
     ));
+    fields.push(format!(
+        "\"exact_recurrent_boundary_fusion_active\":{}",
+        exact_recurrent_boundary_fusion_active
+    ));
+    fields.push("\"persistent_cta_block_backward_active\":false".to_string());
+    fields.push("\"persistent_cta_block_backward_validated\":false".to_string());
     fields.push("\"proposal_true_xsa_in_attention_fusion\":false".to_string());
     fields.push("\"proposal_persistent_cta_block_backward\":false".to_string());
     fields.push("\"proposal_nccl_overlap_event_proof\":false".to_string());
@@ -11673,6 +11754,24 @@ mod tests {
             json.contains("\"proposal_persistent_cta_block_backward\":false"),
             "{json}"
         );
+        assert!(json.contains("\"xsa_fusion_kind\":\"none\""), "{json}");
+        assert!(
+            json.contains("\"true_xsa_in_attention_fusion\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"persistent_cta_block_backward_active\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"persistent_cta_block_backward_validated\":false"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"quant_arch_profile\":\"sm90_h100\""),
+            "{json}"
+        );
+        assert!(json.contains("\"compiled_arch_profile\":\""), "{json}");
         assert!(
             json.contains("\"artifact_audit_stage\":\"pre_export_path_audit\""),
             "{json}"
@@ -11741,6 +11840,18 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("\"strict_decimal_bytes\":true"), "{json}");
+    }
+
+    #[test]
+    fn record_artifact_audit_json_marks_missing_bytes_non_authoritative() {
+        let spec = RunSpec::default();
+        let json = record_artifact_audit_json(&spec, None, None, None, None, None, None, None);
+
+        assert!(json.contains("\"artifact_model_bytes\":null"), "{json}");
+        assert!(json.contains("\"artifact_total_bytes\":null"), "{json}");
+        assert!(json.contains("\"artifact_budget_known\":false"), "{json}");
+        assert!(json.contains("\"artifact_budget_ok\":null"), "{json}");
+        assert!(json.contains("\"artifact_model_sha256\":null"), "{json}");
     }
 
     #[test]
@@ -11970,9 +12081,107 @@ mod tests {
             audit.contains("\"proposal_bigramhash_fused_backward\":true"),
             "{audit}"
         );
+        assert!(audit.contains("\"bigram_enabled\":true"), "{audit}");
+        assert!(
+            audit.contains("\"bigram_embedding_merge_active\":true"),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"bigram_fused_backward_tested\":true"),
+            "{audit}"
+        );
+        assert!(audit.contains("\"bigram_h100_validated\":false"), "{audit}");
         assert!(
             !gaps.iter().any(|gap| gap.contains("BigramHash")),
             "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn record_audit_keeps_2135_bigram_and_xsa_claims_honest() {
+        let mut spec = RunSpec::default();
+        spec.quant.matrix_bits = 6;
+        spec.quant.mlp_bits = 6;
+        spec.quant.embed_bits = 7;
+        spec.quant.gptq_calibration_batches = 32;
+        spec.quant.lqer.enabled = true;
+        spec.model.bigram.enabled = false;
+        spec.runtime.bigram_embedding_merge = false;
+        spec.model.xsa_last_n = 4;
+        spec.model.sparse_attn_gate.enabled = true;
+
+        let config = spec.model.to_model_config();
+        let plan = step_batch_plan(&spec, RunMode::Smoke, &config, 1).unwrap();
+        let audit = record_path_audit_json(
+            &spec,
+            RunMode::Smoke,
+            &plan,
+            1,
+            false,
+            false,
+            &[],
+            true,
+            false,
+            "cpu",
+        );
+
+        assert!(audit.contains("\"bigram_enabled\":false"), "{audit}");
+        assert!(
+            audit.contains("\"bigram_embedding_merge_active\":false"),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"proposal_quantization_layout_arch_profile\":\"sm90_h100\""),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"proposal_quantization_kernel_ids\":\""),
+            "{audit}"
+        );
+        assert!(audit.contains("\"xsa_fusion_kind\":\"none\""), "{audit}");
+        assert!(
+            audit.contains("\"true_xsa_in_attention_fusion\":false"),
+            "{audit}"
+        );
+    }
+
+    #[test]
+    fn record_audit_reports_adjacent_sparse_xsa_when_current_fusion_is_active() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let prev = std::env::var("PG_GPU_SPARSE_XSA_WARPHEAD_BWD").ok();
+        unsafe {
+            std::env::set_var("PG_GPU_SPARSE_XSA_WARPHEAD_BWD", "1");
+        }
+
+        let mut spec = RunSpec::default();
+        spec.model.xsa_last_n = 4;
+        spec.model.sparse_attn_gate.enabled = true;
+        let config = spec.model.to_model_config();
+        let plan = step_batch_plan(&spec, RunMode::Smoke, &config, 1).unwrap();
+        let audit = record_path_audit_json(
+            &spec,
+            RunMode::Smoke,
+            &plan,
+            1,
+            false,
+            false,
+            &[],
+            true,
+            false,
+            "cpu",
+        );
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("PG_GPU_SPARSE_XSA_WARPHEAD_BWD", value) },
+            None => unsafe { std::env::remove_var("PG_GPU_SPARSE_XSA_WARPHEAD_BWD") },
+        }
+        assert!(
+            audit.contains("\"xsa_fusion_kind\":\"adjacent_sparse_xsa\""),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("\"true_xsa_in_attention_fusion\":false"),
+            "{audit}"
         );
     }
 
@@ -13458,6 +13667,31 @@ mod tests {
         assert!(
             gaps.iter().any(|gap| gap.contains("late recurrence")),
             "late-recurrence speed probes must not pass as frontier_2135 quality targets: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn exact_fused_recurrence_does_not_enable_straight_through_quality_gaps() {
+        let mut spec = RunSpec::default();
+        spec.runtime.record_profile = RecordProfile::Frontier2135Audit;
+        spec.model.recurrence.enabled = true;
+        spec.runtime.recurrent_backward_profile = RecurrentBackwardProfile::ExactFused;
+        spec.runtime.recurrent_straight_through_layers = 0;
+        spec.runtime.skip_recurrent_bank_grads = false;
+        spec.runtime.skip_recurrent_pass1_bank_grads = false;
+
+        let gaps = leaderboard_algorithm_gaps(&spec);
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.contains("straight-through recurrent backward")),
+            "ExactFused must remain an exact-gradient profile, not an ST speed probe: {gaps:?}"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.contains("skip recurrent bank gradients")),
+            "ExactFused must not imply skipped recurrent bank gradients: {gaps:?}"
         );
     }
 

@@ -1,0 +1,30 @@
+# Wind Tunnel Trace Suite
+
+- Traces: `14`
+- Traces with measured step timing: `10`
+- Traces with stage attribution: `6`
+- Total-only traces: `4`
+- Shape-only traces: `4`
+- Status: `pass`
+- Baseline shape-model estimate: `134.200 ms/step`
+- Mean absolute baseline error: `6.537 ms/step`
+- Mean absolute baseline error: `5.06%`
+
+| Trace | Trace total | Estimate | Baseline error | Coverage | Useful stages | Role | Top bottleneck | Risks |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_caseops_preflight_after_seed_v1.finish_status.json` | n/a | 134.200 | n/a | 0.00% | 0.00% | `shape_model_only` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_caseops_preflight_after_seed_v1.json` | n/a | 134.200 | n/a | 0.00% | 0.00% | `shape_model_only` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_caseops_preflight_latest.finish_status.json` | n/a | 134.200 | n/a | 0.00% | 0.00% | `shape_model_only` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_caseops_preflight_latest.json` | n/a | 134.200 | n/a | 0.00% | 0.00% | `shape_model_only` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_exact_chunked_recurrent_scale_v1.json` | 127.132 | 127.132 | 7.068 | 100.00% | 22.22% | `partial_stage_calibration` | `unattributed_trace_overhead` | estimate_only_not_record_claim, trace_partial_stage_attribution, trace_contains_zero_stage_fields, trace_unattributed_overhead_dominates, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_exactfused_accum_short_v1.finish_status.json` | 127.578 | 127.578 | 6.622 | 16.67% | 0.00% | `total_calibration` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, trace_total_only_no_stage_attribution, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_exactfused_accum_short_v1.json` | 127.578 | 127.578 | 6.622 | 100.00% | 22.22% | `partial_stage_calibration` | `unattributed_trace_overhead` | estimate_only_not_record_claim, trace_partial_stage_attribution, trace_contains_zero_stage_fields, trace_unattributed_overhead_dominates, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_exactfused_short_v2.finish_status.json` | 128.631 | 128.631 | 5.569 | 16.67% | 0.00% | `total_calibration` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, trace_total_only_no_stage_attribution, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_exactfused_short_v2.json` | 128.631 | 128.631 | 5.569 | 100.00% | 22.22% | `partial_stage_calibration` | `unattributed_trace_overhead` | estimate_only_not_record_claim, trace_partial_stage_attribution, trace_contains_zero_stage_fields, trace_unattributed_overhead_dominates, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_recurrent_stage_probe_caseops_v2.json` | 141.531 | 141.531 | 7.331 | 66.67% | 77.78% | `stage_calibration` | `forward_replay` | estimate_only_not_record_claim, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_sparsexsa_bf16dx_graphside_short_v1.finish_status.json` | 127.994 | 127.994 | 6.206 | 8.33% | 0.00% | `total_calibration` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, trace_total_only_no_stage_attribution, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_sparsexsa_bf16dx_graphside_short_v1.json` | 127.994 | 127.994 | 6.206 | 66.67% | 22.22% | `partial_stage_calibration` | `unattributed_trace_overhead` | estimate_only_not_record_claim, trace_partial_stage_attribution, trace_contains_zero_stage_fields, trace_unattributed_overhead_dominates, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_sparsexsa_bf16dx_short_v1.finish_status.json` | 127.110 | 127.110 | 7.090 | 16.67% | 0.00% | `total_calibration` | `forward_replay` | estimate_only_not_record_claim, low_trace_field_coverage, trace_total_only_no_stage_attribution, recurrent_active_inactive_split_defaulted, train_wall_budget_risk, artifact_budget_risk |
+| `../records/track_non_record_16mb/2026-04-30_RustCudaSystems/modal_results/frontier_2135_sparsexsa_bf16dx_short_v1.json` | 127.110 | 127.110 | 7.090 | 100.00% | 22.22% | `partial_stage_calibration` | `unattributed_trace_overhead` | estimate_only_not_record_claim, trace_partial_stage_attribution, trace_contains_zero_stage_fields, trace_unattributed_overhead_dominates, train_wall_budget_risk, artifact_budget_risk |
+
+Wind Tunnel predictions are planning estimates, not H100 validation.

@@ -1,0 +1,21 @@
+track = "byte_golf"
+artifact_budget_bytes = 256000
+train_time_seconds = 60
+eval_time_seconds = 30
+memory_budget_bytes = 2000000000
+score = "bpb"
+
+[data]
+train_path = "specs/pg_lite/sample_train.txt"
+val_path = "specs/pg_lite/sample_val.txt"
+format = "bytes"
+
+[model]
+family = "byte_ngram"
+vocab = "byte"
+context = 128
+residual_buckets = 1
+residual_weight = 0.0
+
+[backend]
+kind = "cpu_reference"

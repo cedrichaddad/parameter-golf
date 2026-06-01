@@ -1,0 +1,14 @@
+{
+  "bf16_direct_compact": "h100_validated",
+  "device_resident_sampler": "h100_validated",
+  "no_loss_backward_graph": "h100_validated",
+  "full_train_step_graph": "not_implemented",
+  "persistent_cta_block_backward": "not_implemented",
+  "xsa_inside_sdpa": "local_parity_tested_not_record_active",
+  "adjacent_sparse_xsa": "implemented",
+  "quant_layout_compiler": "local_parity_tested",
+  "bigramhash_fusion": "local_parity_tested",
+  "pg_lite": "local_validated",
+  "pg_lite_metal_backend": "source_boundary_checked_not_executable",
+  "wind_tunnel": "local_validated"
+}

@@ -6,15 +6,24 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_cuda_cpp)");
     println!("cargo:rustc-check-cfg=cfg(has_cudnn_frontend_sdpa)");
     println!("cargo:rustc-check-cfg=cfg(has_fused_output_ce)");
+    println!("cargo:rustc-check-cfg=cfg(pg_cuda_arch_sm90)");
 
     // Only attempt to build CUDA/C++ extensions if the 'cuda' feature is enabled.
     if env::var("CARGO_FEATURE_CUDA").is_err() {
+        emit_compiled_arch_metadata(&[], "portable_cpu");
         return;
+    }
+
+    let arches = cuda_arches();
+    let arch_profile = compiled_arch_profile(&arches);
+    emit_compiled_arch_metadata(&arches, arch_profile);
+    if arch_profile == "sm90_h100" {
+        println!("cargo:rustc-cfg=pg_cuda_arch_sm90");
     }
 
     // Check if nvcc is available
     if Command::new("nvcc").arg("--version").status().is_err() {
-        println!("cargo:warning=nvcc not found. Skipping CUDA/C++ F32 SDPA compilation.");
+        println!("cargo:warning=nvcc not found. Skipping CUDA/C++ F32 SDPA/XSA compilation.");
         return;
     }
 
@@ -29,7 +38,17 @@ fn main() {
         // Allow C++17 for CUDA/C++ attention sources.
         .flag("-std=c++17")
         .file("cpp/sdpa.cu")
+        .file("cpp/xsa_inside_sdpa.cu")
         .compile("naive_sdpa_f32");
+
+    let mut quant_build = cc::Build::new();
+    add_cuda_arch_flags(&mut quant_build);
+    quant_build
+        .cuda(true)
+        .flag("-O3")
+        .flag("-std=c++17")
+        .file("cpp/quant_pack.cu")
+        .compile("quant_pack_kernels");
 
     println!("cargo:rustc-cfg=has_cuda_cpp");
 
@@ -75,6 +94,8 @@ fn main() {
 
     // Re-run if the C++ file changes
     println!("cargo:rerun-if-changed=cpp/sdpa.cu");
+    println!("cargo:rerun-if-changed=cpp/xsa_inside_sdpa.cu");
+    println!("cargo:rerun-if-changed=cpp/quant_pack.cu");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -82,6 +103,26 @@ fn add_cuda_arch_flags(build: &mut cc::Build) {
     for arch in cuda_arches() {
         build.flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
+}
+
+fn emit_compiled_arch_metadata(arches: &[String], profile: &str) {
+    let arch_list = if arches.is_empty() {
+        "none".to_string()
+    } else {
+        arches.join(",")
+    };
+    println!("cargo:rustc-env=PG_COMPILED_CUDA_ARCHES={arch_list}");
+    println!("cargo:rustc-env=PG_COMPILED_ARCH_PROFILE={profile}");
+}
+
+fn compiled_arch_profile(arches: &[String]) -> &'static str {
+    if arches.is_empty() {
+        return "portable_cpu";
+    }
+    if arches.len() == 1 && arches[0] == "90" {
+        return "sm90_h100";
+    }
+    "mixed_cuda"
 }
 
 fn add_cuda_arch_args(command: &mut Command) {

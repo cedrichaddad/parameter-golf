@@ -3,8 +3,36 @@ use pg_model::{ModelConfig, QuantSpec};
 use pg_quant_macros::quant_layout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantArchProfile {
+    PortableCpu,
+    Sm90H100,
+}
+
+impl QuantArchProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            QuantArchProfile::PortableCpu => "portable_cpu",
+            QuantArchProfile::Sm90H100 => "sm90_h100",
+        }
+    }
+
+    pub const fn record_default() -> Self {
+        QuantArchProfile::Sm90H100
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "portable_cpu" => Some(QuantArchProfile::PortableCpu),
+            "sm90_h100" => Some(QuantArchProfile::Sm90H100),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledQuantLayout {
     pub name: &'static str,
+    pub arch_profile: QuantArchProfile,
     pub matrix_bits: u8,
     pub mlp_bits: u8,
     pub embed_bits: u8,
@@ -34,7 +62,7 @@ pub struct CompiledQuantLayoutManifest {
     pub generated_from: &'static str,
     pub pack_format: &'static str,
     pub dequant_format: &'static str,
-    pub arch_profile: &'static str,
+    pub arch_profile: QuantArchProfile,
     pub groups: Vec<CompiledQuantGroupManifest>,
     pub estimated_raw_weight_bytes: Option<usize>,
     pub target_artifact_bytes: usize,
@@ -127,7 +155,7 @@ impl CompiledQuantLayoutManifest {
             self.generated_from,
             self.pack_format,
             self.dequant_format,
-            self.arch_profile,
+            self.arch_profile.as_str(),
             self.target_artifact_bytes,
             json_usize_or_null(self.estimated_raw_weight_bytes),
             self.fingerprint_crc32,
@@ -138,6 +166,7 @@ impl CompiledQuantLayoutManifest {
 
 pub const FRONTIER_1855_MIXED_INT5_INT6_LAYOUT: CompiledQuantLayout = quant_layout! {
     name: "frontier_1855_mixed_int5_int6",
+    arch_profile: "sm90_h100",
     matrix_bits: 6,
     mlp_bits: 5,
     embed_bits: 7,
@@ -149,6 +178,7 @@ pub const FRONTIER_1855_MIXED_INT5_INT6_LAYOUT: CompiledQuantLayout = quant_layo
 
 pub const FRONTIER_2135_MIXED_INT5_INT4_LAYOUT: CompiledQuantLayout = quant_layout! {
     name: "frontier_2135_mixed_int5_int4",
+    arch_profile: "sm90_h100",
     matrix_bits: 5,
     mlp_bits: 4,
     embed_bits: 6,
@@ -160,6 +190,7 @@ pub const FRONTIER_2135_MIXED_INT5_INT4_LAYOUT: CompiledQuantLayout = quant_layo
 
 pub const FRONTIER_2135_CALIB32_INT6_INT7_LAYOUT: CompiledQuantLayout = quant_layout! {
     name: "frontier_2135_calib32_int6_int7",
+    arch_profile: "sm90_h100",
     matrix_bits: 6,
     mlp_bits: 6,
     embed_bits: 7,
@@ -185,6 +216,7 @@ pub fn compile_quant_layout_manifest(
 ) -> PgResult<CompiledQuantLayoutManifest> {
     let layout = compiled_layout_for_quant_spec(quant_spec).unwrap_or(CompiledQuantLayout {
         name: "spec_generated_quant_layout",
+        arch_profile: QuantArchProfile::record_default(),
         matrix_bits: quant_spec.matrix_bits,
         mlp_bits: quant_spec.mlp_bits,
         embed_bits: quant_spec.embed_bits,
@@ -276,7 +308,7 @@ pub fn compile_quant_layout_manifest(
         generated_from,
         pack_format: "signed_packed_int_per_row_f16_scale",
         dequant_format: "per_row_scale_dequant_add_optional_lqer",
-        arch_profile: "sm90_h100",
+        arch_profile: layout.arch_profile,
         groups,
         estimated_raw_weight_bytes,
         target_artifact_bytes: layout.target_artifact_bytes,
@@ -380,7 +412,7 @@ fn manifest_crc32(manifest: &CompiledQuantLayoutManifest) -> String {
     hasher.update(manifest.generated_from.as_bytes());
     hasher.update(manifest.pack_format.as_bytes());
     hasher.update(manifest.dequant_format.as_bytes());
-    hasher.update(manifest.arch_profile.as_bytes());
+    hasher.update(manifest.arch_profile.as_str().as_bytes());
     hasher.update(&manifest.target_artifact_bytes.to_le_bytes());
     if let Some(bytes) = manifest.estimated_raw_weight_bytes {
         hasher.update(&bytes.to_le_bytes());
@@ -494,7 +526,7 @@ mod tests {
         let config = pg_model::ModelConfig::default();
         let manifest = compile_quant_layout_manifest(&quant_spec, Some(&config)).unwrap();
         assert_eq!(manifest.layout.name, "frontier_2135_mixed_int5_int4");
-        assert_eq!(manifest.arch_profile, "sm90_h100");
+        assert_eq!(manifest.arch_profile, QuantArchProfile::Sm90H100);
         assert_eq!(manifest.groups.len(), 7);
         assert!(manifest.estimated_raw_weight_bytes.unwrap() > 0);
         assert_eq!(manifest.fingerprint_crc32.len(), 8);
@@ -505,10 +537,7 @@ mod tests {
             .expect("mlp_down_bank manifest group");
         assert_eq!(mlp_down.bits, 4);
         assert_eq!(mlp_down.pack_kernel, "pack_signed_i4_per_row_sm90");
-        assert_eq!(
-            mlp_down.dequant_kernel,
-            "dequant_i4_per_row_f16_scale_sm90"
-        );
+        assert_eq!(mlp_down.dequant_kernel, "dequant_i4_per_row_f16_scale_sm90");
         let q_bank = manifest
             .groups
             .iter()
@@ -521,6 +550,32 @@ mod tests {
         assert!(metadata.contains("\"arch_profile\":\"sm90_h100\""));
         assert!(metadata.contains("\"pack_kernel\":\"pack_signed_i4_per_row_sm90\""));
         assert!(metadata.contains("\"name\":\"mlp_down_bank\""));
+    }
+
+    #[test]
+    fn quant_layout_manifest_crc_tracks_arch_and_kernel_ids() {
+        let quant_spec = QuantSpec {
+            matrix_bits: 5,
+            mlp_bits: 4,
+            embed_bits: 6,
+            attn_gate_bits: 8,
+            gptq_calibration_batches: 32,
+            lqer: pg_model::spec::LqerSpec {
+                enabled: true,
+                ..Default::default()
+            },
+            ..QuantSpec::default()
+        };
+        let config = pg_model::ModelConfig::default();
+        let manifest = compile_quant_layout_manifest(&quant_spec, Some(&config)).unwrap();
+
+        let mut portable = manifest.clone();
+        portable.arch_profile = QuantArchProfile::PortableCpu;
+        assert_ne!(manifest.fingerprint_crc32, manifest_crc32(&portable));
+
+        let mut changed_kernel = manifest.clone();
+        changed_kernel.groups[0].pack_kernel = "pack_signed_i5_per_row_test_variant";
+        assert_ne!(manifest.fingerprint_crc32, manifest_crc32(&changed_kernel));
     }
 
     #[test]

@@ -1,0 +1,228 @@
+{
+  "kind": "pg_local_evidence_manifest",
+  "package_kind": "local_non_record_proof",
+  "output_dir": "records/local_proof",
+  "record_claim": false,
+  "leaderboard_claim": false,
+  "proof_bundle_status": "fail",
+  "component_statuses": [
+    {
+      "name": "verify",
+      "status": "fail",
+      "path": "records/local_proof/verify.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "dist_sim",
+      "status": "pass",
+      "path": "records/local_proof/dist_sim.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "artifact_lab",
+      "status": "pass",
+      "path": "records/local_proof/artifact_lab.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "wind_tunnel",
+      "status": "pass",
+      "path": "records/local_proof/wind_tunnel.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "pg_lite",
+      "status": "pass",
+      "path": "records/local_proof/pg_lite/report.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "pg_lite_suite",
+      "status": "pass",
+      "path": "records/local_proof/pg_lite_suite/summary.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "backend_cpu_reference",
+      "status": "pass",
+      "path": "records/local_proof/backend_cpu_reference.json",
+      "decisive_for_local_bundle": true
+    },
+    {
+      "name": "backend_metal_apple",
+      "status": "source_only_expected",
+      "path": "records/local_proof/backend_metal_apple.json",
+      "decisive_for_local_bundle": true
+    }
+  ],
+  "generated_files": [
+    {
+      "path": "records/local_proof/verify.json",
+      "kind": "verify_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/dist_sim.json",
+      "kind": "distributed_sim_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/artifact_lab.json",
+      "kind": "artifact_lab_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/wind_tunnel.json",
+      "kind": "wind_tunnel_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/pg_lite/report.json",
+      "kind": "pg_lite_run_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/pg_lite/model.pglite.bin",
+      "kind": "pg_lite_model_artifact",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/pg_lite_suite/summary.json",
+      "kind": "pg_lite_suite_summary",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/backend_cpu_reference.json",
+      "kind": "backend_check",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/backend_metal_apple.json",
+      "kind": "backend_check",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/proposal_features.json",
+      "kind": "proposal_feature_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/proof_bundle.json",
+      "kind": "proof_bundle_report",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/README.md",
+      "kind": "human_readme",
+      "required": true,
+      "exists": true
+    },
+    {
+      "path": "records/local_proof/evidence_manifest.json",
+      "kind": "evidence_manifest",
+      "required": true,
+      "exists": true
+    }
+  ],
+  "local_evidence": [
+    {
+      "name": "proposal_claim_honesty",
+      "status": "pass",
+      "evidence_path": "records/local_proof/verify.json"
+    },
+    {
+      "name": "record_data_preflight",
+      "status": "fail",
+      "evidence_path": "records/local_proof/verify.json"
+    },
+    {
+      "name": "local_eval_legality",
+      "status": "pass",
+      "evidence_path": "records/local_proof/verify.json"
+    },
+    {
+      "name": "distributed_optimizer_math",
+      "status": "pass",
+      "evidence_path": "records/local_proof/dist_sim.json"
+    },
+    {
+      "name": "quant_layout_compiler",
+      "status": "local_parity_tested",
+      "evidence_path": "records/local_proof/artifact_lab.json"
+    },
+    {
+      "name": "pg_lite_cpu_reference",
+      "status": "pass",
+      "evidence_path": "records/local_proof/pg_lite_suite/summary.json"
+    },
+    {
+      "name": "pg_lite_metal_backend",
+      "status": "source_boundary_checked_not_executable",
+      "evidence_path": "records/local_proof/backend_metal_apple.json"
+    },
+    {
+      "name": "wind_tunnel_estimate",
+      "status": "estimate_only",
+      "evidence_path": "records/local_proof/wind_tunnel.json"
+    }
+  ],
+  "requires_remote_validation": [
+    {
+      "name": "full_record_train_eval_export",
+      "status": "missing",
+      "evidence_path": null
+    },
+    {
+      "name": "post_export_full_validation_bpb",
+      "status": "missing",
+      "evidence_path": null
+    },
+    {
+      "name": "artifact_budget_from_final_record_run",
+      "status": "missing",
+      "evidence_path": "records/local_proof/verify.json"
+    },
+    {
+      "name": "exact_2135_h100_step_time",
+      "status": "missing",
+      "evidence_path": null
+    },
+    {
+      "name": "persistent_cta_block_backward",
+      "status": "not_implemented",
+      "evidence_path": "records/local_proof/proposal_features.json"
+    },
+    {
+      "name": "record_active_xsa_inside_sdpa",
+      "status": "local_parity_tested_not_record_active",
+      "evidence_path": "records/local_proof/proposal_features.json"
+    }
+  ],
+  "blocking_reasons": [
+    "verify status is fail; notes: artifact not supplied; artifact checks are skipped; CaseOps byte sidecar is required or configured but not locally valid",
+    "final artifact bytes were not supplied to verify",
+    "canonical CaseOps byte sidecar is not locally valid",
+    "data preflight: train shard count mismatch: found 0 required 80",
+    "data preflight: validation token count mismatch: found Some(0) required 47851520",
+    "data preflight: validation doc count is not available from local shard headers",
+    "data preflight: CaseOps sidecar pattern did not resolve to readable token shards: Some(\"/data/datasets/fineweb10B_sp8192/fineweb_val_bytes_*.bin\")",
+    "PG-Lite Metal backend is source-only and not executable yet"
+  ],
+  "caveats": [
+    "This package is local evidence only; it is not a Parameter Golf leaderboard claim.",
+    "Wind Tunnel values are estimates unless backed by supplied H100 timing traces.",
+    "PG-Lite BPB and artifact-lab mini-BPB are local proxy scores, not FineWeb validation BPB.",
+    "Metal backend source presence is not executable Metal acceleration."
+  ]
+}

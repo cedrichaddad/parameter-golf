@@ -1,0 +1,21 @@
+track = "artifact_golf"
+artifact_budget_bytes = 1000000
+train_time_seconds = 0
+eval_time_seconds = 60
+memory_budget_bytes = 4000000000
+score = "bpb"
+
+[data]
+train_path = "specs/pg_lite/sample_train.txt"
+val_path = "specs/pg_lite/sample_val.txt"
+format = "bytes"
+
+[model]
+family = "artifact_only"
+vocab = "byte"
+context = 512
+residual_buckets = 2048
+residual_weight = 0.0
+
+[backend]
+kind = "cpu_reference"

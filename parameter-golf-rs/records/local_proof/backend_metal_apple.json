@@ -1,0 +1,33 @@
+{
+  "kind": "pg_local_backend_check",
+  "backend": "metal_apple",
+  "host_os": "macos",
+  "cargo_feature_enabled": false,
+  "kernel_source_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/crates/pg-local/kernels/pg_lite_ngram.metal",
+  "kernel_source_present": true,
+  "kernel_source_crc32": "f1a25172",
+  "expected_kernel_symbols": [
+    "pg_lite_ngram_loss_kernel",
+    "pg_lite_ngram_loss_u32_residual_kernel",
+    "pg_lite_ngram_train_kernel",
+    "pg_lite_reduce_loss_kernel"
+  ],
+  "kernel_symbols_found": [
+    "pg_lite_ngram_loss_kernel",
+    "pg_lite_ngram_loss_u32_residual_kernel",
+    "pg_lite_ngram_train_kernel",
+    "pg_lite_reduce_loss_kernel"
+  ],
+  "kernel_contract_ok": true,
+  "metal_compiler_path": null,
+  "metal_compiler_available": false,
+  "metal_compile_smoke_attempted": false,
+  "metal_compile_smoke_ok": false,
+  "metal_compile_stderr": null,
+  "rust_runtime_linked": false,
+  "executable_backend_available": false,
+  "notes": [
+    "Apple Metal compiler was not found via `xcrun --find metal`."
+  ],
+  "status": "fail"
+}

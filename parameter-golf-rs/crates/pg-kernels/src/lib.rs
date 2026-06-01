@@ -10,6 +10,9 @@ pub mod rope;
 pub mod smear_gate;
 pub mod xsa;
 
+pub const COMPILED_CUDA_ARCHES: Option<&str> = option_env!("PG_COMPILED_CUDA_ARCHES");
+pub const COMPILED_ARCH_PROFILE: Option<&str> = option_env!("PG_COMPILED_ARCH_PROFILE");
+
 #[cfg(feature = "cuda")]
 pub mod gemm;
 
@@ -21,3 +24,6 @@ pub mod flash_attn;
 
 #[cfg(feature = "cuda")]
 pub mod output_ce;
+
+#[cfg(all(feature = "cuda", has_cuda_cpp))]
+pub mod xsa_inside_sdpa_cuda;

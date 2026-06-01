@@ -1,0 +1,2 @@
+parameter golf lite reports local proxy bpb only.
+it is not a leaderboard result.

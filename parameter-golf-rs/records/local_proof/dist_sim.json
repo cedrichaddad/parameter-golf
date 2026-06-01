@@ -1,0 +1,106 @@
+{
+  "kind": "pg_local_dist_sim",
+  "spec_fingerprint": "b33646024b31d3df",
+  "world_size": 8,
+  "steps": 3,
+  "parameter_shapes": [
+    [
+      22,
+      512,
+      512
+    ],
+    [
+      22,
+      256,
+      512
+    ],
+    [
+      11,
+      2048,
+      512
+    ],
+    [
+      11,
+      512,
+      2048
+    ]
+  ],
+  "bank_reports": [
+    {
+      "name": "qo_bank",
+      "shape": [
+        22,
+        512,
+        512
+      ],
+      "simulated_shape": [
+        1,
+        8,
+        8
+      ],
+      "reduce_scatter_bytes_per_step": 2883584,
+      "all_gather_bytes_per_step": 2883584,
+      "optimizer_parity_max_abs_diff": 0.0,
+      "equivalent": true
+    },
+    {
+      "name": "kv_bank",
+      "shape": [
+        22,
+        256,
+        512
+      ],
+      "simulated_shape": [
+        1,
+        8,
+        8
+      ],
+      "reduce_scatter_bytes_per_step": 1441792,
+      "all_gather_bytes_per_step": 1441792,
+      "optimizer_parity_max_abs_diff": 0.0,
+      "equivalent": true
+    },
+    {
+      "name": "mlp_up_bank",
+      "shape": [
+        11,
+        2048,
+        512
+      ],
+      "simulated_shape": [
+        1,
+        8,
+        8
+      ],
+      "reduce_scatter_bytes_per_step": 5767168,
+      "all_gather_bytes_per_step": 5767168,
+      "optimizer_parity_max_abs_diff": 0.0,
+      "equivalent": true
+    },
+    {
+      "name": "mlp_down_bank",
+      "shape": [
+        11,
+        512,
+        2048
+      ],
+      "simulated_shape": [
+        1,
+        8,
+        8
+      ],
+      "reduce_scatter_bytes_per_step": 5767168,
+      "all_gather_bytes_per_step": 5767168,
+      "optimizer_parity_max_abs_diff": 0.0,
+      "equivalent": true
+    }
+  ],
+  "reduce_scatter_equivalent": true,
+  "all_gather_equivalent": true,
+  "optimizer_parity_max_abs_diff": 0.0,
+  "tolerance": 0.00001,
+  "estimated_reduce_scatter_bytes_per_step": 15859712,
+  "estimated_all_gather_bytes_per_step": 15859712,
+  "bf16_shadow_freshness": "pass",
+  "status": "pass"
+}

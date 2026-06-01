@@ -1,0 +1,23 @@
+{
+  "kind": "pg_local_backend_check",
+  "backend": "cpu_reference",
+  "host_os": "macos",
+  "cargo_feature_enabled": true,
+  "kernel_source_path": null,
+  "kernel_source_present": false,
+  "kernel_source_crc32": null,
+  "expected_kernel_symbols": [],
+  "kernel_symbols_found": [],
+  "kernel_contract_ok": true,
+  "metal_compiler_path": null,
+  "metal_compiler_available": false,
+  "metal_compile_smoke_attempted": false,
+  "metal_compile_smoke_ok": false,
+  "metal_compile_stderr": null,
+  "rust_runtime_linked": true,
+  "executable_backend_available": true,
+  "notes": [
+    "CPU reference backend is always available in pg-local."
+  ],
+  "status": "pass"
+}

@@ -1,0 +1,13 @@
+{
+  "kind": "pg_lite_model_artifact",
+  "version": 1,
+  "source_config_fingerprint": "lite-crc32:3d9cc4dd",
+  "model_fingerprint": "lite-artifact-crc32:128c94c4",
+  "model_family": "artifact_only",
+  "context": 512,
+  "residual_weight": 0.0,
+  "bigram_rows": 257,
+  "residual_buckets": 2048,
+  "bigram_entries": [],
+  "residual_entries": []
+}

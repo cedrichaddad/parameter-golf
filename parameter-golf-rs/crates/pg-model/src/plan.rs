@@ -849,22 +849,32 @@ mod tests {
         );
         ExecutionPlan::from_run_spec(&allst_quality_probe).unwrap();
 
-        let exact_artifact_eval_compat = RunSpec::load(
-            &specs_dir.join("frontier_2135_exact_artifact_eval_compat.toml"),
-        )
-        .unwrap();
+        let exact_artifact_eval_compat =
+            RunSpec::load(&specs_dir.join("frontier_2135_exact_artifact_eval_compat.toml"))
+                .unwrap();
         assert_eq!(
             exact_artifact_eval_compat.runtime.record_profile,
             RecordProfile::Frontier2135Audit
         );
         assert_eq!(
-            exact_artifact_eval_compat.runtime.recurrent_backward_profile,
+            exact_artifact_eval_compat
+                .runtime
+                .recurrent_backward_profile,
             RecurrentBackwardProfile::Full,
             "eval-only compatibility spec must stay parseable by older pg-eval builds"
         );
-        assert_eq!(exact_artifact_eval_compat.quant.matrix_bits, audit.quant.matrix_bits);
-        assert_eq!(exact_artifact_eval_compat.quant.mlp_bits, audit.quant.mlp_bits);
-        assert_eq!(exact_artifact_eval_compat.quant.embed_bits, audit.quant.embed_bits);
+        assert_eq!(
+            exact_artifact_eval_compat.quant.matrix_bits,
+            audit.quant.matrix_bits
+        );
+        assert_eq!(
+            exact_artifact_eval_compat.quant.mlp_bits,
+            audit.quant.mlp_bits
+        );
+        assert_eq!(
+            exact_artifact_eval_compat.quant.embed_bits,
+            audit.quant.embed_bits
+        );
         assert_eq!(
             exact_artifact_eval_compat.quant.gptq_calibration_batches,
             audit.quant.gptq_calibration_batches

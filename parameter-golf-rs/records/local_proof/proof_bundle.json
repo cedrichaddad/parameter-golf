@@ -1,0 +1,16 @@
+{
+  "kind": "pg_local_proof_bundle",
+  "output_dir": "records/local_proof",
+  "readme_path": "records/local_proof/README.md",
+  "evidence_manifest_path": "records/local_proof/evidence_manifest.json",
+  "verify_path": "records/local_proof/verify.json",
+  "dist_sim_path": "records/local_proof/dist_sim.json",
+  "artifact_lab_path": "records/local_proof/artifact_lab.json",
+  "wind_tunnel_path": "records/local_proof/wind_tunnel.json",
+  "lite_report_path": "records/local_proof/pg_lite/report.json",
+  "lite_suite_summary_path": "records/local_proof/pg_lite_suite/summary.json",
+  "backend_cpu_check_path": "records/local_proof/backend_cpu_reference.json",
+  "backend_metal_check_path": "records/local_proof/backend_metal_apple.json",
+  "proposal_feature_path": "records/local_proof/proposal_features.json",
+  "status": "fail"
+}
