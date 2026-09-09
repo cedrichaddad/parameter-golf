@@ -1,0 +1,105 @@
+{
+  "kind": "pg_local_wind_tunnel_reviewer_report",
+  "spec_path": "specs/frontier_2135_audit_target.toml",
+  "trace_dir": "../records",
+  "output_dir": "records/local_proof/wind_tunnel_reviewer",
+  "report_json_path": "records/local_proof/wind_tunnel_reviewer/report.json",
+  "report_markdown_path": "records/local_proof/wind_tunnel_reviewer/report.md",
+  "trace_index_path": "records/local_proof/wind_tunnel_reviewer/trace_index.json",
+  "corpus_path": "records/local_proof/wind_tunnel_reviewer/trace_corpus.json",
+  "calibration_path": "records/local_proof/wind_tunnel_reviewer/calibration_model.json",
+  "scenario_path": "records/local_proof/wind_tunnel_reviewer/scenario_exact_recurrent_replay.json",
+  "suite_summary_path": "records/local_proof/wind_tunnel_reviewer/suite/summary.json",
+  "traces_found": 109,
+  "parseable_traces": 46,
+  "deduped_runs": 44,
+  "timed_runs": 12,
+  "exact_2135_timed_runs": 10,
+  "stage_calibration_runs": 1,
+  "canonical_caseops_runs": 4,
+  "best_exact_2135_ms": 127.109924,
+  "best_active_recurrent_ms": 155.576088,
+  "calibration_confidence_summary": "exact_total=high_multi_trace; active_recurrent=high_multi_trace; stage_attribution=low_single_trace",
+  "holdout_validation": {
+    "kind": "pg_local_wind_tunnel_holdout",
+    "estimate_only": true,
+    "train_sample_count": 6,
+    "holdout_sample_count": 6,
+    "baseline_ms": 127.78601950000001,
+    "mean_abs_error_ms": 25.855562000000003,
+    "mean_abs_pct_error": 10.565872747538533,
+    "status": "pass"
+  },
+  "scenario_clears_target": true,
+  "scenario_predicted_step_ms": 117.109924,
+  "recommended_next_experiment": "run the cheapest exact #2135 H100 A/B that exercises active recurrence; require median/p90 and bridge/host-copy counters before promotion; next trace to collect: collect graph-disabled exact #2135 stage timing with active recurrent windows and nonzero qkv/mlp/attention/output/optimizer fields",
+  "top_stage_metrics": [
+    {
+      "stage": "qkv_backward",
+      "estimate_ms": 22.023804,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_qkv_ms_per_step"
+      ]
+    },
+    {
+      "stage": "mlp_backward",
+      "estimate_ms": 20.44511,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_mlp_ms_per_step"
+      ]
+    },
+    {
+      "stage": "attention_backward",
+      "estimate_ms": 14.155369,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_attention_sdpa_ms_per_step"
+      ]
+    },
+    {
+      "stage": "optimizer_update",
+      "estimate_ms": 8.970195,
+      "sample_count": 7,
+      "confidence": "high_multi_trace",
+      "source_fields": [
+        "timing_cuda_bank_update_ms_per_step"
+      ]
+    },
+    {
+      "stage": "gate_xsa_backward",
+      "estimate_ms": 6.868746,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_attn_out_gate_xsa_ms_per_step"
+      ]
+    },
+    {
+      "stage": "output_ce",
+      "estimate_ms": 5.813824,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_output_ms_per_step"
+      ]
+    },
+    {
+      "stage": "non_bank_update",
+      "estimate_ms": 2.740981,
+      "sample_count": 7,
+      "confidence": "high_multi_trace",
+      "source_fields": [
+        "timing_cuda_non_bank_update_ms_per_step"
+      ]
+    }
+  ],
+  "warnings": [
+    "fewer than two rich stage-calibration traces; use stage estimates as low-confidence attribution"
+  ],
+  "status": "pass"
+}

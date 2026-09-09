@@ -473,7 +473,7 @@ mod tests {
 
         let s = t.slice_first(1).unwrap();
         assert_eq!(s.shape(), &[4, 5]);
-        assert_eq!(s.offset(), 1 * 20 * 2); // stride[0]=20, bf16=2 bytes
+        assert_eq!(s.offset(), 20 * 2); // stride[0]=20, bf16=2 bytes
         assert_eq!(s.numel(), 20);
     }
 

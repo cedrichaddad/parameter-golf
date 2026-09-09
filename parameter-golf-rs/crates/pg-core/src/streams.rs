@@ -5,7 +5,6 @@
 ///
 /// Synchronization between streams uses CUDA events, not stream synchronize
 /// (which would block the CPU thread).
-
 pub struct StreamManager {
     // Will hold cudarc stream handles when CUDA is available.
     // On CPU-only builds, this is a no-op placeholder.

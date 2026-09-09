@@ -1,0 +1,50 @@
+{
+  "kind": "pg_lite_artifact_manifest",
+  "config_fingerprint": "lite-crc32:a0aabbf5",
+  "model_fingerprint": "lite-artifact-crc32:ae5af180",
+  "track": "byte_golf",
+  "track_behavior": "train_then_score_fixed_artifact",
+  "backend": "metal_apple",
+  "execution_backend": "metal_apple",
+  "backend_status": "metal_apple_runtime",
+  "backend_accelerated": true,
+  "backend_fallback_reason": null,
+  "model_family": "ngram_residual",
+  "score": "bpb",
+  "score_scope": "local_proxy_bpb_not_leaderboard",
+  "train_bytes": 215,
+  "train_bytes_used": 215,
+  "val_bytes": 82,
+  "artifact_budget_bytes": 1000000,
+  "artifact_bytes_estimate": 1565,
+  "artifact_actual_bytes": 2497,
+  "artifact_path": "model.pglite.bin",
+  "artifact_budget_ok": true,
+  "memory_budget_bytes": 4000000000,
+  "memory_bytes_estimate": 1311816,
+  "memory_budget_status": "pass",
+  "score_first_tokens_scored": 0,
+  "score_first_update_count": 0,
+  "outputs": [
+    {
+      "path": "model.pglite.bin",
+      "kind": "model_artifact_binary",
+      "stable_json": false
+    },
+    {
+      "path": "model.pglite.json",
+      "kind": "model_artifact_debug_json",
+      "stable_json": true
+    },
+    {
+      "path": "report.json",
+      "kind": "run_report",
+      "stable_json": false
+    },
+    {
+      "path": "artifact_manifest.json",
+      "kind": "artifact_manifest",
+      "stable_json": true
+    }
+  ]
+}

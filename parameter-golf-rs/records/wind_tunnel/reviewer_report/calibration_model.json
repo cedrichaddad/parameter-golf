@@ -1,0 +1,174 @@
+{
+  "kind": "pg_local_wind_tunnel_calibration",
+  "spec_path": "specs/frontier_2135_audit_target.toml",
+  "source_kind": "corpus_json",
+  "corpus_path": "/var/folders/x0/n_h15qdj44s93v8t3nssd_0h0000gn/T/pg_local_report_trace_corpus_40456_1780949883001551000.json",
+  "trace_dir": null,
+  "runs_considered": 44,
+  "timed_runs": 12,
+  "exact_2135_timed_runs": 10,
+  "stage_calibration_runs": 1,
+  "total_step_ms": {
+    "name": "total_step_ms",
+    "estimate_ms": 127.99365,
+    "best_ms": 127.109924,
+    "median_ms": 127.99365,
+    "p90_ms": 256.787,
+    "sample_count": 12,
+    "confidence": "high_multi_trace",
+    "source_run_keys": [
+      "run:frontier_2135_audit_target_toml:127.109924ms",
+      "path:___records_track_non_record_16mb_2026-04-30_RustCudaSystems_logs_v86_record_shaped_clean",
+      "path:___records_track_non_record_16mb_2026-04-30_RustCudaSystems_logs_v87_u16_shift_regression",
+      "run:frontier_2135_audit_target:127.131505ms",
+      "run:frontier_2135_audit_target_toml:127.578389ms",
+      "run:frontier_2135_audit_target:127.578389ms",
+      "run:frontier_2135_audit_target_toml:128.631212ms",
+      "run:frontier_2135_audit_target:128.631212ms",
+      "run:frontier_2135_audit_target:141.531443ms",
+      "run:frontier_2135_audit_target_toml:127.993650ms",
+      "run:frontier_2135_audit_target:127.993650ms",
+      "run:frontier_2135_audit_target:127.109924ms"
+    ]
+  },
+  "exact_2135_total_step_ms": {
+    "name": "exact_2135_total_step_ms",
+    "estimate_ms": 127.99365,
+    "best_ms": 127.109924,
+    "median_ms": 127.99365,
+    "p90_ms": 128.631212,
+    "sample_count": 10,
+    "confidence": "high_multi_trace",
+    "source_run_keys": [
+      "run:frontier_2135_audit_target_toml:127.109924ms",
+      "run:frontier_2135_audit_target:127.131505ms",
+      "run:frontier_2135_audit_target_toml:127.578389ms",
+      "run:frontier_2135_audit_target:127.578389ms",
+      "run:frontier_2135_audit_target_toml:128.631212ms",
+      "run:frontier_2135_audit_target:128.631212ms",
+      "run:frontier_2135_audit_target:141.531443ms",
+      "run:frontier_2135_audit_target_toml:127.993650ms",
+      "run:frontier_2135_audit_target:127.993650ms",
+      "run:frontier_2135_audit_target:127.109924ms"
+    ]
+  },
+  "active_recurrent_ms": {
+    "name": "active_recurrent_ms",
+    "estimate_ms": 156.310609,
+    "best_ms": 155.576088,
+    "median_ms": 156.310609,
+    "p90_ms": 157.502122,
+    "sample_count": 7,
+    "confidence": "high_multi_trace",
+    "source_run_keys": [
+      "run:frontier_2135_audit_target_toml:127.109924ms",
+      "run:frontier_2135_audit_target:127.131505ms",
+      "run:frontier_2135_audit_target_toml:127.578389ms",
+      "run:frontier_2135_audit_target:127.578389ms",
+      "run:frontier_2135_audit_target_toml:128.631212ms",
+      "run:frontier_2135_audit_target:128.631212ms",
+      "run:frontier_2135_audit_target:127.109924ms"
+    ]
+  },
+  "inactive_recurrent_ms": {
+    "name": "inactive_recurrent_ms",
+    "estimate_ms": 119.844761,
+    "best_ms": 119.426539,
+    "median_ms": 119.844761,
+    "p90_ms": 120.860254,
+    "sample_count": 4,
+    "confidence": "medium_multi_trace",
+    "source_run_keys": [
+      "run:frontier_2135_audit_target:127.131505ms",
+      "run:frontier_2135_audit_target:127.578389ms",
+      "run:frontier_2135_audit_target:128.631212ms",
+      "run:frontier_2135_audit_target:127.109924ms"
+    ]
+  },
+  "recurrent_active_minus_inactive_ms": {
+    "name": "recurrent_active_minus_inactive_ms",
+    "estimate_ms": 36.465847999999994,
+    "best_ms": 36.10078899999999,
+    "median_ms": 36.465847999999994,
+    "p90_ms": 36.64186800000002,
+    "sample_count": 4,
+    "confidence": "medium_multi_trace",
+    "source_run_keys": [
+      "run:frontier_2135_audit_target:127.131505ms",
+      "run:frontier_2135_audit_target:127.578389ms",
+      "run:frontier_2135_audit_target:128.631212ms",
+      "run:frontier_2135_audit_target:127.109924ms"
+    ]
+  },
+  "stage_metrics": [
+    {
+      "stage": "attention_backward",
+      "estimate_ms": 14.155369,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_attention_sdpa_ms_per_step"
+      ]
+    },
+    {
+      "stage": "gate_xsa_backward",
+      "estimate_ms": 6.868746,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_attn_out_gate_xsa_ms_per_step"
+      ]
+    },
+    {
+      "stage": "mlp_backward",
+      "estimate_ms": 20.44511,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_mlp_ms_per_step"
+      ]
+    },
+    {
+      "stage": "non_bank_update",
+      "estimate_ms": 2.740981,
+      "sample_count": 7,
+      "confidence": "high_multi_trace",
+      "source_fields": [
+        "timing_cuda_non_bank_update_ms_per_step"
+      ]
+    },
+    {
+      "stage": "optimizer_update",
+      "estimate_ms": 8.970195,
+      "sample_count": 7,
+      "confidence": "high_multi_trace",
+      "source_fields": [
+        "timing_cuda_bank_update_ms_per_step"
+      ]
+    },
+    {
+      "stage": "output_ce",
+      "estimate_ms": 5.813824,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_output_ms_per_step"
+      ]
+    },
+    {
+      "stage": "qkv_backward",
+      "estimate_ms": 22.023804,
+      "sample_count": 1,
+      "confidence": "low_single_trace",
+      "source_fields": [
+        "timing_cuda_backward_block_qkv_ms_per_step"
+      ]
+    }
+  ],
+  "recommended_trace_to_collect": "collect graph-disabled exact #2135 stage timing with active recurrent windows and nonzero qkv/mlp/attention/output/optimizer fields",
+  "confidence_summary": "exact_total=high_multi_trace; active_recurrent=high_multi_trace; stage_attribution=low_single_trace",
+  "warnings": [
+    "fewer than two rich stage-calibration traces; use stage estimates as low-confidence attribution"
+  ],
+  "status": "pass"
+}

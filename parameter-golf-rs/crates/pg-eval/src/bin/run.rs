@@ -81,15 +81,14 @@ fn main() {
         run_spec.eval.chunk_tokens = value;
     }
     validate_leaderboard_eval_request(&run_spec, artifact.as_ref(), max_tokens, leaderboard_mode);
-    if leaderboard_mode {
-        if let Some(path) = artifact.as_ref() {
-            if !path.is_file() {
-                fail(&format!(
-                    "leaderboard eval artifact does not exist or is not a regular file: {}",
-                    path.display()
-                ));
-            }
-        }
+    if leaderboard_mode
+        && let Some(path) = artifact.as_ref()
+        && !path.is_file()
+    {
+        fail(&format!(
+            "leaderboard eval artifact does not exist or is not a regular file: {}",
+            path.display()
+        ));
     }
     let plan = ExecutionPlan::from_run_spec(&run_spec).expect("failed to build execution plan");
 
@@ -268,13 +267,13 @@ fn main() {
     }
 }
 
-fn eval_gpu_world_size(run_spec: &RunSpec, leaderboard_mode: bool) -> usize {
+fn eval_gpu_world_size(run_spec: &RunSpec, _leaderboard_mode: bool) -> usize {
     if run_spec.eval.adaptation_backend == EvalAdaptationBackend::GpuLoraPhased {
         std::env::var("PG_EVAL_GPU_WORLD_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&world_size| world_size > 0)
-            .unwrap_or(if leaderboard_mode { 1 } else { 1 })
+            .unwrap_or(1)
     } else {
         0
     }
@@ -438,15 +437,15 @@ fn eval_gpu_lora_phased(
 }
 
 fn current_executable_bytes() -> usize {
-    if let Ok(value) = std::env::var("PG_SUBMISSION_CODE_BYTES") {
-        if let Ok(bytes) = value.parse::<usize>() {
-            return bytes;
-        }
+    if let Ok(value) = std::env::var("PG_SUBMISSION_CODE_BYTES")
+        && let Ok(bytes) = value.parse::<usize>()
+    {
+        return bytes;
     }
-    if let Ok(path) = std::env::var("PG_SUBMISSION_CODE_DIR") {
-        if let Ok(bytes) = directory_regular_file_bytes(std::path::Path::new(&path)) {
-            return bytes;
-        }
+    if let Ok(path) = std::env::var("PG_SUBMISSION_CODE_DIR")
+        && let Ok(bytes) = directory_regular_file_bytes(std::path::Path::new(&path))
+    {
+        return bytes;
     }
     std::env::current_exe()
         .ok()

@@ -812,6 +812,10 @@ pub struct TrainSpec {
     pub adam_beta2: f32,
     pub ema_decay: f32,
     pub late_qat_threshold: f32,
+    pub artifact_regularization_lambda: f32,
+    pub artifact_regularization_bits: u8,
+    pub artifact_regularization_block_size: usize,
+    pub artifact_regularization_start_lr_scale: f32,
 }
 
 impl Default for TrainSpec {
@@ -849,6 +853,10 @@ impl Default for TrainSpec {
             adam_beta2: 0.95,
             ema_decay: 0.997,
             late_qat_threshold: 0.15,
+            artifact_regularization_lambda: 0.0,
+            artifact_regularization_bits: 4,
+            artifact_regularization_block_size: 64,
+            artifact_regularization_start_lr_scale: 0.15,
         }
     }
 }
@@ -886,6 +894,10 @@ impl TrainSpec {
             swa_enabled: true,
             swa_every: 50,
             late_qat_threshold: self.late_qat_threshold,
+            artifact_regularization_lambda: self.artifact_regularization_lambda,
+            artifact_regularization_bits: self.artifact_regularization_bits,
+            artifact_regularization_block_size: self.artifact_regularization_block_size,
+            artifact_regularization_start_lr_scale: self.artifact_regularization_start_lr_scale,
             ttt_enabled: false,
             ttt_lr: 0.002,
             ttt_epochs: 3,

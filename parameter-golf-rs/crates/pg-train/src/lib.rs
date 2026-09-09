@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use pg_model::backward::GradBuffers;
+use pg_model::backward::{ArtifactRegularizationConfig, GradBuffers};
 use pg_model::{
     AttentionBackend, BackwardChainProfile, CudaGraphProfile, DistributedOptimizerBackend,
     EvalAdaptationBackend, ExecutionPlan, ForwardBuffer, GptModel, ModelComputePrecision,
@@ -24,6 +24,9 @@ use pg_data::{DataShard, token_stream::DistributedTokenLoader};
 const FRONTIER_2135_CASEOPS_VAL_TOKENS: usize = 47_851_520;
 const FRONTIER_CASEOPS_VAL_DOCS: usize = 50_000;
 const FRONTIER_2135_TRAIN_SHARDS: usize = 80;
+
+type TokenBatch = (Vec<u32>, Vec<u32>);
+type DistributedTokenBatches = Vec<Vec<TokenBatch>>;
 
 fn scored_validation_targets_for_seq_len(raw_tokens: usize, seq_len: usize) -> usize {
     if raw_tokens <= 1 || seq_len == 0 {
@@ -397,9 +400,7 @@ fn count_validation_docs_from_tokens(
     boundary_token_id: Option<u32>,
 ) -> Option<usize> {
     let boundary = boundary_token_id?;
-    let mut docs = if tokens.first().copied() == Some(boundary) {
-        0
-    } else if tokens.is_empty() {
+    let mut docs = if tokens.is_empty() || tokens.first().copied() == Some(boundary) {
         0
     } else {
         1
@@ -416,7 +417,13 @@ pub struct VariantResult {
     pub variant_fingerprint: String,
     pub steps_completed: usize,
     pub train_loss: f32,
+    pub train_task_loss: f32,
     pub train_loss_source: String,
+    pub artifact_regularization_steps: usize,
+    pub artifact_regularization_loss_last: f64,
+    pub artifact_regularization_distance_norm_last: f64,
+    pub artifact_regularization_tensors_last: usize,
+    pub artifact_regularization_parameters_last: usize,
     pub proxy_bpb: Option<f64>,
     pub eval_loss: Option<f64>,
     pub final_bpb: Option<f64>,
@@ -769,12 +776,12 @@ fn set_env_var(name: &str, value: &str) {
 
 fn apply_bool_runtime_env(name: &str, expected: bool, record_authoritative: bool) -> PgResult<()> {
     if record_authoritative {
-        if let Some(actual) = env_flag_raw(name) {
-            if actual != expected {
-                return Err(pg_core::PgError::InvalidOp(format!(
-                    "record mode runtime profile owns {name}; env requested {actual}, spec requires {expected}"
-                )));
-            }
+        if let Some(actual) = env_flag_raw(name)
+            && actual != expected
+        {
+            return Err(pg_core::PgError::InvalidOp(format!(
+                "record mode runtime profile owns {name}; env requested {actual}, spec requires {expected}"
+            )));
         }
         set_env_var(name, if expected { "1" } else { "0" });
     } else if std::env::var_os(name).is_none() {
@@ -789,12 +796,12 @@ fn apply_string_runtime_env(
     record_authoritative: bool,
 ) -> PgResult<()> {
     if record_authoritative {
-        if let Ok(actual) = std::env::var(name) {
-            if actual != expected {
-                return Err(pg_core::PgError::InvalidOp(format!(
-                    "record mode runtime profile owns {name}; env requested {actual:?}, spec requires {expected:?}"
-                )));
-            }
+        if let Ok(actual) = std::env::var(name)
+            && actual != expected
+        {
+            return Err(pg_core::PgError::InvalidOp(format!(
+                "record mode runtime profile owns {name}; env requested {actual:?}, spec requires {expected:?}"
+            )));
         }
         set_env_var(name, expected);
     } else if std::env::var_os(name).is_none() {
@@ -2196,6 +2203,7 @@ impl VariantRunner {
     pub fn run(&self, mode: RunMode) -> PgResult<VariantResult> {
         let model_config = self.run_spec.model.to_model_config();
         let train_config = self.run_spec.train.to_train_config();
+        let artifact_regularization_config = artifact_regularization_config(&train_config)?;
         apply_runtime_profile_env(&self.run_spec, mode)?;
         validate_backend_request(&self.run_spec, mode)?;
         validate_executable_variant(&self.run_spec, mode)?;
@@ -2248,10 +2256,9 @@ impl VariantRunner {
         } else {
             None
         };
-        let train_data_source = if data_loader.is_some() {
-            "shards"
-        } else if self.run_spec.train.backend == TrainBackend::CudaDistributed
-            && self.run_spec.train.train_data_pattern.is_some()
+        let train_data_source = if data_loader.is_some()
+            || (self.run_spec.train.backend == TrainBackend::CudaDistributed
+                && self.run_spec.train.train_data_pattern.is_some())
         {
             "shards"
         } else {
@@ -2443,7 +2450,13 @@ impl VariantRunner {
         let mut timing_steps = 0usize;
         let mut timing_measured_wallclock_ms = 0.0f64;
         let mut final_loss = 0.0f32;
+        let mut final_task_loss = 0.0f32;
         let mut steps_completed = 0usize;
+        let mut artifact_regularization_steps = 0usize;
+        let mut artifact_regularization_loss_last = 0.0f64;
+        let mut artifact_regularization_distance_norm_last = 0.0f64;
+        let mut artifact_regularization_tensors_last = 0usize;
+        let mut artifact_regularization_parameters_last = 0usize;
         let mut last_input_ids = Vec::new();
         let mut last_targets = Vec::new();
         for step in 0..max_steps {
@@ -2518,7 +2531,7 @@ impl VariantRunner {
                     })
                     .collect::<Vec<_>>()
             };
-            let distributed_batches: Option<Vec<Vec<(Vec<u32>, Vec<u32>)>>> = if self
+            let distributed_batches: Option<DistributedTokenBatches> = if self
                 .run_spec
                 .train
                 .backend
@@ -2762,10 +2775,25 @@ impl VariantRunner {
                 #[cfg(not(feature = "cuda"))]
                 _ => unreachable!("backend should have been rejected before run"),
             };
+            final_task_loss = final_loss;
             if !matches!(
                 self.run_spec.train.backend,
                 TrainBackend::CudaSingle | TrainBackend::CudaDistributed
             ) {
+                if let Some(config) = artifact_regularization_config
+                    && train_config.artifact_regularization_active(step)
+                {
+                    let report = grads.add_artifact_regularization(&model, config)?;
+                    final_loss = pg_kernels::traingolf::traingolf_stop_gradient_regularized_loss(
+                        final_task_loss as f64,
+                        report.regularization_loss,
+                    )? as f32;
+                    artifact_regularization_steps += 1;
+                    artifact_regularization_loss_last = report.regularization_loss;
+                    artifact_regularization_distance_norm_last = report.distance_norm;
+                    artifact_regularization_tensors_last = report.tensors;
+                    artifact_regularization_parameters_last = report.parameters;
+                }
                 if train_config.grad_clip_norm > 0.0 {
                     grads.clip_grad_norm(train_config.grad_clip_norm);
                 }
@@ -3132,18 +3160,26 @@ impl VariantRunner {
             let tgt: Vec<u16> = last_targets.iter().map(|&v| v as u16).collect();
             let byte_count = bpb_luts.count_bytes(&prev, &tgt);
             Some(compute_bpb(
-                final_loss as f64,
+                final_task_loss as f64,
                 last_targets.len() as f64,
                 byte_count,
             ))
         } else {
             None
         };
-        let proxy_metric_source = proxy_bpb.map(|_| "last_batch_train_loss".to_string());
+        let proxy_metric_source = proxy_bpb.map(|_| {
+            if artifact_regularization_steps > 0 {
+                "last_batch_train_task_loss_excludes_artifact_regularization".to_string()
+            } else {
+                "last_batch_train_loss".to_string()
+            }
+        });
         let train_loss_source = if is_record_shaped_mode(mode) {
             "disabled_for_record_shaped_timing".to_string()
+        } else if artifact_regularization_steps > 0 {
+            "last_step_loss_plus_artifact_regularization".to_string()
         } else {
-            "mean_step_loss".to_string()
+            "last_step_loss".to_string()
         };
         let validation_audit = validation_data_audit(&self.run_spec);
         let mut eval_docs = None;
@@ -3362,7 +3398,13 @@ impl VariantRunner {
             variant_fingerprint: self.plan.variant_fingerprint.clone(),
             steps_completed,
             train_loss: final_loss,
+            train_task_loss: final_task_loss,
             train_loss_source,
+            artifact_regularization_steps,
+            artifact_regularization_loss_last,
+            artifact_regularization_distance_norm_last,
+            artifact_regularization_tensors_last,
+            artifact_regularization_parameters_last,
             proxy_bpb,
             eval_loss,
             final_bpb,
@@ -6884,13 +6926,11 @@ fn final_frontier_record_ready(
     if matches!(
         run_spec.runtime.record_profile,
         RecordProfile::Frontier2135Audit
-    ) {
-        if validation.train_shard_count != FRONTIER_2135_TRAIN_SHARDS
-            || validation.token_count != FRONTIER_2135_CASEOPS_VAL_TOKENS
-            || validation.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS)
-        {
-            return false;
-        }
+    ) && (validation.train_shard_count != FRONTIER_2135_TRAIN_SHARDS
+        || validation.token_count != FRONTIER_2135_CASEOPS_VAL_TOKENS
+        || validation.doc_count != Some(FRONTIER_CASEOPS_VAL_DOCS))
+    {
+        return false;
     }
     if validation.sidecar_token_count != Some(validation.token_count)
         || validation.sidecar_file_set_sha256.is_none()
@@ -7090,9 +7130,30 @@ pub fn run_timing_json(result: &VariantResult) -> String {
         result.proxy_metric_source.as_deref(),
     ));
     fields.push(format!("\"train_loss\":{:.6}", result.train_loss));
+    fields.push(format!("\"train_task_loss\":{:.6}", result.train_task_loss));
     fields.push(json_str_field(
         "train_loss_source",
         &result.train_loss_source,
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_steps\":{}",
+        result.artifact_regularization_steps
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_loss_last\":{:.9}",
+        result.artifact_regularization_loss_last
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_distance_norm_last\":{:.9}",
+        result.artifact_regularization_distance_norm_last
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_tensors_last\":{}",
+        result.artifact_regularization_tensors_last
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_parameters_last\":{}",
+        result.artifact_regularization_parameters_last
     ));
     fields.push(json_opt_f64_field("proxy_bpb", result.proxy_bpb));
     fields.push(json_opt_f64_field("eval_loss", result.eval_loss));
@@ -7750,6 +7811,22 @@ fn record_path_audit_json(
     fields.push(format!(
         "\"grad_clip_norm\":{}",
         run_spec.train.grad_clip_norm
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_lambda\":{}",
+        run_spec.train.artifact_regularization_lambda
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_bits\":{}",
+        run_spec.train.artifact_regularization_bits
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_block_size\":{}",
+        run_spec.train.artifact_regularization_block_size
+    ));
+    fields.push(format!(
+        "\"artifact_regularization_start_lr_scale\":{}",
+        run_spec.train.artifact_regularization_start_lr_scale
     ));
     fields.push(format!("\"warmup_steps\":{}", run_spec.train.warmup_steps));
     fields.push(format!(
@@ -9726,12 +9803,18 @@ fn chunked_bf16_output_ce_cache_enabled_for_audit(run_spec: &RunSpec) -> bool {
 
 fn tiled_output_cross_entropy_enabled_for_audit(run_spec: &RunSpec) -> bool {
     effective_output_ce_backend_for_audit(run_spec) == Some(OutputCeBackend::TiledRepeatedGemm)
-        && run_spec.model.vocab_size % output_ce_tile_vocab_for_audit() == 0
+        && run_spec
+            .model
+            .vocab_size
+            .is_multiple_of(output_ce_tile_vocab_for_audit())
 }
 
 fn fused_exact_output_ce_enabled_for_audit(run_spec: &RunSpec) -> bool {
     effective_output_ce_backend_for_audit(run_spec) == Some(OutputCeBackend::FusedExactWmma)
-        && run_spec.model.vocab_size % output_ce_tile_vocab_for_audit() == 0
+        && run_spec
+            .model
+            .vocab_size
+            .is_multiple_of(output_ce_tile_vocab_for_audit())
 }
 
 fn output_path_materializes_full_logits_for_audit(run_spec: &RunSpec) -> bool {
@@ -10080,7 +10163,7 @@ fn frontier_record_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
         {
             gaps.push("record-grade sparse-XSA cuDNN SDPA backward should feed BF16 [B,H,S,D] dO directly into cuDNN; current config still materializes F32 dO and converts it before SDPA backward");
         }
-        if gpu_saved_layer_activations_mode_for_audit().to_ascii_lowercase() != "all"
+        if !gpu_saved_layer_activations_mode_for_audit().eq_ignore_ascii_case("all")
             || !direct_saved_layer_activations_enabled_for_audit()
             || !skip_f32_attention_saved_activations_enabled_for_audit(run_spec)
         {
@@ -10347,13 +10430,13 @@ fn proposal_feature_gaps(run_spec: &RunSpec) -> Vec<&'static str> {
     if pg_quant::layout::compile_quant_layout_manifest(&run_spec.quant, None).is_err() {
         gaps.push("QuantSpec does not compile into a quantization layout manifest");
     }
-    if run_spec.model.bigram.enabled {
-        if !run_spec.runtime.bigram_embedding_merge {
-            gaps.push("BigramHash is enabled but the fused embedding/BigramHash merge kernel is not active");
-            gaps.push(
-                "BigramHash fused backward requires the fused embedding/BigramHash merge profile",
-            );
-        }
+    if run_spec.model.bigram.enabled && !run_spec.runtime.bigram_embedding_merge {
+        gaps.push(
+            "BigramHash is enabled but the fused embedding/BigramHash merge kernel is not active",
+        );
+        gaps.push(
+            "BigramHash fused backward requires the fused embedding/BigramHash merge profile",
+        );
     }
     if run_spec.model.sparse_attn_gate.enabled
         && run_spec.model.xsa_last_n > 0
@@ -10839,6 +10922,43 @@ fn scale_cpu_grads(grads: &mut GradBuffers, scale: f32) {
     scale_slice(&mut grads.ve_layer_scales, scale);
 }
 
+fn artifact_regularization_config(
+    train_config: &pg_model::TrainConfig,
+) -> PgResult<Option<ArtifactRegularizationConfig>> {
+    let lambda = train_config.artifact_regularization_lambda;
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "artifact_regularization_lambda must be nonnegative finite, got {lambda}"
+        )));
+    }
+    if lambda == 0.0 {
+        return Ok(None);
+    }
+    let bits = train_config.artifact_regularization_bits;
+    if !(2..=8).contains(&bits) {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "artifact_regularization_bits must be in 2..=8, got {bits}"
+        )));
+    }
+    let block_size = train_config.artifact_regularization_block_size;
+    if block_size == 0 {
+        return Err(pg_core::PgError::InvalidOp(
+            "artifact_regularization_block_size must be > 0".into(),
+        ));
+    }
+    let start_lr_scale = train_config.artifact_regularization_start_lr_scale;
+    if !start_lr_scale.is_finite() || start_lr_scale < 0.0 {
+        return Err(pg_core::PgError::InvalidOp(format!(
+            "artifact_regularization_start_lr_scale must be nonnegative finite, got {start_lr_scale}"
+        )));
+    }
+    Ok(Some(ArtifactRegularizationConfig {
+        bits,
+        block_size,
+        lambda,
+    }))
+}
+
 fn current_executable_bytes() -> Option<usize> {
     if let Ok(value) = std::env::var("PG_SUBMISSION_CODE_BYTES") {
         if let Ok(bytes) = value.parse::<usize>() {
@@ -10953,6 +11073,7 @@ fn flatten_params_into(model: &GptModel, flat: &mut [f32]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -10971,6 +11092,40 @@ mod tests {
         header[2] = values.len() as i32;
         file.write_all(bytemuck::cast_slice(&header)).unwrap();
         file.write_all(bytemuck::cast_slice(values)).unwrap();
+    }
+
+    fn tiny_cpu_run_spec() -> RunSpec {
+        let mut spec = RunSpec::default();
+        spec.name = "tiny_cpu_train".to_string();
+        spec.model.vocab_size = 32;
+        spec.model.num_layers = 2;
+        spec.model.model_dim = 16;
+        spec.model.num_heads = 4;
+        spec.model.num_kv_heads = 2;
+        spec.model.mlp_mult = 2.0;
+        spec.model.train_seq_len = 8;
+        spec.model.eval_seq_len = 8;
+        spec.model.xsa_last_n = 0;
+        spec.model.rope.dims = 0;
+        spec.model.value_embedding.enabled = false;
+        spec.model.value_embedding.layers.clear();
+        spec.model.value_embedding.dim = 4;
+        spec.model.bigram.enabled = false;
+        spec.model.bigram.vocab_size = 0;
+        spec.model.bigram.dim = 0;
+        spec.model.ln_scale = false;
+        spec.model.qk_gain_init = 1.0;
+        spec.train.backend = TrainBackend::Cpu;
+        spec.train.batch_tokens = 8;
+        spec.train.seq_len = 8;
+        spec.train.fast_bank_updates = true;
+        spec.train.total_iterations = 4;
+        spec.train.warmup_steps = 0;
+        spec.train.warmdown_iters = 4;
+        spec.train.warmdown_frac = 0.0;
+        spec.train.max_wallclock_seconds = 30.0;
+        spec.train.grad_clip_norm = 1.0;
+        spec
     }
 
     fn with_tiled_output_ce_env<T>(
@@ -11036,6 +11191,62 @@ mod tests {
         spec.train.backend = TrainBackend::CudaSingle;
         let err = validate_backend_request(&spec, RunMode::RecordShapedProxy).unwrap_err();
         assert!(err.to_string().contains("cuda-distributed"));
+    }
+
+    #[test]
+    fn train_golf_regularization_smoke_run_reports_active_steps() {
+        let mut spec = tiny_cpu_run_spec();
+        spec.train.artifact_regularization_lambda = 0.05;
+        spec.train.artifact_regularization_bits = 4;
+        spec.train.artifact_regularization_block_size = 8;
+        spec.train.artifact_regularization_start_lr_scale = 1.0;
+
+        let result = VariantRunner::new(spec)
+            .unwrap()
+            .run(RunMode::Smoke)
+            .unwrap();
+
+        assert_eq!(result.steps_completed, 4);
+        assert_eq!(result.artifact_regularization_steps, result.steps_completed);
+        assert!(result.artifact_regularization_loss_last > 0.0);
+        assert!(result.artifact_regularization_distance_norm_last > 0.0);
+        assert!(result.artifact_regularization_tensors_last > 0);
+        assert!(result.artifact_regularization_parameters_last > 0);
+        assert!(result.train_loss > result.train_task_loss);
+        assert_eq!(
+            result.train_loss_source,
+            "last_step_loss_plus_artifact_regularization"
+        );
+        assert_eq!(result.proxy_metric_source, None);
+    }
+
+    #[test]
+    fn train_loss_source_reports_last_step_when_regularization_inactive() {
+        let spec = tiny_cpu_run_spec();
+
+        let result = VariantRunner::new(spec)
+            .unwrap()
+            .run(RunMode::Smoke)
+            .unwrap();
+
+        assert_eq!(result.steps_completed, 4);
+        assert_eq!(result.artifact_regularization_steps, 0);
+        assert_eq!(result.train_loss, result.train_task_loss);
+        assert_eq!(result.train_loss_source, "last_step_loss");
+    }
+
+    #[test]
+    fn train_golf_regularization_rejects_invalid_config() {
+        let mut config = pg_model::TrainConfig::default();
+        config.artifact_regularization_lambda = 0.1;
+        config.artifact_regularization_bits = 1;
+
+        let err = artifact_regularization_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("artifact_regularization_bits must be in 2..=8"),
+            "{err}"
+        );
     }
 
     #[test]

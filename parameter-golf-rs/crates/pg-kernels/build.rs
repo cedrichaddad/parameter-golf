@@ -101,7 +101,7 @@ fn main() {
 
 fn add_cuda_arch_flags(build: &mut cc::Build) {
     for arch in cuda_arches() {
-        build.flag(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
+        build.flag(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
 }
 

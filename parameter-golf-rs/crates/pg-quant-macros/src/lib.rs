@@ -78,10 +78,10 @@ fn reject_unknown_fields(
 
 fn unwrap_single_group(input: TokenStream) -> Vec<TokenTree> {
     let tokens: Vec<TokenTree> = input.into_iter().collect();
-    if let [TokenTree::Group(group)] = tokens.as_slice() {
-        if group.delimiter() == Delimiter::Brace {
-            return group.stream().into_iter().collect();
-        }
+    if let [TokenTree::Group(group)] = tokens.as_slice()
+        && group.delimiter() == Delimiter::Brace
+    {
+        return group.stream().into_iter().collect();
     }
     tokens
 }

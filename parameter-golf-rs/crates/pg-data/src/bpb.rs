@@ -60,11 +60,7 @@ impl BpbLuts {
             } else if is_byte_piece(piece) {
                 1
             } else {
-                piece
-                    .trim_start_matches('▁')
-                    .as_bytes()
-                    .len()
-                    .min(i16::MAX as usize) as i16
+                piece.trim_start_matches('▁').len().min(i16::MAX as usize) as i16
             };
             base_bytes.push(bytes);
             has_leading_space.push(leading);

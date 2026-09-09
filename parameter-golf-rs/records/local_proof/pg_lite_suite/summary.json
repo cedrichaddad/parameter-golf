@@ -2,7 +2,7 @@
   "kind": "pg_lite_suite",
   "config_dir": "specs/pg_lite",
   "output_dir": "records/local_proof/pg_lite_suite",
-  "configs_found": 5,
+  "configs_found": 6,
   "runs": [
     {
       "config_path": "specs/pg_lite/artifact_golf_1mb.toml",
@@ -33,6 +33,24 @@
       "backend_accelerated": false,
       "status": "pass",
       "validation_bpb": 6.975616794261117,
+      "artifact_bytes_estimate": 1565,
+      "artifact_actual_bytes": 2497,
+      "artifact_budget_ok": true,
+      "memory_budget_status": "pass",
+      "score_first_tokens_scored": 0,
+      "score_first_update_count": 0
+    },
+    {
+      "config_path": "specs/pg_lite/byte_golf_1mb_300s_metal_probe.toml",
+      "output_dir": "records/local_proof/pg_lite_suite/byte_golf_1mb_300s_metal_probe",
+      "track": "byte_golf",
+      "model_family": "ngram_residual",
+      "requested_backend": "metal_apple",
+      "execution_backend": "metal_apple",
+      "backend_status": "metal_apple_runtime",
+      "backend_accelerated": true,
+      "status": "pass",
+      "validation_bpb": 6.975616855916965,
       "artifact_bytes_estimate": 1565,
       "artifact_actual_bytes": 2497,
       "artifact_budget_ok": true,

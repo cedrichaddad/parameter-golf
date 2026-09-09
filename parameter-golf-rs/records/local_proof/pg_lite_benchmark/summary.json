@@ -1,0 +1,128 @@
+{
+  "kind": "pg_lite_benchmark",
+  "config_path": "specs/pg_lite/byte_golf_1mb_300s_metal_probe.toml",
+  "output_dir": "records/local_proof/pg_lite_benchmark",
+  "repeats": 3,
+  "backends": [
+    {
+      "requested_backend": "cpu_reference",
+      "status": "pass",
+      "error": null,
+      "runs": [
+        {
+          "run_index": 0,
+          "output_dir": "records/local_proof/pg_lite_benchmark/cpu_reference/run_000",
+          "report_path": "records/local_proof/pg_lite_benchmark/cpu_reference/run_000/report.json",
+          "status": "pass",
+          "execution_backend": "cpu_reference",
+          "backend_accelerated": false,
+          "validation_bpb": 6.975616794261117,
+          "total_wall_seconds": 0.173096417,
+          "train_wall_seconds": 0.000101542,
+          "eval_wall_seconds": 0.000335959,
+          "artifact_actual_bytes": 2497
+        },
+        {
+          "run_index": 1,
+          "output_dir": "records/local_proof/pg_lite_benchmark/cpu_reference/run_001",
+          "report_path": "records/local_proof/pg_lite_benchmark/cpu_reference/run_001/report.json",
+          "status": "pass",
+          "execution_backend": "cpu_reference",
+          "backend_accelerated": false,
+          "validation_bpb": 6.975616794261117,
+          "total_wall_seconds": 0.149205166,
+          "train_wall_seconds": 0.000094208,
+          "eval_wall_seconds": 0.000399542,
+          "artifact_actual_bytes": 2497
+        },
+        {
+          "run_index": 2,
+          "output_dir": "records/local_proof/pg_lite_benchmark/cpu_reference/run_002",
+          "report_path": "records/local_proof/pg_lite_benchmark/cpu_reference/run_002/report.json",
+          "status": "pass",
+          "execution_backend": "cpu_reference",
+          "backend_accelerated": false,
+          "validation_bpb": 6.975616794261117,
+          "total_wall_seconds": 0.150235875,
+          "train_wall_seconds": 0.000100166,
+          "eval_wall_seconds": 0.000329042,
+          "artifact_actual_bytes": 2497
+        }
+      ],
+      "run_count": 3,
+      "accelerated_run_count": 0,
+      "execution_backends": [
+        "cpu_reference"
+      ],
+      "median_total_wall_seconds": 0.150235875,
+      "median_train_wall_seconds": 0.000100166,
+      "median_eval_wall_seconds": 0.000335959,
+      "median_validation_bpb": 6.975616794261117,
+      "artifact_actual_bytes": 2497
+    },
+    {
+      "requested_backend": "metal_apple",
+      "status": "pass",
+      "error": null,
+      "runs": [
+        {
+          "run_index": 0,
+          "output_dir": "records/local_proof/pg_lite_benchmark/metal_apple/run_000",
+          "report_path": "records/local_proof/pg_lite_benchmark/metal_apple/run_000/report.json",
+          "status": "pass",
+          "execution_backend": "metal_apple",
+          "backend_accelerated": true,
+          "validation_bpb": 6.975616855916965,
+          "total_wall_seconds": 0.156479458,
+          "train_wall_seconds": 0.0021185,
+          "eval_wall_seconds": 4.2e-8,
+          "artifact_actual_bytes": 2497
+        },
+        {
+          "run_index": 1,
+          "output_dir": "records/local_proof/pg_lite_benchmark/metal_apple/run_001",
+          "report_path": "records/local_proof/pg_lite_benchmark/metal_apple/run_001/report.json",
+          "status": "pass",
+          "execution_backend": "metal_apple",
+          "backend_accelerated": true,
+          "validation_bpb": 6.975616855916965,
+          "total_wall_seconds": 0.151636042,
+          "train_wall_seconds": 0.006706458,
+          "eval_wall_seconds": 4.1e-8,
+          "artifact_actual_bytes": 2497
+        },
+        {
+          "run_index": 2,
+          "output_dir": "records/local_proof/pg_lite_benchmark/metal_apple/run_002",
+          "report_path": "records/local_proof/pg_lite_benchmark/metal_apple/run_002/report.json",
+          "status": "pass",
+          "execution_backend": "metal_apple",
+          "backend_accelerated": true,
+          "validation_bpb": 6.975616855916965,
+          "total_wall_seconds": 0.156023375,
+          "train_wall_seconds": 0.002517125,
+          "eval_wall_seconds": 4.1e-8,
+          "artifact_actual_bytes": 2497
+        }
+      ],
+      "run_count": 3,
+      "accelerated_run_count": 3,
+      "execution_backends": [
+        "metal_apple"
+      ],
+      "median_total_wall_seconds": 0.156023375,
+      "median_train_wall_seconds": 0.002517125,
+      "median_eval_wall_seconds": 4.1e-8,
+      "median_validation_bpb": 6.975616855916965,
+      "artifact_actual_bytes": 2497
+    }
+  ],
+  "cpu_vs_metal_speedup_total": 0.962906199151249,
+  "cpu_vs_metal_speedup_train": 0.039793812385161643,
+  "cpu_vs_metal_bpb_delta": 6.165584842676708e-8,
+  "best_total_wall_backend": "cpu_reference",
+  "best_bpb_backend": "cpu_reference",
+  "summary_json_path": "records/local_proof/pg_lite_benchmark/summary.json",
+  "summary_markdown_path": "records/local_proof/pg_lite_benchmark/summary.md",
+  "status": "pass"
+}

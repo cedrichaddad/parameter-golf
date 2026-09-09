@@ -1,0 +1,21 @@
+track = "byte_golf"
+artifact_budget_bytes = 1000000
+train_time_seconds = 300.0
+eval_time_seconds = 60.0
+score = "bpb"
+
+[data]
+train_path = "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/data/train.bytes"
+val_path = "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/data/val.bytes"
+format = "bytes"
+
+[model]
+family = "ngram_residual"
+vocab = "byte"
+context = 512
+residual_buckets = 2048
+residual_weight = 0.15
+
+[backend]
+kind = "metal_apple"
+allow_cpu_fallback = true

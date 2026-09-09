@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -8,6 +9,12 @@ use pg_model::{ExecutionPlan, GptModel, RecurrentBackwardProfile, RunSpec};
 use pg_optim::muon::Muon;
 use pg_quant::{CompiledQuantKernelSet, compile_quant_layout_manifest};
 use serde::{Deserialize, Serialize};
+
+pub mod modelgolf;
+pub use modelgolf::{ModelGolfOptions, ModelGolfReport, ModelGolfSection, run_modelgolf_plan};
+
+#[cfg(feature = "metal_apple")]
+mod metal_lite;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyOptions {
@@ -103,6 +110,7 @@ pub struct ProofBundleOptions {
     pub spec: PathBuf,
     pub artifact: Option<PathBuf>,
     pub trace: Option<PathBuf>,
+    pub trace_dir: Option<PathBuf>,
     pub lite_config: PathBuf,
     pub lite_config_dir: Option<PathBuf>,
     pub output_dir: PathBuf,
@@ -117,9 +125,15 @@ pub struct ProofBundleReport {
     pub verify_path: String,
     pub dist_sim_path: String,
     pub artifact_lab_path: String,
+    pub modelgolf_path: String,
     pub wind_tunnel_path: String,
+    pub trace_corpus_path: String,
+    pub calibration_model_path: String,
+    pub scenario_report_path: String,
     pub lite_report_path: String,
+    pub lite_benchmark_summary_path: String,
     pub lite_suite_summary_path: String,
+    pub wind_tunnel_reviewer_report_path: String,
     pub backend_cpu_check_path: String,
     pub backend_metal_check_path: String,
     pub proposal_feature_path: String,
@@ -322,9 +336,11 @@ pub struct BackendCheckReport {
     pub kernel_source_crc32: Option<String>,
     pub expected_kernel_symbols: Vec<String>,
     pub kernel_symbols_found: Vec<String>,
+    pub kernel_contracts: Vec<BackendKernelContractReport>,
     pub kernel_contract_ok: bool,
     pub metal_compiler_path: Option<String>,
     pub metal_compiler_available: bool,
+    pub metal_compiler_error: Option<String>,
     pub metal_compile_smoke_attempted: bool,
     pub metal_compile_smoke_ok: bool,
     pub metal_compile_stderr: Option<String>,
@@ -332,6 +348,14 @@ pub struct BackendCheckReport {
     pub executable_backend_available: bool,
     pub notes: Vec<String>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendKernelContractReport {
+    pub symbol: String,
+    pub role: String,
+    pub optimization_note: String,
+    pub executable_required_for_acceleration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,6 +640,98 @@ pub struct LiteRunOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteInitOptions {
+    pub input: PathBuf,
+    pub output_dir: PathBuf,
+    pub artifact_budget_bytes: usize,
+    pub train_time_seconds: f64,
+    pub eval_time_seconds: f64,
+    pub memory_budget_bytes: Option<usize>,
+    pub val_bytes: Option<usize>,
+    pub val_fraction: f64,
+    pub context: usize,
+    pub residual_buckets: usize,
+    pub residual_weight: f64,
+    pub backend: LiteBackendKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteInitReport {
+    pub kind: &'static str,
+    pub input_path: String,
+    pub output_dir: String,
+    pub input_bytes: usize,
+    pub input_crc32: String,
+    pub train_path: String,
+    pub val_path: String,
+    pub train_bytes: usize,
+    pub train_crc32: String,
+    pub val_bytes: usize,
+    pub val_crc32: String,
+    pub val_fraction_effective: f64,
+    pub configs: Vec<LiteInitConfigReport>,
+    pub readme_path: String,
+    pub report_path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteInitConfigReport {
+    pub name: String,
+    pub path: String,
+    pub track: LiteTrack,
+    pub model_family: LiteModelFamily,
+    pub backend: LiteBackendKind,
+    pub allow_cpu_fallback: bool,
+    pub artifact_budget_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteVerifyArtifactOptions {
+    pub artifact: PathBuf,
+    pub config: Option<PathBuf>,
+    pub val: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteVerifyArtifactReport {
+    pub kind: &'static str,
+    pub artifact_path: String,
+    pub artifact_bytes: usize,
+    pub artifact_crc32: String,
+    pub artifact_kind: String,
+    pub decoded_ok: bool,
+    pub model_reconstruct_ok: bool,
+    pub source_config_fingerprint: String,
+    pub model_fingerprint: String,
+    pub expected_config_fingerprint: Option<String>,
+    pub source_config_matches_expected: Option<bool>,
+    pub model_family: LiteModelFamily,
+    pub context: usize,
+    pub residual_weight: f64,
+    pub bigram_rows: usize,
+    pub residual_buckets: usize,
+    pub bigram_entries: usize,
+    pub residual_entries: usize,
+    pub artifact_budget_bytes: Option<usize>,
+    pub artifact_budget_ok: Option<bool>,
+    pub val_path: Option<String>,
+    pub val_bytes: Option<usize>,
+    pub validation_bpb: Option<f64>,
+    pub validation_bpb_scope: &'static str,
+    pub notes: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteBenchmarkOptions {
+    pub config: PathBuf,
+    pub output_dir: PathBuf,
+    pub repeats: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiteSuiteOptions {
     pub config_dir: PathBuf,
     pub output_dir: PathBuf,
@@ -633,6 +749,54 @@ pub struct LiteSuiteReport {
     pub summary_json_path: String,
     pub summary_markdown_path: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteBenchmarkReport {
+    pub kind: &'static str,
+    pub config_path: String,
+    pub output_dir: String,
+    pub repeats: usize,
+    pub backends: Vec<LiteBenchmarkBackendReport>,
+    pub cpu_vs_metal_speedup_total: Option<f64>,
+    pub cpu_vs_metal_speedup_train: Option<f64>,
+    pub cpu_vs_metal_bpb_delta: Option<f64>,
+    pub best_total_wall_backend: Option<LiteBackendKind>,
+    pub best_bpb_backend: Option<LiteBackendKind>,
+    pub summary_json_path: String,
+    pub summary_markdown_path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteBenchmarkBackendReport {
+    pub requested_backend: LiteBackendKind,
+    pub status: String,
+    pub error: Option<String>,
+    pub runs: Vec<LiteBenchmarkRunReport>,
+    pub run_count: usize,
+    pub accelerated_run_count: usize,
+    pub execution_backends: Vec<LiteBackendKind>,
+    pub median_total_wall_seconds: Option<f64>,
+    pub median_train_wall_seconds: Option<f64>,
+    pub median_eval_wall_seconds: Option<f64>,
+    pub median_validation_bpb: Option<f64>,
+    pub artifact_actual_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteBenchmarkRunReport {
+    pub run_index: usize,
+    pub output_dir: String,
+    pub report_path: String,
+    pub status: String,
+    pub execution_backend: LiteBackendKind,
+    pub backend_accelerated: bool,
+    pub validation_bpb: f64,
+    pub total_wall_seconds: f64,
+    pub train_wall_seconds: f64,
+    pub eval_wall_seconds: f64,
+    pub artifact_actual_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +839,7 @@ pub struct LiteRunReport {
     pub eval_time_seconds_budget: f64,
     pub train_wall_seconds: f64,
     pub eval_wall_seconds: f64,
+    pub timing: LiteTimingReport,
     pub artifact_budget_bytes: usize,
     pub artifact_bytes_estimate: usize,
     pub artifact_actual_bytes: usize,
@@ -694,6 +859,20 @@ pub struct LiteRunReport {
     pub score_first_update_count: usize,
     pub proxy_only: bool,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteTimingReport {
+    pub config_load_wall_seconds: f64,
+    pub backend_select_wall_seconds: f64,
+    pub data_load_wall_seconds: f64,
+    pub train_wall_seconds: f64,
+    pub eval_wall_seconds: f64,
+    pub artifact_json_write_wall_seconds: f64,
+    pub artifact_binary_write_wall_seconds: f64,
+    pub manifest_write_wall_seconds: f64,
+    pub total_wall_seconds_excluding_report_write: f64,
+    pub report_write_excluded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +945,15 @@ pub struct WindTunnelSuiteOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelReviewerOptions {
+    pub spec: PathBuf,
+    pub trace_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub target_step_ms: f64,
+    pub active_recurrent_replay_cut_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindTunnelSuiteReport {
     pub kind: &'static str,
     pub spec_path: String,
@@ -784,6 +972,66 @@ pub struct WindTunnelSuiteReport {
     pub summary_json_path: String,
     pub summary_markdown_path: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelReviewerReport {
+    pub kind: &'static str,
+    pub spec_path: String,
+    pub trace_dir: String,
+    pub output_dir: String,
+    pub report_json_path: String,
+    pub report_markdown_path: String,
+    pub trace_index_path: String,
+    pub corpus_path: String,
+    pub calibration_path: String,
+    pub scenario_path: String,
+    pub suite_summary_path: String,
+    pub traces_found: usize,
+    pub parseable_traces: usize,
+    pub deduped_runs: usize,
+    pub timed_runs: usize,
+    pub exact_2135_timed_runs: usize,
+    pub stage_calibration_runs: usize,
+    pub canonical_caseops_runs: usize,
+    pub best_exact_2135_ms: Option<f64>,
+    pub best_active_recurrent_ms: Option<f64>,
+    pub calibration_confidence_summary: String,
+    pub holdout_validation: WindTunnelHoldoutReport,
+    pub scenario_clears_target: bool,
+    pub scenario_predicted_step_ms: f64,
+    pub recommended_next_experiment: String,
+    pub top_stage_metrics: Vec<CalibratedStageMetricReport>,
+    pub warnings: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelHoldoutReport {
+    pub kind: &'static str,
+    pub estimate_only: bool,
+    pub predictor_kind: &'static str,
+    pub train_sample_count: usize,
+    pub holdout_sample_count: usize,
+    pub baseline_ms: Option<f64>,
+    pub mean_predicted_ms: Option<f64>,
+    pub mean_abs_error_ms: Option<f64>,
+    pub mean_abs_pct_error: Option<f64>,
+    pub spearman_rank_correlation: Option<f64>,
+    pub samples: Vec<WindTunnelHoldoutSampleReport>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelHoldoutSampleReport {
+    pub run_key: String,
+    pub selected_trace_path: String,
+    pub class_label: String,
+    pub prediction_source: String,
+    pub observed_ms: f64,
+    pub predicted_ms: f64,
+    pub abs_error_ms: f64,
+    pub pct_error: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,6 +1056,33 @@ pub struct WindTunnelSuiteTraceSummary {
 pub struct TraceIndexOptions {
     pub spec: PathBuf,
     pub trace_dir: PathBuf,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelCorpusOptions {
+    pub spec: PathBuf,
+    pub trace_dir: PathBuf,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelCalibrationOptions {
+    pub spec: PathBuf,
+    pub trace_dir: Option<PathBuf>,
+    pub corpus: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelScenarioOptions {
+    pub spec: PathBuf,
+    pub calibration: Option<PathBuf>,
+    pub trace: Option<PathBuf>,
+    pub active_recurrent_replay_cut_ms: f64,
+    pub bank_update_cut_ms: f64,
+    pub graph_overhead_cut_ms: f64,
+    pub target_step_ms: f64,
     pub output: Option<PathBuf>,
 }
 
@@ -865,6 +1140,137 @@ pub struct TraceIndexEntry {
     pub nonzero_stage_fields: Vec<String>,
     pub zero_stage_fields: Vec<String>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelCorpusReport {
+    pub kind: String,
+    pub spec_path: String,
+    pub trace_dir: String,
+    pub traces_found: usize,
+    pub parseable_traces: usize,
+    pub deduped_runs: usize,
+    pub duplicate_source_files: usize,
+    pub timed_runs: usize,
+    pub stage_calibration_runs: usize,
+    pub partial_stage_calibration_runs: usize,
+    pub total_calibration_runs: usize,
+    pub exact_2135_runs: usize,
+    pub canonical_caseops_runs: usize,
+    pub allst_diagnostic_runs: usize,
+    pub best_exact_2135_ms: Option<f64>,
+    pub best_exact_2135_run_key: Option<String>,
+    pub best_active_recurrent_ms: Option<f64>,
+    pub best_active_recurrent_run_key: Option<String>,
+    pub runs: Vec<WindTunnelCorpusRun>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelCorpusRun {
+    pub run_key: String,
+    pub selected_trace_path: String,
+    pub source_paths: Vec<String>,
+    pub selection_score: i32,
+    pub selection_reason: String,
+    pub calibration_role: String,
+    pub signal_quality: String,
+    pub trace_total_ms: Option<f64>,
+    pub active_recurrent_ms_per_step: Option<f64>,
+    pub inactive_recurrent_ms_per_step: Option<f64>,
+    pub active_recurrent_steps: Option<usize>,
+    pub timing_steps: Option<usize>,
+    pub steps_completed: Option<usize>,
+    pub run_name: Option<String>,
+    pub mode: Option<String>,
+    pub record_profile: Option<String>,
+    pub recurrent_backward_profile: Option<String>,
+    pub cuda_graph_profile: Option<String>,
+    pub world_size: Option<usize>,
+    pub seq_len: Option<usize>,
+    pub canonical_caseops_dataset: Option<bool>,
+    pub train_shards: Option<usize>,
+    pub val_tokens: Option<usize>,
+    pub f32_to_bf16_bridge_launches: Option<usize>,
+    pub bf16_to_f32_bridge_launches: Option<usize>,
+    pub host_batch_flatten_calls: Option<usize>,
+    pub host_to_device_batch_bytes: Option<usize>,
+    pub useful_stage_coverage_ratio: f64,
+    pub traced_stage_ms_ratio: f64,
+    pub nonzero_stage_fields: Vec<String>,
+    pub zero_stage_fields: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelCalibrationReport {
+    pub kind: String,
+    pub spec_path: String,
+    pub source_kind: String,
+    pub corpus_path: Option<String>,
+    pub trace_dir: Option<String>,
+    pub runs_considered: usize,
+    pub timed_runs: usize,
+    pub exact_2135_timed_runs: usize,
+    pub stage_calibration_runs: usize,
+    pub total_step_ms: Option<CalibratedMetricReport>,
+    pub exact_2135_total_step_ms: Option<CalibratedMetricReport>,
+    pub active_recurrent_ms: Option<CalibratedMetricReport>,
+    pub inactive_recurrent_ms: Option<CalibratedMetricReport>,
+    pub recurrent_active_minus_inactive_ms: Option<CalibratedMetricReport>,
+    pub stage_metrics: Vec<CalibratedStageMetricReport>,
+    pub recommended_trace_to_collect: String,
+    pub confidence_summary: String,
+    pub warnings: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibratedMetricReport {
+    pub name: String,
+    pub estimate_ms: f64,
+    pub best_ms: f64,
+    pub median_ms: f64,
+    pub p90_ms: f64,
+    pub sample_count: usize,
+    pub confidence: String,
+    pub source_run_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibratedStageMetricReport {
+    pub stage: String,
+    pub estimate_ms: f64,
+    pub sample_count: usize,
+    pub confidence: String,
+    pub source_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindTunnelScenarioReport {
+    pub kind: String,
+    pub spec_fingerprint: String,
+    pub estimate_only: bool,
+    pub source_kind: String,
+    pub calibration_path: Option<String>,
+    pub trace_path: Option<String>,
+    pub base_step_ms: f64,
+    pub base_step_source: String,
+    pub target_step_ms: f64,
+    pub active_recurrent_replay_cut_ms: f64,
+    pub bank_update_cut_ms: f64,
+    pub graph_overhead_cut_ms: f64,
+    pub total_requested_cut_ms: f64,
+    pub predicted_step_ms: f64,
+    pub predicted_active_recurrent_ms: Option<f64>,
+    pub expected_train_steps_in_600s: usize,
+    pub expected_train_wall_seconds: f64,
+    pub clears_target: bool,
+    pub remaining_gap_ms: f64,
+    pub risk_level: String,
+    pub recommendation: String,
+    pub warnings: Vec<String>,
+    pub status: String,
 }
 
 pub fn run_verify(options: VerifyOptions) -> PgResult<VerifyReport> {
@@ -970,11 +1376,21 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
     let verify_path = options.output_dir.join("verify.json");
     let dist_sim_path = options.output_dir.join("dist_sim.json");
     let artifact_lab_path = options.output_dir.join("artifact_lab.json");
+    let modelgolf_path = options.output_dir.join("modelgolf.json");
     let wind_tunnel_path = options.output_dir.join("wind_tunnel.json");
+    let trace_corpus_path = options.output_dir.join("trace_corpus.json");
+    let calibration_model_path = options.output_dir.join("calibration_model.json");
+    let scenario_report_path = options
+        .output_dir
+        .join("scenario_exact_recurrent_replay.json");
     let lite_output_dir = options.output_dir.join("pg_lite");
     let lite_report_path = lite_output_dir.join("report.json");
+    let lite_benchmark_output_dir = options.output_dir.join("pg_lite_benchmark");
+    let lite_benchmark_summary_path = lite_benchmark_output_dir.join("summary.json");
     let lite_suite_output_dir = options.output_dir.join("pg_lite_suite");
     let lite_suite_summary_path = lite_suite_output_dir.join("summary.json");
+    let wind_tunnel_reviewer_output_dir = options.output_dir.join("wind_tunnel_reviewer");
+    let wind_tunnel_reviewer_report_path = wind_tunnel_reviewer_output_dir.join("report.json");
     let backend_cpu_check_path = options.output_dir.join("backend_cpu_reference.json");
     let backend_metal_check_path = options.output_dir.join("backend_metal_apple.json");
     let proposal_feature_path = options.output_dir.join("proposal_features.json");
@@ -1008,14 +1424,122 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
         mini_val: None,
         output: Some(artifact_lab_path.clone()),
     })?;
+    let modelgolf = run_modelgolf_plan(ModelGolfOptions {
+        section: modelgolf::ModelGolfSection::Full,
+        spec: options.spec.clone(),
+        output: Some(modelgolf_path.clone()),
+        hardware: "proof_bundle_local".to_string(),
+        runtime: "pg-local".to_string(),
+        memory_budget_bytes: None,
+        latency_target_ms: None,
+        quality_budget_ppl_pct: None,
+        context: None,
+        batch: None,
+        artifact_budget_bytes: None,
+        delta_budget_bytes: None,
+        proof_artifact: None,
+        quality_calibration: None,
+        release_evidence: None,
+        release_artifact: None,
+        validation_dataset_id: None,
+        validation_command: None,
+        heldout_bpb: None,
+        baseline_bpb: None,
+        decode_tokens_per_second: None,
+        backend_id: None,
+        kernel_id: None,
+        long_context_dataset_id: None,
+        fused_runtime: None,
+        parity_pass: None,
+        long_context_bpb_delta_pct: None,
+        speedup_x: None,
+        calibration_dataset_id: None,
+        production_svd_validated: None,
+        calibrated_tensor_sensitivity: None,
+        equal_byte_bpb_delta: None,
+        domain_dataset_id: None,
+        trained_delta_bytes: None,
+        legality_pass: None,
+        score_first_trace_or_review: None,
+        equal_byte_domain_bpb_delta: None,
+        training_run_id: None,
+        gpu_backend_integrated: None,
+        proxy_calibrated: None,
+        post_export_bpb_delta_vs_posthoc: None,
+        measurement_run_id: None,
+        power_meter_id: None,
+        wall_time_seconds: None,
+        average_power_watts: None,
+        energy_joules: None,
+        telemetry_validated: None,
+        distributed_backend_id: None,
+        reduce_scatter_parity_pass: None,
+        all_gather_parity_pass: None,
+        optimizer_update_parity_pass: None,
+        nccl_trace_validated: None,
+        overlap_validated: None,
+        measured_comm_time_ms: None,
+        measured_step_time_ms: None,
+        communication_speedup_x: None,
+        generated_kernel_ids: None,
+        generated_kernels: None,
+        memory_reduction_x: None,
+        trace_corpus_id: None,
+        calibration_report_id: None,
+        fresh_profiler_traces: None,
+        external_timing_validated: None,
+        holdout_spearman: None,
+        mean_abs_pct_error: None,
+        evidence_source: None,
+        source_report_dir: None,
+        evidence_id: None,
+        generated_at: None,
+    })?;
     let wind = run_wind_tunnel(WindTunnelOptions {
-        spec: options.spec,
-        trace: options.trace,
+        spec: options.spec.clone(),
+        trace: options.trace.clone(),
         output: Some(wind_tunnel_path.clone()),
+    })?;
+    let trace_dir = options
+        .trace_dir
+        .clone()
+        .or_else(|| {
+            options
+                .trace
+                .as_ref()
+                .and_then(|trace| trace.parent().map(Path::to_path_buf))
+        })
+        .unwrap_or_else(|| options.output_dir.join("trace_corpus_empty"));
+    fs::create_dir_all(&trace_dir)?;
+    let _corpus = run_wind_tunnel_corpus(WindTunnelCorpusOptions {
+        spec: options.spec.clone(),
+        trace_dir: trace_dir.clone(),
+        output: Some(trace_corpus_path.clone()),
+    })?;
+    let calibration = run_wind_tunnel_calibrate(WindTunnelCalibrationOptions {
+        spec: options.spec.clone(),
+        trace_dir: None,
+        corpus: Some(trace_corpus_path.clone()),
+        output: Some(calibration_model_path.clone()),
+    })?;
+    let scenario = run_wind_tunnel_scenario(WindTunnelScenarioOptions {
+        spec: options.spec.clone(),
+        calibration: Some(calibration_model_path.clone()),
+        trace: options.trace.clone(),
+        active_recurrent_replay_cut_ms: 10.0,
+        bank_update_cut_ms: 0.0,
+        graph_overhead_cut_ms: 0.0,
+        target_step_ms: 120.0,
+        output: Some(scenario_report_path.clone()),
     })?;
     let lite = run_lite(LiteRunOptions {
         config: options.lite_config.clone(),
         output: lite_output_dir.clone(),
+    })?;
+    let lite_benchmark = run_lite_benchmark(LiteBenchmarkOptions {
+        config: options.lite_config.clone(),
+        output_dir: lite_benchmark_output_dir.clone(),
+        repeats: 3,
     })?;
     let lite_suite = if let Some(config_dir) = options.lite_config_dir.clone() {
         run_lite_suite(LiteSuiteOptions {
@@ -1029,6 +1553,13 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
             vec![options.lite_config.clone()],
         )?
     };
+    let wind_tunnel_reviewer = run_wind_tunnel_report(WindTunnelReviewerOptions {
+        spec: options.spec.clone(),
+        trace_dir: trace_dir.clone(),
+        output_dir: wind_tunnel_reviewer_output_dir.clone(),
+        target_step_ms: 120.0,
+        active_recurrent_replay_cut_ms: 10.0,
+    })?;
     let backend_cpu = run_backend_check(BackendCheckOptions {
         backend: LiteBackendKind::CpuReference,
         output: Some(backend_cpu_check_path.clone()),
@@ -1044,10 +1575,11 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
         && dist.status == "pass"
         && artifact.status == "pass"
         && lite.status == "pass"
+        && lite_benchmark.status == "pass"
         && lite_suite.status == "pass"
         && backend_cpu.status == "pass"
         && backend_metal.kernel_source_present
-        && !backend_metal.executable_backend_available
+        && backend_metal.kernel_contract_ok
         && wind.train_step_ms_estimate.is_finite();
     let status = if pass { "pass" } else { "fail" }.to_string();
     let report = ProofBundleReport {
@@ -1058,9 +1590,15 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
         verify_path: verify_path.display().to_string(),
         dist_sim_path: dist_sim_path.display().to_string(),
         artifact_lab_path: artifact_lab_path.display().to_string(),
+        modelgolf_path: modelgolf_path.display().to_string(),
         wind_tunnel_path: wind_tunnel_path.display().to_string(),
+        trace_corpus_path: trace_corpus_path.display().to_string(),
+        calibration_model_path: calibration_model_path.display().to_string(),
+        scenario_report_path: scenario_report_path.display().to_string(),
         lite_report_path: lite_report_path.display().to_string(),
+        lite_benchmark_summary_path: lite_benchmark_summary_path.display().to_string(),
         lite_suite_summary_path: lite_suite_summary_path.display().to_string(),
+        wind_tunnel_reviewer_report_path: wind_tunnel_reviewer_report_path.display().to_string(),
         backend_cpu_check_path: backend_cpu_check_path.display().to_string(),
         backend_metal_check_path: backend_metal_check_path.display().to_string(),
         proposal_feature_path: proposal_feature_path.display().to_string(),
@@ -1073,9 +1611,14 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
         &verify,
         &dist,
         &artifact,
+        &modelgolf,
         &wind,
+        &calibration,
+        &scenario,
         &lite,
+        &lite_benchmark,
         &lite_suite,
+        &wind_tunnel_reviewer,
         &backend_cpu,
         &backend_metal,
         &proposal_features,
@@ -1085,15 +1628,21 @@ pub fn run_proof_bundle(options: ProofBundleOptions) -> PgResult<ProofBundleRepo
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evidence_manifest_for_proof_bundle(
     output_dir: &Path,
     report: &ProofBundleReport,
     verify: &VerifyReport,
     dist: &DistSimReport,
     artifact: &ArtifactLabReport,
+    modelgolf: &ModelGolfReport,
     wind: &WindTunnelReport,
+    calibration: &WindTunnelCalibrationReport,
+    scenario: &WindTunnelScenarioReport,
     lite: &LiteRunReport,
+    lite_benchmark: &LiteBenchmarkReport,
     lite_suite: &LiteSuiteReport,
+    wind_tunnel_reviewer: &WindTunnelReviewerReport,
     backend_cpu: &BackendCheckReport,
     backend_metal: &BackendCheckReport,
     proposal_features: &ProposalFeatureReport,
@@ -1119,8 +1668,12 @@ fn evidence_manifest_for_proof_bundle(
         blocking_reasons.push("supplied artifact exceeds configured byte budget".to_string());
     }
     if !backend_metal.executable_backend_available {
-        blocking_reasons
-            .push("PG-Lite Metal backend is source-only and not executable yet".to_string());
+        blocking_reasons.push(format!(
+            "PG-Lite Metal backend is not executable in this local proof build; feature_enabled={}, runtime_linked={}, notes: {}",
+            backend_metal.cargo_feature_enabled,
+            backend_metal.rust_runtime_linked,
+            backend_metal.notes.join("; ")
+        ));
     }
 
     EvidenceManifestReport {
@@ -1150,6 +1703,12 @@ fn evidence_manifest_for_proof_bundle(
                 decisive_for_local_bundle: true,
             },
             EvidenceComponentStatus {
+                name: "modelgolf".to_string(),
+                status: modelgolf.status.clone(),
+                path: report.modelgolf_path.clone(),
+                decisive_for_local_bundle: false,
+            },
+            EvidenceComponentStatus {
                 name: "wind_tunnel".to_string(),
                 status: if wind.train_step_ms_estimate.is_finite() {
                     "pass"
@@ -1161,9 +1720,33 @@ fn evidence_manifest_for_proof_bundle(
                 decisive_for_local_bundle: true,
             },
             EvidenceComponentStatus {
+                name: "wind_tunnel_calibration".to_string(),
+                status: calibration.status.clone(),
+                path: report.calibration_model_path.clone(),
+                decisive_for_local_bundle: false,
+            },
+            EvidenceComponentStatus {
+                name: "wind_tunnel_scenario".to_string(),
+                status: scenario.status.clone(),
+                path: report.scenario_report_path.clone(),
+                decisive_for_local_bundle: false,
+            },
+            EvidenceComponentStatus {
+                name: "wind_tunnel_reviewer".to_string(),
+                status: wind_tunnel_reviewer.status.clone(),
+                path: report.wind_tunnel_reviewer_report_path.clone(),
+                decisive_for_local_bundle: false,
+            },
+            EvidenceComponentStatus {
                 name: "pg_lite".to_string(),
                 status: lite.status.clone(),
                 path: report.lite_report_path.clone(),
+                decisive_for_local_bundle: true,
+            },
+            EvidenceComponentStatus {
+                name: "pg_lite_benchmark".to_string(),
+                status: lite_benchmark.status.clone(),
+                path: report.lite_benchmark_summary_path.clone(),
                 decisive_for_local_bundle: true,
             },
             EvidenceComponentStatus {
@@ -1180,10 +1763,12 @@ fn evidence_manifest_for_proof_bundle(
             },
             EvidenceComponentStatus {
                 name: "backend_metal_apple".to_string(),
-                status: if backend_metal.kernel_source_present
-                    && !backend_metal.executable_backend_available
-                {
-                    "source_only_expected".to_string()
+                status: if backend_metal.executable_backend_available {
+                    "runtime_available".to_string()
+                } else if backend_metal.rust_runtime_linked {
+                    "runtime_linked_not_executable".to_string()
+                } else if backend_metal.kernel_source_present && backend_metal.kernel_contract_ok {
+                    "source_contract_feature_gated".to_string()
                 } else {
                     backend_metal.status.clone()
                 },
@@ -1195,8 +1780,30 @@ fn evidence_manifest_for_proof_bundle(
             evidence_file(&report.verify_path, "verify_report", true),
             evidence_file(&report.dist_sim_path, "distributed_sim_report", true),
             evidence_file(&report.artifact_lab_path, "artifact_lab_report", true),
+            evidence_file(&report.modelgolf_path, "modelgolf_planner_report", true),
             evidence_file(&report.wind_tunnel_path, "wind_tunnel_report", true),
+            evidence_file(&report.trace_corpus_path, "wind_tunnel_trace_corpus", true),
+            evidence_file(
+                &report.calibration_model_path,
+                "wind_tunnel_calibration_model",
+                true,
+            ),
+            evidence_file(
+                &report.scenario_report_path,
+                "wind_tunnel_scenario_report",
+                true,
+            ),
+            evidence_file(
+                &report.wind_tunnel_reviewer_report_path,
+                "wind_tunnel_reviewer_report",
+                true,
+            ),
             evidence_file(&report.lite_report_path, "pg_lite_run_report", true),
+            evidence_file(
+                &report.lite_benchmark_summary_path,
+                "pg_lite_backend_benchmark",
+                true,
+            ),
             evidence_file(
                 &output_dir.join("pg_lite/model.pglite.bin").display().to_string(),
                 "pg_lite_model_artifact",
@@ -1265,19 +1872,49 @@ fn evidence_manifest_for_proof_bundle(
                 evidence_path: Some(report.artifact_lab_path.clone()),
             },
             EvidenceClaimReport {
+                name: "modelgolf_constraint_compiler".to_string(),
+                status: modelgolf.status.clone(),
+                evidence_path: Some(report.modelgolf_path.clone()),
+            },
+            EvidenceClaimReport {
                 name: "pg_lite_cpu_reference".to_string(),
                 status: lite_suite.status.clone(),
                 evidence_path: Some(report.lite_suite_summary_path.clone()),
             },
             EvidenceClaimReport {
                 name: "pg_lite_metal_backend".to_string(),
-                status: proposal_features.pg_lite_metal_backend.clone(),
-                evidence_path: Some(report.backend_metal_check_path.clone()),
+                status: if backend_metal.executable_backend_available {
+                    "local_validated"
+                } else {
+                    proposal_features.pg_lite_metal_backend.as_str()
+                }
+                .to_string(),
+                evidence_path: Some(report.lite_benchmark_summary_path.clone()),
             },
             EvidenceClaimReport {
                 name: "wind_tunnel_estimate".to_string(),
                 status: "estimate_only".to_string(),
                 evidence_path: Some(report.wind_tunnel_path.clone()),
+            },
+            EvidenceClaimReport {
+                name: "wind_tunnel_reviewer_packet".to_string(),
+                status: wind_tunnel_reviewer.status.clone(),
+                evidence_path: Some(report.wind_tunnel_reviewer_report_path.clone()),
+            },
+            EvidenceClaimReport {
+                name: "wind_tunnel_trace_corpus".to_string(),
+                status: calibration.status.clone(),
+                evidence_path: Some(report.trace_corpus_path.clone()),
+            },
+            EvidenceClaimReport {
+                name: "wind_tunnel_next_cut_scenario".to_string(),
+                status: if scenario.clears_target {
+                    "scenario_clears_target_estimate_only"
+                } else {
+                    "scenario_misses_target_estimate_only"
+                }
+                .to_string(),
+                evidence_path: Some(report.scenario_report_path.clone()),
             },
         ],
         requires_remote_validation: vec![
@@ -1325,7 +1962,7 @@ fn evidence_manifest_for_proof_bundle(
                 .to_string(),
             "PG-Lite BPB and artifact-lab mini-BPB are local proxy scores, not FineWeb validation BPB."
                 .to_string(),
-            "Metal backend source presence is not executable Metal acceleration.".to_string(),
+            "A PG-Lite Metal claim requires backend-check to report executable_backend_available=true; CPU fallback remains a contract smoke only.".to_string(),
         ],
     }
 }
@@ -1613,43 +2250,59 @@ pub fn run_artifact_lab(options: ArtifactLabOptions) -> PgResult<ArtifactLabRepo
 pub fn run_backend_check(options: BackendCheckOptions) -> PgResult<BackendCheckReport> {
     let host_os = std::env::consts::OS.to_string();
     let mut notes = Vec::new();
-    let expected_kernel_symbols = match options.backend {
-        LiteBackendKind::MetalApple => pg_lite_metal_expected_symbols(),
+    let kernel_contracts = match options.backend {
+        LiteBackendKind::MetalApple => pg_lite_metal_kernel_contracts(),
         LiteBackendKind::CpuReference | LiteBackendKind::MlxPrototype => Vec::new(),
     };
-    let (kernel_source_path, kernel_source_present, metal_compiler_path, metal_compiler_available) =
-        match options.backend {
-            LiteBackendKind::CpuReference => {
-                notes.push("CPU reference backend is always available in pg-local.".to_string());
-                (None, false, None, false)
+    let expected_kernel_symbols = kernel_contracts
+        .iter()
+        .map(|contract| contract.symbol.clone())
+        .collect::<Vec<_>>();
+    let (
+        kernel_source_path,
+        kernel_source_present,
+        metal_compiler_path,
+        metal_compiler_available,
+        metal_compiler_error,
+    ) = match options.backend {
+        LiteBackendKind::CpuReference => {
+            notes.push("CPU reference backend is always available in pg-local.".to_string());
+            (None, false, None, false, None)
+        }
+        LiteBackendKind::MetalApple => {
+            let path = pg_lite_metal_kernel_path();
+            let source_present = path.exists();
+            if !source_present {
+                notes.push("PG-Lite Metal kernel source is missing.".to_string());
             }
-            LiteBackendKind::MetalApple => {
-                let path = pg_lite_metal_kernel_path();
-                let source_present = path.exists();
-                if !source_present {
-                    notes.push("PG-Lite Metal kernel source is missing.".to_string());
-                }
-                let compiler = find_metal_compiler();
-                if compiler.is_none() {
+            let compiler = find_metal_compiler();
+            if compiler.path.is_none() {
+                if let Some(error) = compiler.error.as_deref() {
+                    notes.push(format!(
+                        "Apple Metal compiler probe failed via `xcrun --find metal`: {error}"
+                    ));
+                } else {
                     notes.push(
                         "Apple Metal compiler was not found via `xcrun --find metal`.".to_string(),
                     );
                 }
-                (
-                    Some(path.display().to_string()),
-                    source_present,
-                    compiler.clone(),
-                    compiler.is_some(),
-                )
             }
-            LiteBackendKind::MlxPrototype => {
-                notes.push(
-                    "MLX prototype interop is intentionally not linked into the Rust pg-local CLI."
-                        .to_string(),
-                );
-                (None, false, None, false)
-            }
-        };
+            (
+                Some(path.display().to_string()),
+                source_present,
+                compiler.path.clone(),
+                compiler.path.is_some(),
+                compiler.error.clone(),
+            )
+        }
+        LiteBackendKind::MlxPrototype => {
+            notes.push(
+                "MLX prototype interop is intentionally not linked into the Rust pg-local CLI."
+                    .to_string(),
+            );
+            (None, false, None, false, None)
+        }
+    };
     let (kernel_source_crc32, kernel_symbols_found) =
         if options.backend == LiteBackendKind::MetalApple {
             match kernel_source_path.as_deref() {
@@ -1714,17 +2367,34 @@ pub fn run_backend_check(options: BackendCheckOptions) -> PgResult<BackendCheckR
     };
     let rust_runtime_linked = match options.backend {
         LiteBackendKind::CpuReference => true,
-        LiteBackendKind::MetalApple | LiteBackendKind::MlxPrototype => false,
+        LiteBackendKind::MetalApple => cfg!(feature = "metal_apple"),
+        LiteBackendKind::MlxPrototype => false,
     };
-    if options.backend == LiteBackendKind::MetalApple && cargo_feature_enabled {
-        notes.push(
-            "`metal_apple` Cargo feature is enabled, but the Rust Metal runtime is not linked yet."
-                .to_string(),
-        );
+    let mut metal_runtime_ok = false;
+    if options.backend == LiteBackendKind::MetalApple {
+        if !cargo_feature_enabled {
+            notes.push(
+                "`metal_apple` Cargo feature is disabled; runtime execution is unavailable."
+                    .to_string(),
+            );
+        } else {
+            match metal_lite_runtime_probe() {
+                Ok(message) => {
+                    metal_runtime_ok = true;
+                    notes.push(format!(
+                        "PG-Lite Rust Metal runtime probe passed: {message}"
+                    ));
+                }
+                Err(err) => {
+                    notes.push(format!("PG-Lite Rust Metal runtime probe failed: {err}"));
+                }
+            }
+        }
     }
     let executable_backend_available = match options.backend {
         LiteBackendKind::CpuReference => true,
-        LiteBackendKind::MetalApple | LiteBackendKind::MlxPrototype => false,
+        LiteBackendKind::MetalApple => metal_runtime_ok,
+        LiteBackendKind::MlxPrototype => false,
     };
     let status = if executable_backend_available {
         "pass"
@@ -1742,9 +2412,11 @@ pub fn run_backend_check(options: BackendCheckOptions) -> PgResult<BackendCheckR
         kernel_source_crc32,
         expected_kernel_symbols,
         kernel_symbols_found,
+        kernel_contracts,
         kernel_contract_ok,
         metal_compiler_path,
         metal_compiler_available,
+        metal_compiler_error,
         metal_compile_smoke_attempted,
         metal_compile_smoke_ok,
         metal_compile_stderr,
@@ -1918,9 +2590,12 @@ pub fn run_wind_tunnel(options: WindTunnelOptions) -> PgResult<WindTunnelReport>
 }
 
 pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
+    let total_start = Instant::now();
+    let config_start = Instant::now();
     let body = fs::read_to_string(&options.config)?;
     let spec: LiteSpec = toml::from_str(&body)
         .map_err(|err| PgError::DataFormat(format!("invalid PG-Lite TOML: {err}")))?;
+    let config_load_wall_seconds = config_start.elapsed().as_secs_f64();
     let config_fingerprint = spec.config_fingerprint()?;
     if spec.score != "bpb" {
         return Err(PgError::InvalidOp(format!(
@@ -1928,9 +2603,13 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
             spec.score
         )));
     }
+    let backend_start = Instant::now();
     let backend = select_lite_backend(&spec)?;
+    let backend_select_wall_seconds = backend_start.elapsed().as_secs_f64();
+    let data_start = Instant::now();
     let train = fs::read(&spec.data.train_path)?;
     let val = fs::read(&spec.data.val_path)?;
+    let data_load_wall_seconds = data_start.elapsed().as_secs_f64();
     if val.is_empty() {
         return Err(PgError::DataFormat(
             "PG-Lite validation data is empty".into(),
@@ -1939,7 +2618,14 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
 
     validate_lite_spec(&spec)?;
     let train_start = Instant::now();
-    let model = if spec.track == LiteTrack::ArtifactGolf {
+    let mut metal_eval: Option<LiteEvalStats> = None;
+    let model = if backend.execution_backend == LiteBackendKind::MetalApple
+        && spec.track == LiteTrack::ByteGolf
+    {
+        let metal = run_metal_lite_train_eval(&train, &val, &spec)?;
+        metal_eval = Some(metal.eval);
+        metal.model
+    } else if spec.track == LiteTrack::ArtifactGolf {
         if let Some(path) = spec.model.artifact_path.as_deref() {
             let stored = load_lite_stored_artifact(Path::new(path))?;
             LiteNgramResidual::from_stored_artifact(&stored)?
@@ -1956,9 +2642,20 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
         measured_train_wall
     };
     let eval_start = Instant::now();
-    let eval = match spec.track {
-        LiteTrack::ByteGolf | LiteTrack::ArtifactGolf => model.loss_on_bytes(&val, false),
-        LiteTrack::StreamGolf => model.loss_on_bytes_score_first(&val),
+    let eval = if let Some(eval) = metal_eval {
+        eval
+    } else if backend.execution_backend == LiteBackendKind::MetalApple {
+        match spec.track {
+            LiteTrack::ByteGolf | LiteTrack::ArtifactGolf => {
+                run_metal_lite_fixed_eval(&model, &val)?
+            }
+            LiteTrack::StreamGolf => run_metal_lite_score_first_eval(&model, &val)?,
+        }
+    } else {
+        match spec.track {
+            LiteTrack::ByteGolf | LiteTrack::ArtifactGolf => model.loss_on_bytes(&val, false),
+            LiteTrack::StreamGolf => model.loss_on_bytes_score_first(&val),
+        }
     };
     let eval_wall = eval_start.elapsed().as_secs_f64();
     let avg_loss = if eval.tokens == 0 {
@@ -1986,10 +2683,14 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
     let model_artifact_path = options.output.join("model.pglite.bin");
     let model_artifact_json_path = options.output.join("model.pglite.json");
     let stored_artifact = model.to_stored_artifact(config_fingerprint.clone());
+    let artifact_json_start = Instant::now();
     let artifact_debug_json_bytes =
         write_lite_stored_artifact_json(&model_artifact_json_path, &stored_artifact)?;
+    let artifact_json_write_wall_seconds = artifact_json_start.elapsed().as_secs_f64();
+    let artifact_binary_start = Instant::now();
     let artifact_actual_bytes =
         write_lite_stored_artifact_binary(&model_artifact_path, &stored_artifact)?;
+    let artifact_binary_write_wall_seconds = artifact_binary_start.elapsed().as_secs_f64();
     let artifact_budget_ok = artifact_actual_bytes <= spec.artifact_budget_bytes;
     let memory_budget_pass = memory_budget_ok.unwrap_or(true);
     let status = if bpb.is_finite()
@@ -2010,6 +2711,18 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
     };
     let track_behavior = spec.track_behavior();
     let score_scope = "local_proxy_bpb_not_leaderboard";
+    let timing = LiteTimingReport {
+        config_load_wall_seconds,
+        backend_select_wall_seconds,
+        data_load_wall_seconds,
+        train_wall_seconds: train_wall,
+        eval_wall_seconds: eval_wall,
+        artifact_json_write_wall_seconds,
+        artifact_binary_write_wall_seconds,
+        manifest_write_wall_seconds: 0.0,
+        total_wall_seconds_excluding_report_write: 0.0,
+        report_write_excluded: true,
+    };
     let manifest = LiteArtifactManifest {
         kind: "pg_lite_artifact_manifest",
         config_fingerprint: config_fingerprint.clone(),
@@ -2061,7 +2774,12 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
         ],
     };
     let _ = artifact_debug_json_bytes;
+    let manifest_start = Instant::now();
     write_json_pretty(&artifact_manifest_path, &manifest)?;
+    let manifest_write_wall_seconds = manifest_start.elapsed().as_secs_f64();
+    let mut timing = timing;
+    timing.manifest_write_wall_seconds = manifest_write_wall_seconds;
+    timing.total_wall_seconds_excluding_report_write = total_start.elapsed().as_secs_f64();
     let report = LiteRunReport {
         kind: "pg_lite_run",
         config_path: options.config.display().to_string(),
@@ -2081,6 +2799,7 @@ pub fn run_lite(options: LiteRunOptions) -> PgResult<LiteRunReport> {
         eval_time_seconds_budget: spec.eval_time_seconds,
         train_wall_seconds: train_wall,
         eval_wall_seconds: eval_wall,
+        timing,
         artifact_budget_bytes: spec.artifact_budget_bytes,
         artifact_bytes_estimate,
         artifact_actual_bytes,
@@ -2114,6 +2833,187 @@ pub fn run_lite_suite(options: LiteSuiteOptions) -> PgResult<LiteSuiteReport> {
         options.output_dir,
         configs,
     )
+}
+
+pub fn run_lite_benchmark(options: LiteBenchmarkOptions) -> PgResult<LiteBenchmarkReport> {
+    let repeats = options.repeats.max(1);
+    fs::create_dir_all(&options.output_dir)?;
+    let base_spec = load_lite_spec(&options.config)?;
+    validate_lite_spec(&base_spec)?;
+    let mut backends = Vec::new();
+    for backend in [LiteBackendKind::CpuReference, LiteBackendKind::MetalApple] {
+        backends.push(run_lite_benchmark_backend(
+            &options.config,
+            &base_spec,
+            &options.output_dir,
+            backend,
+            repeats,
+        )?);
+    }
+    let cpu = backends
+        .iter()
+        .find(|backend| backend.requested_backend == LiteBackendKind::CpuReference);
+    let metal = backends
+        .iter()
+        .find(|backend| backend.requested_backend == LiteBackendKind::MetalApple);
+    let cpu_vs_metal_speedup_total = cpu
+        .and_then(|cpu| cpu.median_total_wall_seconds)
+        .zip(metal.and_then(|metal| metal.median_total_wall_seconds))
+        .and_then(|(cpu, metal)| (metal > 0.0).then_some(cpu / metal));
+    let cpu_vs_metal_speedup_train = cpu
+        .and_then(|cpu| cpu.median_train_wall_seconds)
+        .zip(metal.and_then(|metal| metal.median_train_wall_seconds))
+        .and_then(|(cpu, metal)| (metal > 0.0).then_some(cpu / metal));
+    let cpu_vs_metal_bpb_delta = cpu
+        .and_then(|cpu| cpu.median_validation_bpb)
+        .zip(metal.and_then(|metal| metal.median_validation_bpb))
+        .map(|(cpu, metal)| metal - cpu);
+    let best_total_wall_backend = backends
+        .iter()
+        .filter_map(|backend| {
+            backend
+                .median_total_wall_seconds
+                .map(|seconds| (backend.requested_backend, seconds))
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(backend, _)| backend);
+    let best_bpb_backend = backends
+        .iter()
+        .filter_map(|backend| {
+            backend
+                .median_validation_bpb
+                .map(|bpb| (backend.requested_backend, bpb))
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(backend, _)| backend);
+    let summary_json_path = options.output_dir.join("summary.json");
+    let summary_markdown_path = options.output_dir.join("summary.md");
+    let status = if backends.iter().any(|backend| {
+        backend.requested_backend == LiteBackendKind::CpuReference && !backend.runs.is_empty()
+    }) {
+        "pass"
+    } else {
+        "fail"
+    }
+    .to_string();
+    let report = LiteBenchmarkReport {
+        kind: "pg_lite_benchmark",
+        config_path: options.config.display().to_string(),
+        output_dir: options.output_dir.display().to_string(),
+        repeats,
+        backends,
+        cpu_vs_metal_speedup_total,
+        cpu_vs_metal_speedup_train,
+        cpu_vs_metal_bpb_delta,
+        best_total_wall_backend,
+        best_bpb_backend,
+        summary_json_path: summary_json_path.display().to_string(),
+        summary_markdown_path: summary_markdown_path.display().to_string(),
+        status,
+    };
+    write_json_pretty(&summary_json_path, &report)?;
+    fs::write(&summary_markdown_path, lite_benchmark_markdown(&report))?;
+    Ok(report)
+}
+
+fn run_lite_benchmark_backend(
+    config_path: &Path,
+    base_spec: &LiteSpec,
+    output_dir: &Path,
+    backend: LiteBackendKind,
+    repeats: usize,
+) -> PgResult<LiteBenchmarkBackendReport> {
+    let backend_dir = output_dir.join(lite_backend_label(backend));
+    fs::create_dir_all(&backend_dir)?;
+    let mut spec = base_spec.clone();
+    spec.backend.kind = backend;
+    spec.backend.allow_cpu_fallback = false;
+    let config_copy = backend_dir.join("config.toml");
+    fs::write(
+        &config_copy,
+        toml::to_string_pretty(&spec).map_err(|err| {
+            PgError::DataFormat(format!("PG-Lite benchmark TOML encode failed: {err}"))
+        })?,
+    )?;
+    let mut runs = Vec::new();
+    let mut first_error = None;
+    for run_index in 0..repeats {
+        let run_output = backend_dir.join(format!("run_{run_index:03}"));
+        match run_lite(LiteRunOptions {
+            config: config_copy.clone(),
+            output: run_output.clone(),
+        }) {
+            Ok(report) => runs.push(LiteBenchmarkRunReport {
+                run_index,
+                output_dir: run_output.display().to_string(),
+                report_path: run_output.join("report.json").display().to_string(),
+                status: report.status,
+                execution_backend: report.execution_backend,
+                backend_accelerated: report.backend_accelerated,
+                validation_bpb: report.validation_bpb,
+                total_wall_seconds: report.timing.total_wall_seconds_excluding_report_write,
+                train_wall_seconds: report.train_wall_seconds,
+                eval_wall_seconds: report.eval_wall_seconds,
+                artifact_actual_bytes: report.artifact_actual_bytes,
+            }),
+            Err(err) => {
+                first_error = Some(format!("{err}"));
+                break;
+            }
+        }
+    }
+    let total = runs
+        .iter()
+        .map(|run| run.total_wall_seconds)
+        .collect::<Vec<_>>();
+    let train = runs
+        .iter()
+        .map(|run| run.train_wall_seconds)
+        .collect::<Vec<_>>();
+    let eval = runs
+        .iter()
+        .map(|run| run.eval_wall_seconds)
+        .collect::<Vec<_>>();
+    let bpb = runs
+        .iter()
+        .map(|run| run.validation_bpb)
+        .collect::<Vec<_>>();
+    let mut execution_backends = runs
+        .iter()
+        .map(|run| run.execution_backend)
+        .collect::<Vec<_>>();
+    execution_backends.sort_by_key(|backend| lite_backend_label(*backend));
+    execution_backends.dedup();
+    let accelerated_run_count = runs.iter().filter(|run| run.backend_accelerated).count();
+    let artifact_actual_bytes = runs.first().map(|run| run.artifact_actual_bytes);
+    let status = if first_error.is_none() && runs.len() == repeats {
+        "pass"
+    } else if runs.is_empty() {
+        "unavailable"
+    } else {
+        "partial"
+    }
+    .to_string();
+    Ok(LiteBenchmarkBackendReport {
+        requested_backend: backend,
+        status,
+        error: first_error.map(|err| {
+            format!(
+                "{} benchmark failed for {}: {err}",
+                config_path.display(),
+                lite_backend_label(backend)
+            )
+        }),
+        runs,
+        run_count: total.len(),
+        accelerated_run_count,
+        execution_backends,
+        median_total_wall_seconds: median_f64(total),
+        median_train_wall_seconds: median_f64(train),
+        median_eval_wall_seconds: median_f64(eval),
+        median_validation_bpb: median_f64(bpb),
+        artifact_actual_bytes,
+    })
 }
 
 fn run_lite_suite_for_configs(
@@ -2301,6 +3201,164 @@ pub fn run_wind_tunnel_suite(options: WindTunnelSuiteOptions) -> PgResult<WindTu
     };
     write_json_pretty(&summary_json_path, &report)?;
     fs::write(&summary_markdown_path, wind_tunnel_suite_markdown(&report))?;
+    Ok(report)
+}
+
+pub fn run_wind_tunnel_report(
+    options: WindTunnelReviewerOptions,
+) -> PgResult<WindTunnelReviewerReport> {
+    fs::create_dir_all(&options.output_dir)?;
+
+    let trace_index_path = options.output_dir.join("trace_index.json");
+    let corpus_path = options.output_dir.join("trace_corpus.json");
+    let calibration_path = options.output_dir.join("calibration_model.json");
+    let scenario_path = options
+        .output_dir
+        .join("scenario_exact_recurrent_replay.json");
+    let suite_dir = options.output_dir.join("suite");
+    let report_json_path = options.output_dir.join("report.json");
+    let report_markdown_path = options.output_dir.join("report.md");
+
+    let index_scratch = scratch_report_path("pg_local_report_trace_index");
+    let corpus_scratch = scratch_report_path("pg_local_report_trace_corpus");
+    let calibration_scratch = scratch_report_path("pg_local_report_calibration");
+    let scenario_scratch = scratch_report_path("pg_local_report_scenario");
+
+    let index = run_trace_index(TraceIndexOptions {
+        spec: options.spec.clone(),
+        trace_dir: options.trace_dir.clone(),
+        output: Some(index_scratch.clone()),
+    })?;
+    let corpus = run_wind_tunnel_corpus(WindTunnelCorpusOptions {
+        spec: options.spec.clone(),
+        trace_dir: options.trace_dir.clone(),
+        output: Some(corpus_scratch.clone()),
+    })?;
+    let calibration = run_wind_tunnel_calibrate(WindTunnelCalibrationOptions {
+        spec: options.spec.clone(),
+        trace_dir: None,
+        corpus: Some(corpus_scratch.clone()),
+        output: Some(calibration_scratch.clone()),
+    })?;
+    let scenario = run_wind_tunnel_scenario(WindTunnelScenarioOptions {
+        spec: options.spec.clone(),
+        calibration: Some(calibration_scratch.clone()),
+        trace: None,
+        active_recurrent_replay_cut_ms: options.active_recurrent_replay_cut_ms,
+        bank_update_cut_ms: 0.0,
+        graph_overhead_cut_ms: 0.0,
+        target_step_ms: options.target_step_ms,
+        output: Some(scenario_scratch.clone()),
+    })?;
+    let suite = run_wind_tunnel_suite(WindTunnelSuiteOptions {
+        spec: options.spec.clone(),
+        trace_dir: options.trace_dir.clone(),
+        output_dir: suite_dir.clone(),
+    })?;
+
+    let _ = fs::remove_file(index_scratch);
+    let _ = fs::remove_file(corpus_scratch);
+    let _ = fs::remove_file(calibration_scratch);
+    let _ = fs::remove_file(scenario_scratch);
+
+    write_json_pretty(&trace_index_path, &index)?;
+    write_json_pretty(&corpus_path, &corpus)?;
+    write_json_pretty(&calibration_path, &calibration)?;
+    write_json_pretty(&scenario_path, &scenario)?;
+
+    let mut top_stage_metrics = calibration.stage_metrics.clone();
+    top_stage_metrics.sort_by(|a, b| {
+        b.estimate_ms
+            .partial_cmp(&a.estimate_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top_stage_metrics.truncate(8);
+
+    let holdout_validation = wind_tunnel_holdout_report(&corpus);
+    let exact_2135_timed_runs = corpus
+        .runs
+        .iter()
+        .filter(|run| corpus_run_is_exact_2135(run) && run.trace_total_ms.is_some())
+        .count();
+    let mut warnings = calibration.warnings.clone();
+    if holdout_validation.status != "pass" {
+        push_unique(
+            &mut warnings,
+            format!(
+                "holdout validation status is {}; collect more timed traces for a stronger local predictor",
+                holdout_validation.status
+            ),
+        );
+    }
+    if suite.status != "pass" {
+        push_unique(
+            &mut warnings,
+            "Wind Tunnel suite did not find measured step timing; reviewer report is shape-model dominated"
+                .to_string(),
+        );
+    }
+    if exact_2135_timed_runs == 0 {
+        push_unique(
+            &mut warnings,
+            "no timed exact #2135 traces found in the corpus".to_string(),
+        );
+    }
+    if corpus.canonical_caseops_runs == 0 {
+        push_unique(
+            &mut warnings,
+            "no canonical CaseOps trace found; this report cannot prove record data compliance"
+                .to_string(),
+        );
+    }
+
+    let mut recommended_next_experiment = scenario.recommendation.clone();
+    if !calibration.recommended_trace_to_collect.is_empty() {
+        recommended_next_experiment.push_str("; next trace to collect: ");
+        recommended_next_experiment.push_str(&calibration.recommended_trace_to_collect);
+    }
+    let status = if corpus.timed_runs > 0 && calibration.total_step_ms.is_some() {
+        "pass"
+    } else if index.parseable_traces > 0 {
+        "partial"
+    } else {
+        "fail"
+    }
+    .to_string();
+    let report = WindTunnelReviewerReport {
+        kind: "pg_local_wind_tunnel_reviewer_report",
+        spec_path: options.spec.display().to_string(),
+        trace_dir: options.trace_dir.display().to_string(),
+        output_dir: options.output_dir.display().to_string(),
+        report_json_path: report_json_path.display().to_string(),
+        report_markdown_path: report_markdown_path.display().to_string(),
+        trace_index_path: trace_index_path.display().to_string(),
+        corpus_path: corpus_path.display().to_string(),
+        calibration_path: calibration_path.display().to_string(),
+        scenario_path: scenario_path.display().to_string(),
+        suite_summary_path: suite.summary_json_path.clone(),
+        traces_found: index.traces_found,
+        parseable_traces: index.parseable_traces,
+        deduped_runs: corpus.deduped_runs,
+        timed_runs: corpus.timed_runs,
+        exact_2135_timed_runs,
+        stage_calibration_runs: corpus.stage_calibration_runs,
+        canonical_caseops_runs: corpus.canonical_caseops_runs,
+        best_exact_2135_ms: corpus.best_exact_2135_ms,
+        best_active_recurrent_ms: corpus.best_active_recurrent_ms,
+        calibration_confidence_summary: calibration.confidence_summary.clone(),
+        holdout_validation,
+        scenario_clears_target: scenario.clears_target,
+        scenario_predicted_step_ms: scenario.predicted_step_ms,
+        recommended_next_experiment,
+        top_stage_metrics,
+        warnings,
+        status,
+    };
+    write_json_pretty(&report_json_path, &report)?;
+    fs::write(
+        &report_markdown_path,
+        wind_tunnel_reviewer_markdown(&report, &index, &corpus, &calibration, &scenario, &suite),
+    )?;
     Ok(report)
 }
 
@@ -2587,19 +3645,771 @@ pub fn run_trace_index(options: TraceIndexOptions) -> PgResult<TraceIndexReport>
     Ok(report)
 }
 
+pub fn run_wind_tunnel_corpus(
+    options: WindTunnelCorpusOptions,
+) -> PgResult<WindTunnelCorpusReport> {
+    let index_scratch = std::env::temp_dir().join(format!(
+        "pg_local_trace_index_{}_{}.json",
+        std::process::id(),
+        monotonic_nanos()
+    ));
+    let index = run_trace_index(TraceIndexOptions {
+        spec: options.spec.clone(),
+        trace_dir: options.trace_dir.clone(),
+        output: Some(index_scratch.clone()),
+    })?;
+    let _ = fs::remove_file(index_scratch);
+    let mut groups: BTreeMap<String, Vec<TraceIndexEntry>> = BTreeMap::new();
+    for entry in index.entries.into_iter().filter(|entry| entry.parsed_trace) {
+        groups
+            .entry(trace_entry_run_key(&entry))
+            .or_default()
+            .push(entry);
+    }
+    let mut runs = Vec::with_capacity(groups.len());
+    for (run_key, mut entries) in groups {
+        entries.sort_by_key(|entry| std::cmp::Reverse(trace_entry_selection_score(entry)));
+        let selected = entries
+            .first()
+            .cloned()
+            .expect("trace corpus group must contain at least one entry");
+        let mut source_paths = entries
+            .iter()
+            .map(|entry| entry.trace_path.clone())
+            .collect::<Vec<_>>();
+        source_paths.sort();
+        source_paths.dedup();
+        runs.push(WindTunnelCorpusRun {
+            run_key,
+            selected_trace_path: selected.trace_path.clone(),
+            source_paths,
+            selection_score: trace_entry_selection_score(&selected),
+            selection_reason: trace_entry_selection_reason(&selected),
+            calibration_role: selected.calibration_role,
+            signal_quality: selected.signal_quality,
+            trace_total_ms: selected.trace_total_ms,
+            active_recurrent_ms_per_step: selected.active_recurrent_ms_per_step,
+            inactive_recurrent_ms_per_step: selected.inactive_recurrent_ms_per_step,
+            active_recurrent_steps: selected.active_recurrent_steps,
+            timing_steps: selected.timing_steps,
+            steps_completed: selected.steps_completed,
+            run_name: selected.run_name,
+            mode: selected.mode,
+            record_profile: selected.record_profile,
+            recurrent_backward_profile: selected.recurrent_backward_profile,
+            cuda_graph_profile: selected.cuda_graph_profile,
+            world_size: selected.world_size,
+            seq_len: selected.seq_len,
+            canonical_caseops_dataset: selected.canonical_caseops_dataset,
+            train_shards: selected.train_shards,
+            val_tokens: selected.val_tokens,
+            f32_to_bf16_bridge_launches: selected.f32_to_bf16_bridge_launches,
+            bf16_to_f32_bridge_launches: selected.bf16_to_f32_bridge_launches,
+            host_batch_flatten_calls: selected.host_batch_flatten_calls,
+            host_to_device_batch_bytes: selected.host_to_device_batch_bytes,
+            useful_stage_coverage_ratio: selected.useful_stage_coverage_ratio,
+            traced_stage_ms_ratio: selected.traced_stage_ms_ratio,
+            nonzero_stage_fields: selected.nonzero_stage_fields,
+            zero_stage_fields: selected.zero_stage_fields,
+            tags: selected.tags,
+        });
+    }
+    runs.sort_by(|a, b| {
+        a.selected_trace_path
+            .cmp(&b.selected_trace_path)
+            .then_with(|| a.run_key.cmp(&b.run_key))
+    });
+    let timed_runs = runs
+        .iter()
+        .filter(|run| run.trace_total_ms.is_some())
+        .count();
+    let stage_calibration_runs = runs
+        .iter()
+        .filter(|run| run.calibration_role == "stage_calibration")
+        .count();
+    let partial_stage_calibration_runs = runs
+        .iter()
+        .filter(|run| run.calibration_role == "partial_stage_calibration")
+        .count();
+    let total_calibration_runs = runs
+        .iter()
+        .filter(|run| run.calibration_role == "total_calibration")
+        .count();
+    let exact_2135_runs = runs
+        .iter()
+        .filter(|run| corpus_run_is_exact_2135(run))
+        .count();
+    let canonical_caseops_runs = runs
+        .iter()
+        .filter(|run| run.canonical_caseops_dataset == Some(true))
+        .count();
+    let allst_diagnostic_runs = runs.iter().filter(|run| corpus_run_is_allst(run)).count();
+    let best_exact = runs
+        .iter()
+        .filter(|run| corpus_run_is_exact_2135(run))
+        .filter_map(|run| run.trace_total_ms.map(|ms| (ms, run.run_key.clone())))
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let best_active = runs
+        .iter()
+        .filter_map(|run| {
+            run.active_recurrent_ms_per_step
+                .map(|ms| (ms, run.run_key.clone()))
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let duplicate_source_files = index.parseable_traces.saturating_sub(runs.len());
+    let report = WindTunnelCorpusReport {
+        kind: "pg_local_wind_tunnel_corpus".to_string(),
+        spec_path: options.spec.display().to_string(),
+        trace_dir: options.trace_dir.display().to_string(),
+        traces_found: index.traces_found,
+        parseable_traces: index.parseable_traces,
+        deduped_runs: runs.len(),
+        duplicate_source_files,
+        timed_runs,
+        stage_calibration_runs,
+        partial_stage_calibration_runs,
+        total_calibration_runs,
+        exact_2135_runs,
+        canonical_caseops_runs,
+        allst_diagnostic_runs,
+        best_exact_2135_ms: best_exact.as_ref().map(|(ms, _)| *ms),
+        best_exact_2135_run_key: best_exact.map(|(_, key)| key),
+        best_active_recurrent_ms: best_active.as_ref().map(|(ms, _)| *ms),
+        best_active_recurrent_run_key: best_active.map(|(_, key)| key),
+        runs,
+        status: "pass".to_string(),
+    };
+    write_report_if_requested(&report, options.output.as_deref())?;
+    Ok(report)
+}
+
+pub fn run_wind_tunnel_calibrate(
+    options: WindTunnelCalibrationOptions,
+) -> PgResult<WindTunnelCalibrationReport> {
+    let corpus = if let Some(path) = options.corpus.as_ref() {
+        serde_json::from_str::<WindTunnelCorpusReport>(&fs::read_to_string(path)?)
+            .map_err(|err| PgError::DataFormat(format!("invalid Wind Tunnel corpus JSON: {err}")))?
+    } else if let Some(trace_dir) = options.trace_dir.as_ref() {
+        run_wind_tunnel_corpus(WindTunnelCorpusOptions {
+            spec: options.spec.clone(),
+            trace_dir: trace_dir.clone(),
+            output: None,
+        })?
+    } else {
+        return Err(PgError::InvalidOp(
+            "wind-tunnel calibrate requires --trace-dir or --corpus".into(),
+        ));
+    };
+    let timed = corpus
+        .runs
+        .iter()
+        .filter_map(|run| run.trace_total_ms.map(|ms| (run.run_key.clone(), ms)))
+        .collect::<Vec<_>>();
+    let exact = corpus
+        .runs
+        .iter()
+        .filter(|run| corpus_run_is_exact_2135(run))
+        .filter_map(|run| run.trace_total_ms.map(|ms| (run.run_key.clone(), ms)))
+        .collect::<Vec<_>>();
+    let active = corpus
+        .runs
+        .iter()
+        .filter_map(|run| {
+            run.active_recurrent_ms_per_step
+                .map(|ms| (run.run_key.clone(), ms))
+        })
+        .collect::<Vec<_>>();
+    let inactive = corpus
+        .runs
+        .iter()
+        .filter_map(|run| {
+            run.inactive_recurrent_ms_per_step
+                .map(|ms| (run.run_key.clone(), ms))
+        })
+        .collect::<Vec<_>>();
+    let recurrent_delta = corpus
+        .runs
+        .iter()
+        .filter_map(|run| {
+            run.active_recurrent_ms_per_step
+                .zip(run.inactive_recurrent_ms_per_step)
+                .map(|(active, inactive)| (run.run_key.clone(), active - inactive))
+        })
+        .collect::<Vec<_>>();
+    let stage_metrics = calibrated_stage_metrics(&corpus.runs);
+    let mut warnings = Vec::new();
+    if corpus.stage_calibration_runs < 2 {
+        warnings.push(
+            "fewer than two rich stage-calibration traces; use stage estimates as low-confidence attribution"
+                .to_string(),
+        );
+    }
+    if active.is_empty() || inactive.is_empty() {
+        warnings.push(
+            "active/inactive recurrent split is missing or incomplete in the corpus".to_string(),
+        );
+    }
+    if corpus.canonical_caseops_runs == 0 {
+        warnings.push(
+            "no canonical CaseOps trace was found; use timing calibration separately from record-readiness evidence"
+                .to_string(),
+        );
+    }
+    let total_step_ms = calibrated_metric("total_step_ms", timed);
+    let exact_2135_total_step_ms = calibrated_metric("exact_2135_total_step_ms", exact);
+    let active_recurrent_ms = calibrated_metric("active_recurrent_ms", active);
+    let inactive_recurrent_ms = calibrated_metric("inactive_recurrent_ms", inactive);
+    let recurrent_active_minus_inactive_ms =
+        calibrated_metric("recurrent_active_minus_inactive_ms", recurrent_delta);
+    let confidence_summary = calibration_confidence_summary(
+        exact_2135_total_step_ms.as_ref(),
+        active_recurrent_ms.as_ref(),
+        corpus.stage_calibration_runs,
+    );
+    let recommended_trace_to_collect = if corpus.stage_calibration_runs < 2 {
+        "collect graph-disabled exact #2135 stage timing with active recurrent windows and nonzero qkv/mlp/attention/output/optimizer fields"
+    } else if active_recurrent_ms.is_none() || inactive_recurrent_ms.is_none() {
+        "collect exact #2135 record-shaped proxy with timing_recurrent_active_ms_per_step and timing_recurrent_inactive_ms_per_step"
+    } else {
+        "collect one fresh exact #2135 trace after the next recurrent replay cut to validate the calibration"
+    }
+    .to_string();
+    let status = if total_step_ms.is_some() {
+        "pass"
+    } else {
+        "estimate_only_no_timed_runs"
+    }
+    .to_string();
+    let report = WindTunnelCalibrationReport {
+        kind: "pg_local_wind_tunnel_calibration".to_string(),
+        spec_path: options.spec.display().to_string(),
+        source_kind: if options.corpus.is_some() {
+            "corpus_json".to_string()
+        } else {
+            "trace_dir".to_string()
+        },
+        corpus_path: options
+            .corpus
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        trace_dir: options
+            .trace_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        runs_considered: corpus.runs.len(),
+        timed_runs: corpus.timed_runs,
+        exact_2135_timed_runs: corpus
+            .runs
+            .iter()
+            .filter(|run| corpus_run_is_exact_2135(run) && run.trace_total_ms.is_some())
+            .count(),
+        stage_calibration_runs: corpus.stage_calibration_runs,
+        total_step_ms,
+        exact_2135_total_step_ms,
+        active_recurrent_ms,
+        inactive_recurrent_ms,
+        recurrent_active_minus_inactive_ms,
+        stage_metrics,
+        recommended_trace_to_collect,
+        confidence_summary,
+        warnings,
+        status,
+    };
+    write_report_if_requested(&report, options.output.as_deref())?;
+    Ok(report)
+}
+
+pub fn run_wind_tunnel_scenario(
+    options: WindTunnelScenarioOptions,
+) -> PgResult<WindTunnelScenarioReport> {
+    let spec = RunSpec::load(&options.spec)?;
+    let plan = ExecutionPlan::from_run_spec(&spec)?;
+    let (base_step_ms, base_step_source, active_ms, confidence, source_kind) =
+        if let Some(path) = options.calibration.as_ref() {
+            let calibration =
+                serde_json::from_str::<WindTunnelCalibrationReport>(&fs::read_to_string(path)?)
+                    .map_err(|err| {
+                        PgError::DataFormat(format!("invalid Wind Tunnel calibration JSON: {err}"))
+                    })?;
+            let metric = calibration
+                .exact_2135_total_step_ms
+                .as_ref()
+                .or(calibration.total_step_ms.as_ref());
+            let base = metric
+                .map(|metric| metric.best_ms)
+                .unwrap_or_else(|| default_stage_estimates(&plan).iter().map(|s| s.ms).sum());
+            let source = metric
+                .map(|metric| format!("calibration:{}:best_ms", metric.name))
+                .unwrap_or_else(|| "shape_model_default_no_calibrated_metric".to_string());
+            let active = calibration
+                .active_recurrent_ms
+                .as_ref()
+                .map(|metric| metric.best_ms);
+            let confidence = metric
+                .map(|metric| metric.confidence.clone())
+                .unwrap_or_else(|| "low".to_string());
+            (
+                base,
+                source,
+                active,
+                confidence,
+                "calibration_json".to_string(),
+            )
+        } else {
+            let report = run_wind_tunnel(WindTunnelOptions {
+                spec: options.spec.clone(),
+                trace: options.trace.clone(),
+                output: None,
+            })?;
+            (
+                report.train_step_ms_estimate,
+                report.prediction_source,
+                report.active_recurrent_trace_ms_per_step,
+                report.trace_coverage.signal_quality,
+                if options.trace.is_some() {
+                    "trace_or_shape_model".to_string()
+                } else {
+                    "shape_model".to_string()
+                },
+            )
+        };
+    let active_cut = options.active_recurrent_replay_cut_ms.max(0.0);
+    let bank_cut = options.bank_update_cut_ms.max(0.0);
+    let graph_cut = options.graph_overhead_cut_ms.max(0.0);
+    let total_cut = active_cut + bank_cut + graph_cut;
+    let predicted_step_ms = (base_step_ms - total_cut).max(1.0);
+    let predicted_active_recurrent_ms = active_ms.map(|ms| (ms - active_cut).max(1.0));
+    let expected_train_steps_in_600s = (600_000.0 / predicted_step_ms.max(1.0)).floor() as usize;
+    let expected_train_wall_seconds =
+        spec.train.total_iterations as f64 * predicted_step_ms / 1_000.0;
+    let remaining_gap_ms = (predicted_step_ms - options.target_step_ms).max(0.0);
+    let clears_target = predicted_step_ms <= options.target_step_ms;
+    let mut warnings = Vec::new();
+    if total_cut <= 0.0 {
+        warnings.push("scenario has no positive requested cut".to_string());
+    }
+    if confidence.contains("low")
+        || confidence.contains("total_only")
+        || confidence.contains("shape")
+    {
+        warnings.push("scenario is based on low-confidence or total-only calibration".to_string());
+    }
+    if active_ms.is_none() && active_cut > 0.0 {
+        warnings.push(
+            "active recurrent cut was requested without calibrated active recurrent timing"
+                .to_string(),
+        );
+    }
+    if total_cut > base_step_ms * 0.30 {
+        warnings.push("requested cut exceeds 30% of the calibrated step time".to_string());
+    }
+    let risk_level = if warnings.len() >= 3 {
+        "high"
+    } else if warnings.is_empty() && clears_target {
+        "medium_low"
+    } else {
+        "medium"
+    }
+    .to_string();
+    let recommendation = if clears_target {
+        "run the cheapest exact #2135 H100 A/B that exercises active recurrence; require median/p90 and bridge/host-copy counters before promotion"
+    } else {
+        "do not spend a full record run yet; stack another exact recurrent replay or optimizer-launch cut and rerun the scenario"
+    }
+    .to_string();
+    let report = WindTunnelScenarioReport {
+        kind: "pg_local_wind_tunnel_scenario".to_string(),
+        spec_fingerprint: plan.variant_fingerprint,
+        estimate_only: true,
+        source_kind,
+        calibration_path: options
+            .calibration
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        trace_path: options
+            .trace
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        base_step_ms,
+        base_step_source,
+        target_step_ms: options.target_step_ms,
+        active_recurrent_replay_cut_ms: active_cut,
+        bank_update_cut_ms: bank_cut,
+        graph_overhead_cut_ms: graph_cut,
+        total_requested_cut_ms: total_cut,
+        predicted_step_ms,
+        predicted_active_recurrent_ms,
+        expected_train_steps_in_600s,
+        expected_train_wall_seconds,
+        clears_target,
+        remaining_gap_ms,
+        risk_level,
+        recommendation,
+        warnings,
+        status: "pass".to_string(),
+    };
+    write_report_if_requested(&report, options.output.as_deref())?;
+    Ok(report)
+}
+
 pub fn load_lite_spec(path: &Path) -> PgResult<LiteSpec> {
     let body = fs::read_to_string(path)?;
     toml::from_str(&body).map_err(|err| PgError::DataFormat(format!("invalid PG-Lite TOML: {err}")))
+}
+
+pub fn run_lite_init(options: LiteInitOptions) -> PgResult<LiteInitReport> {
+    let input = fs::read(&options.input)?;
+    if input.len() < 2 {
+        return Err(PgError::DataFormat(
+            "PG-Lite init requires at least two bytes so train and validation splits are non-empty"
+                .into(),
+        ));
+    }
+    if options.context == 0 {
+        return Err(PgError::InvalidOp(
+            "PG-Lite init requires --context > 0".into(),
+        ));
+    }
+    if options.residual_buckets == 0 {
+        return Err(PgError::InvalidOp(
+            "PG-Lite init requires --residual-buckets > 0".into(),
+        ));
+    }
+    let requested_val = options.val_bytes.unwrap_or_else(|| {
+        ((input.len() as f64) * options.val_fraction.clamp(0.01, 0.90)).round() as usize
+    });
+    let val_len = requested_val.clamp(1, input.len() - 1);
+    let train_len = input.len() - val_len;
+
+    fs::create_dir_all(&options.output_dir)?;
+    let output_dir = absolute_path(&options.output_dir)?;
+    let data_dir = output_dir.join("data");
+    let config_dir = output_dir.join("configs");
+    fs::create_dir_all(&data_dir)?;
+    fs::create_dir_all(&config_dir)?;
+
+    let train_path = data_dir.join("train.bytes");
+    let val_path = data_dir.join("val.bytes");
+    fs::write(&train_path, &input[..train_len])?;
+    fs::write(&val_path, &input[train_len..])?;
+
+    let mut configs = Vec::new();
+    let base = LiteSpec {
+        artifact_budget_bytes: options.artifact_budget_bytes,
+        train_time_seconds: options.train_time_seconds,
+        eval_time_seconds: options.eval_time_seconds,
+        memory_budget_bytes: options.memory_budget_bytes,
+        data: LiteDataSpec {
+            train_path: train_path.display().to_string(),
+            val_path: val_path.display().to_string(),
+            format: "bytes".to_string(),
+        },
+        model: LiteModelSpec {
+            family: LiteModelFamily::NgramResidual,
+            vocab: "byte".to_string(),
+            context: options.context,
+            residual_buckets: options.residual_buckets,
+            residual_weight: options.residual_weight,
+            artifact_path: None,
+        },
+        backend: LiteBackendSpec {
+            kind: options.backend,
+            allow_cpu_fallback: false,
+        },
+        ..LiteSpec::default()
+    };
+
+    let residual = write_lite_init_config(
+        &config_dir,
+        "byte_golf_ngram_residual",
+        LiteSpec {
+            track: LiteTrack::ByteGolf,
+            ..base.clone()
+        },
+    )?;
+    configs.push(residual);
+
+    let baseline = write_lite_init_config(
+        &config_dir,
+        "byte_golf_ngram_baseline",
+        LiteSpec {
+            track: LiteTrack::ByteGolf,
+            model: LiteModelSpec {
+                family: LiteModelFamily::ByteNgram,
+                residual_buckets: 1,
+                residual_weight: 0.0,
+                ..base.model.clone()
+            },
+            ..base.clone()
+        },
+    )?;
+    configs.push(baseline);
+
+    let stream = write_lite_init_config(
+        &config_dir,
+        "stream_golf_score_first",
+        LiteSpec {
+            track: LiteTrack::StreamGolf,
+            ..base.clone()
+        },
+    )?;
+    configs.push(stream);
+
+    let artifact = write_lite_init_config(
+        &config_dir,
+        "artifact_golf_empty",
+        LiteSpec {
+            track: LiteTrack::ArtifactGolf,
+            train_time_seconds: 0.0,
+            model: LiteModelSpec {
+                family: LiteModelFamily::ArtifactOnly,
+                residual_weight: 0.0,
+                artifact_path: None,
+                ..base.model.clone()
+            },
+            backend: LiteBackendSpec {
+                kind: LiteBackendKind::CpuReference,
+                allow_cpu_fallback: false,
+            },
+            ..base.clone()
+        },
+    )?;
+    configs.push(artifact);
+
+    if options.backend != LiteBackendKind::MetalApple {
+        let metal_probe = write_lite_init_config(
+            &config_dir,
+            "byte_golf_metal_probe",
+            LiteSpec {
+                track: LiteTrack::ByteGolf,
+                backend: LiteBackendSpec {
+                    kind: LiteBackendKind::MetalApple,
+                    allow_cpu_fallback: true,
+                },
+                ..base.clone()
+            },
+        )?;
+        configs.push(metal_probe);
+    }
+
+    let readme_path = output_dir.join("README.md");
+    let report_path = output_dir.join("init_report.json");
+    let report = LiteInitReport {
+        kind: "pg_lite_init",
+        input_path: absolute_path(&options.input)?.display().to_string(),
+        output_dir: output_dir.display().to_string(),
+        input_bytes: input.len(),
+        input_crc32: crc32_label(&input),
+        train_path: train_path.display().to_string(),
+        val_path: val_path.display().to_string(),
+        train_bytes: train_len,
+        train_crc32: crc32_label(&input[..train_len]),
+        val_bytes: val_len,
+        val_crc32: crc32_label(&input[train_len..]),
+        val_fraction_effective: val_len as f64 / input.len() as f64,
+        configs,
+        readme_path: readme_path.display().to_string(),
+        report_path: report_path.display().to_string(),
+        status: "pass".to_string(),
+    };
+    fs::write(&readme_path, lite_init_readme(&report))?;
+    write_json_pretty(&report_path, &report)?;
+    Ok(report)
+}
+
+pub fn run_lite_verify_artifact(
+    options: LiteVerifyArtifactOptions,
+) -> PgResult<LiteVerifyArtifactReport> {
+    let artifact_bytes = fs::read(&options.artifact)?;
+    let artifact_size = artifact_bytes.len();
+    let artifact_crc32 = crc32_label(&artifact_bytes);
+    let artifact = load_lite_stored_artifact(&options.artifact)?;
+    let model = LiteNgramResidual::from_stored_artifact(&artifact)?;
+    let mut notes = Vec::new();
+
+    let (expected_config_fingerprint, artifact_budget_bytes, config_val_path) =
+        if let Some(config_path) = options.config.as_ref() {
+            let spec = load_lite_spec(config_path)?;
+            validate_lite_spec(&spec)?;
+            (
+                Some(spec.config_fingerprint()?),
+                Some(spec.artifact_budget_bytes),
+                Some(PathBuf::from(spec.data.val_path)),
+            )
+        } else {
+            (None, None, None)
+        };
+    let source_config_matches_expected = expected_config_fingerprint
+        .as_ref()
+        .map(|expected| expected == &artifact.source_config_fingerprint);
+    if source_config_matches_expected == Some(false) {
+        notes.push(
+            "artifact source_config_fingerprint does not match the supplied config".to_string(),
+        );
+    }
+    let artifact_budget_ok = artifact_budget_bytes.map(|budget| artifact_size <= budget);
+    let val_path = options.val.clone().or(config_val_path);
+    let (val_bytes, validation_bpb) = if let Some(path) = val_path.as_ref() {
+        let val = fs::read(path)?;
+        if val.is_empty() {
+            notes.push("validation bytes are empty; BPB was not computed".to_string());
+            (Some(0), None)
+        } else {
+            let eval = model.loss_on_bytes(&val, false);
+            let avg_loss = eval.loss / eval.tokens.max(1) as f64;
+            (
+                Some(val.len()),
+                Some(compute_bpb(
+                    avg_loss,
+                    eval.tokens as f64,
+                    eval.tokens as f64,
+                )),
+            )
+        }
+    } else {
+        notes.push(
+            "no validation path supplied; artifact decode was checked without BPB".to_string(),
+        );
+        (None, None)
+    };
+    let status = if artifact.kind == "pg_lite_model_artifact"
+        && artifact.version == 1
+        && artifact_budget_ok.unwrap_or(true)
+        && source_config_matches_expected.unwrap_or(true)
+        && validation_bpb.map(|bpb| bpb.is_finite()).unwrap_or(true)
+    {
+        "pass"
+    } else {
+        "fail"
+    }
+    .to_string();
+    let report = LiteVerifyArtifactReport {
+        kind: "pg_lite_verify_artifact",
+        artifact_path: options.artifact.display().to_string(),
+        artifact_bytes: artifact_size,
+        artifact_crc32,
+        artifact_kind: artifact.kind,
+        decoded_ok: true,
+        model_reconstruct_ok: true,
+        source_config_fingerprint: artifact.source_config_fingerprint,
+        model_fingerprint: artifact.model_fingerprint,
+        expected_config_fingerprint,
+        source_config_matches_expected,
+        model_family: artifact.model_family,
+        context: artifact.context,
+        residual_weight: artifact.residual_weight,
+        bigram_rows: artifact.bigram_rows,
+        residual_buckets: artifact.residual_buckets,
+        bigram_entries: artifact.bigram_entries.len(),
+        residual_entries: artifact.residual_entries.len(),
+        artifact_budget_bytes,
+        artifact_budget_ok,
+        val_path: val_path.as_ref().map(|path| path.display().to_string()),
+        val_bytes,
+        validation_bpb,
+        validation_bpb_scope: "local_proxy_bpb_not_leaderboard",
+        notes,
+        status,
+    };
+    write_report_if_requested(&report, options.output.as_deref())?;
+    Ok(report)
+}
+
+fn write_lite_init_config(
+    config_dir: &Path,
+    name: &str,
+    spec: LiteSpec,
+) -> PgResult<LiteInitConfigReport> {
+    validate_lite_spec(&spec)?;
+    let path = config_dir.join(format!("{name}.toml"));
+    let body = toml::to_string_pretty(&spec).map_err(|err| {
+        PgError::DataFormat(format!("PG-Lite init TOML encode failed for {name}: {err}"))
+    })?;
+    fs::write(&path, body)?;
+    Ok(LiteInitConfigReport {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        track: spec.track,
+        model_family: spec.model.family,
+        backend: spec.backend.kind,
+        allow_cpu_fallback: spec.backend.allow_cpu_fallback,
+        artifact_budget_bytes: spec.artifact_budget_bytes,
+    })
+}
+
+fn lite_init_readme(report: &LiteInitReport) -> String {
+    let mut body = String::new();
+    body.push_str("# PG-Lite Local Benchmark\n\n");
+    body.push_str(
+        "This directory was generated by `pg-local lite init`. It is a local proxy benchmark and does not claim Parameter Golf leaderboard validity.\n\n",
+    );
+    body.push_str("## Data\n\n");
+    body.push_str(&format!(
+        "- Input bytes: `{}` (`{}`)\n- Train bytes: `{}` (`{}`)\n- Validation bytes: `{}` (`{}`)\n- Effective validation fraction: `{:.4}`\n\n",
+        report.input_bytes,
+        report.input_crc32,
+        report.train_bytes,
+        report.train_crc32,
+        report.val_bytes,
+        report.val_crc32,
+        report.val_fraction_effective
+    ));
+    body.push_str("## Configs\n\n");
+    body.push_str("| Name | Track | Family | Backend | Budget bytes | Path |\n");
+    body.push_str("|---|---|---|---|---:|---|\n");
+    for config in &report.configs {
+        body.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}`{} | {} | `{}` |\n",
+            config.name,
+            lite_track_label(config.track),
+            lite_model_family_label(config.model_family),
+            lite_backend_label(config.backend),
+            if config.allow_cpu_fallback {
+                " fallback"
+            } else {
+                ""
+            },
+            config.artifact_budget_bytes,
+            config.path
+        ));
+    }
+    body.push_str("\n## Commands\n\n");
+    if let Some(first) = report
+        .configs
+        .iter()
+        .find(|config| config.name == "byte_golf_ngram_residual")
+    {
+        body.push_str(&format!(
+            "```bash\npg-local lite run --config '{}' --output run_byte_golf\npg-local lite benchmark --config '{}' --output benchmark_byte_golf --repeats 3\npg-local lite suite --config-dir '{}/configs' --output suite\npg-local lite verify-artifact --artifact run_byte_golf/model.pglite.bin --config '{}' --output verify_artifact.json\n```\n",
+            first.path, first.path, report.output_dir, first.path
+        ));
+    }
+    body.push_str("\nPG-Lite BPB is local proxy evidence only.\n");
+    body
+}
+
+fn crc32_label(bytes: &[u8]) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    format!("crc32:{:08x}", hasher.finalize())
+}
+
+fn absolute_path(path: &Path) -> PgResult<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 pub fn write_report_if_requested<T: Serialize>(report: &T, output: Option<&Path>) -> PgResult<()> {
     let body = serde_json::to_string_pretty(report)
         .map_err(|err| PgError::DataFormat(format!("JSON encode failed: {err}")))?;
     if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         fs::write(path, body)?;
     } else {
@@ -2654,6 +4464,13 @@ fn wind_tunnel_trace_paths(dir: &Path) -> PgResult<Vec<PathBuf>> {
             && !label.ends_with("baseline_shape_model.json")
             && !label.ends_with("summary.json")
             && !label.ends_with("summary.md")
+            && !label.ends_with("trace_index.json")
+            && !label.ends_with("trace_corpus.json")
+            && !label.ends_with("calibration_model.json")
+            && !label.ends_with("scenario_exact_recurrent_replay.json")
+            && !label.ends_with("proof_bundle.json")
+            && !label.ends_with("evidence_manifest.json")
+            && !label.ends_with("proposal_features.json")
     });
     paths.sort();
     paths.dedup();
@@ -2684,29 +4501,155 @@ fn pg_lite_metal_kernel_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/pg_lite_ngram.metal")
 }
 
+#[cfg(test)]
 fn pg_lite_metal_expected_symbols() -> Vec<String> {
-    vec![
-        "pg_lite_ngram_loss_kernel".to_string(),
-        "pg_lite_ngram_loss_u32_residual_kernel".to_string(),
-        "pg_lite_ngram_train_kernel".to_string(),
-        "pg_lite_reduce_loss_kernel".to_string(),
+    pg_lite_metal_kernel_contracts()
+        .into_iter()
+        .map(|contract| contract.symbol)
+        .collect()
+}
+
+fn pg_lite_metal_kernel_contracts() -> Vec<BackendKernelContractReport> {
+    [
+        (
+            "pg_lite_init_bigram_counts_kernel",
+            "initialize add-one-smoothed bigram count table",
+            "parallel dense table fill; removes CPU-side count initialization",
+        ),
+        (
+            "pg_lite_init_residual_counts_u16_kernel",
+            "initialize compact u16 residual count table",
+            "parallel dense table fill for exported/eval compact path",
+        ),
+        (
+            "pg_lite_init_residual_counts_u32_kernel",
+            "initialize u32 residual count table",
+            "training path uses u32 atomics before saturating downcast",
+        ),
+        (
+            "pg_lite_bigram_row_sums_kernel",
+            "precompute 257 bigram row sums",
+            "avoids summing 256 counters per token during loss",
+        ),
+        (
+            "pg_lite_residual_row_sums_u16_kernel",
+            "precompute compact residual row sums",
+            "avoids per-token residual row scans in u16 eval",
+        ),
+        (
+            "pg_lite_residual_row_sums_u32_kernel",
+            "precompute u32 residual row sums",
+            "avoids per-token residual row scans in training/eval",
+        ),
+        (
+            "pg_lite_ngram_train_kernel",
+            "atomic train pass over byte stream",
+            "parallel count accumulation for bigram and hashed residual tables",
+        ),
+        (
+            "pg_lite_downcast_residual_u32_to_u16_kernel",
+            "saturating residual table compaction",
+            "converts atomic u32 training counts into compact artifact/eval counts",
+        ),
+        (
+            "pg_lite_ngram_loss_presummed_u16_kernel",
+            "per-token loss with u16 residual counts and precomputed sums",
+            "fast eval path that writes token losses for optional downstream reductions",
+        ),
+        (
+            "pg_lite_ngram_loss_presummed_u32_kernel",
+            "per-token loss with u32 residual counts and precomputed sums",
+            "fast train/eval path before residual downcast",
+        ),
+        (
+            "pg_lite_ngram_loss_kernel",
+            "legacy u16 residual loss without precomputed sums",
+            "reference-compatible fallback for launch bring-up",
+        ),
+        (
+            "pg_lite_ngram_loss_u32_residual_kernel",
+            "legacy u32 residual loss without precomputed sums",
+            "reference-compatible fallback for launch bring-up",
+        ),
+        (
+            "pg_lite_ngram_loss_reduce_u16_presummed_kernel",
+            "fused u16 residual loss and block reduction",
+            "avoids materializing token_losses for the primary eval path",
+        ),
+        (
+            "pg_lite_ngram_loss_reduce_u32_presummed_kernel",
+            "fused u32 residual loss and block reduction",
+            "avoids materializing token_losses before residual compaction",
+        ),
+        (
+            "pg_lite_reduce_loss_kernel",
+            "block reduce token loss buffer",
+            "shared-memory reduction for fallback loss buffers",
+        ),
+        (
+            "pg_lite_score_first_eval_u32_kernel",
+            "score-first sequential eval/update correctness kernel",
+            "single-lane legality path because online updates are order-dependent",
+        ),
     ]
+    .into_iter()
+    .map(
+        |(symbol, role, optimization_note)| BackendKernelContractReport {
+            symbol: symbol.to_string(),
+            role: role.to_string(),
+            optimization_note: optimization_note.to_string(),
+            executable_required_for_acceleration: true,
+        },
+    )
+    .collect()
 }
 
 fn metal_source_contains_kernel(source: &str, symbol: &str) -> bool {
     source.contains(&format!("kernel void {symbol}"))
 }
 
-fn find_metal_compiler() -> Option<String> {
-    let output = std::process::Command::new("xcrun")
+#[derive(Debug, Clone)]
+struct MetalCompilerProbe {
+    path: Option<String>,
+    error: Option<String>,
+}
+
+fn find_metal_compiler() -> MetalCompilerProbe {
+    let output = match std::process::Command::new("xcrun")
         .args(["--find", "metal"])
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return MetalCompilerProbe {
+                path: None,
+                error: Some(format!("failed to invoke xcrun: {err}")),
+            };
+        }
+    };
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return MetalCompilerProbe {
+            path: None,
+            error: Some(if stderr.is_empty() {
+                format!("xcrun exited with status {}", output.status)
+            } else {
+                stderr
+            }),
+        };
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        MetalCompilerProbe {
+            path: None,
+            error: Some("xcrun returned an empty metal compiler path".to_string()),
+        }
+    } else {
+        MetalCompilerProbe {
+            path: Some(path),
+            error: None,
+        }
+    }
 }
 
 fn compile_metal_kernel_smoke(source: &Path) -> Result<(), String> {
@@ -2777,11 +4720,45 @@ fn sanitize_path_component(raw: &str) -> String {
     }
 }
 
+fn monotonic_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn scratch_report_path(stem: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{stem}_{}_{}.json",
+        std::process::id(),
+        monotonic_nanos()
+    ))
+}
+
 fn mean_f64(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
+    let finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
         None
     } else {
-        Some(values.iter().copied().sum::<f64>() / values.len() as f64)
+        Some(finite.iter().copied().sum::<f64>() / finite.len() as f64)
+    }
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        Some((values[mid - 1] + values[mid]) * 0.5)
+    } else {
+        Some(values[mid])
     }
 }
 
@@ -2809,6 +4786,66 @@ fn lite_backend_label(backend: LiteBackendKind) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct LiteMetalTrainEval {
+    model: LiteNgramResidual,
+    eval: LiteEvalStats,
+}
+
+#[cfg(feature = "metal_apple")]
+fn run_metal_lite_train_eval(
+    train: &[u8],
+    val: &[u8],
+    spec: &LiteSpec,
+) -> PgResult<LiteMetalTrainEval> {
+    let out = metal_lite::train_and_eval_fixed(train, val, spec)?;
+    Ok(LiteMetalTrainEval {
+        model: out.model,
+        eval: out.eval,
+    })
+}
+
+#[cfg(not(feature = "metal_apple"))]
+fn run_metal_lite_train_eval(
+    _train: &[u8],
+    _val: &[u8],
+    _spec: &LiteSpec,
+) -> PgResult<LiteMetalTrainEval> {
+    Err(PgError::InvalidOp(
+        "PG-Lite Metal train/eval requested without `metal_apple` feature".into(),
+    ))
+}
+
+#[cfg(feature = "metal_apple")]
+fn run_metal_lite_fixed_eval(model: &LiteNgramResidual, val: &[u8]) -> PgResult<LiteEvalStats> {
+    metal_lite::eval_fixed_model(model, val)
+}
+
+#[cfg(not(feature = "metal_apple"))]
+fn run_metal_lite_fixed_eval(_model: &LiteNgramResidual, _val: &[u8]) -> PgResult<LiteEvalStats> {
+    Err(PgError::InvalidOp(
+        "PG-Lite Metal fixed eval requested without `metal_apple` feature".into(),
+    ))
+}
+
+#[cfg(feature = "metal_apple")]
+fn run_metal_lite_score_first_eval(
+    model: &LiteNgramResidual,
+    val: &[u8],
+) -> PgResult<LiteEvalStats> {
+    metal_lite::score_first_eval_model(model, val)
+}
+
+#[cfg(not(feature = "metal_apple"))]
+fn run_metal_lite_score_first_eval(
+    _model: &LiteNgramResidual,
+    _val: &[u8],
+) -> PgResult<LiteEvalStats> {
+    Err(PgError::InvalidOp(
+        "PG-Lite Metal score-first eval requested without `metal_apple` feature".into(),
+    ))
+}
+
 fn lite_suite_markdown(report: &LiteSuiteReport) -> String {
     let mut body = String::new();
     body.push_str("# PG-Lite Suite\n\n");
@@ -2821,7 +4858,7 @@ fn lite_suite_markdown(report: &LiteSuiteReport) -> String {
             "- Best local proxy BPB: `{best_bpb:.6}` from `{best_config}`\n"
         ));
     }
-    body.push_str("\n");
+    body.push('\n');
     body.push_str("| Config | Track | Family | Backend | Status | BPB | Artifact bytes | Artifact budget | Score-first updates |\n");
     body.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for run in &report.runs {
@@ -2848,6 +4885,84 @@ fn lite_suite_markdown(report: &LiteSuiteReport) -> String {
     body
 }
 
+fn lite_benchmark_markdown(report: &LiteBenchmarkReport) -> String {
+    let mut body = String::new();
+    body.push_str("# PG-Lite Backend Benchmark\n\n");
+    body.push_str(&format!(
+        "- Config: `{}`\n- Repeats: `{}`\n- Status: `{}`\n",
+        report.config_path, report.repeats, report.status
+    ));
+    if let Some(speedup) = report.cpu_vs_metal_speedup_total {
+        body.push_str(&format!(
+            "- CPU-vs-Metal total wall speedup: `{speedup:.3}x`\n"
+        ));
+    }
+    if let Some(speedup) = report.cpu_vs_metal_speedup_train {
+        body.push_str(&format!(
+            "- CPU-vs-Metal train wall speedup: `{speedup:.3}x`\n"
+        ));
+    }
+    if let Some(delta) = report.cpu_vs_metal_bpb_delta {
+        body.push_str(&format!(
+            "- Metal minus CPU local BPB delta: `{delta:.9}`\n"
+        ));
+    }
+    if let Some(backend) = report.best_total_wall_backend {
+        body.push_str(&format!(
+            "- Fastest local backend: `{}`\n",
+            lite_backend_label(backend)
+        ));
+    }
+    if let Some(backend) = report.best_bpb_backend {
+        body.push_str(&format!(
+            "- Best local proxy BPB backend: `{}`\n",
+            lite_backend_label(backend)
+        ));
+    }
+    body.push('\n');
+    body.push_str("| Requested backend | Status | Runs | Accelerated | Execution backends | Median total s | Median train s | Median eval s | Median BPB | Artifact bytes | Error |\n");
+    body.push_str("|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|\n");
+    for backend in &report.backends {
+        let execution_backends = backend
+            .execution_backends
+            .iter()
+            .map(|backend| lite_backend_label(*backend))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!(
+            "| `{}` | `{}` | {} | {}/{} | `{}` | {} | {} | {} | {} | {} | {} |\n",
+            lite_backend_label(backend.requested_backend),
+            backend.status,
+            backend.run_count,
+            backend.accelerated_run_count,
+            backend.run_count,
+            execution_backends,
+            optional_ms_like_seconds(backend.median_total_wall_seconds),
+            optional_ms_like_seconds(backend.median_train_wall_seconds),
+            optional_ms_like_seconds(backend.median_eval_wall_seconds),
+            backend
+                .median_validation_bpb
+                .map(|value| format!("{value:.9}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            backend
+                .artifact_actual_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            backend.error.as_deref().unwrap_or("")
+        ));
+    }
+    body.push_str(
+        "\nPG-Lite benchmark results are local proxy evidence. They do not establish H100 throughput, final BPB, or leaderboard validity.\n",
+    );
+    body
+}
+
+fn optional_ms_like_seconds(value: Option<f64>) -> String {
+    value
+        .map(|seconds| format!("{seconds:.6}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn wind_tunnel_suite_markdown(report: &WindTunnelSuiteReport) -> String {
     let mut body = String::new();
     body.push_str("# Wind Tunnel Trace Suite\n\n");
@@ -2869,7 +4984,7 @@ fn wind_tunnel_suite_markdown(report: &WindTunnelSuiteReport) -> String {
     if let Some(error) = report.mean_abs_baseline_pct_error {
         body.push_str(&format!("- Mean absolute baseline error: `{error:.2}%`\n"));
     }
-    body.push_str("\n");
+    body.push('\n');
     body.push_str(
         "| Trace | Trace total | Estimate | Baseline error | Coverage | Useful stages | Role | Top bottleneck | Risks |\n",
     );
@@ -2897,6 +5012,454 @@ fn wind_tunnel_suite_markdown(report: &WindTunnelSuiteReport) -> String {
         ));
     }
     body.push_str("\nWind Tunnel predictions are planning estimates, not H100 validation.\n");
+    body
+}
+
+fn wind_tunnel_holdout_report(corpus: &WindTunnelCorpusReport) -> WindTunnelHoldoutReport {
+    let mut timed_runs = corpus
+        .runs
+        .iter()
+        .filter(|run| run.trace_total_ms.is_some_and(f64::is_finite))
+        .collect::<Vec<_>>();
+    timed_runs.sort_by(|a, b| a.run_key.cmp(&b.run_key));
+
+    let mut train = Vec::new();
+    let mut holdout = Vec::new();
+    for (idx, run) in timed_runs.into_iter().enumerate() {
+        if idx % 2 == 0 {
+            train.push(run);
+        } else {
+            holdout.push(run);
+        }
+    }
+
+    let predictor = WindTunnelHoldoutPredictor::fit(&train);
+    let samples = holdout
+        .iter()
+        .filter_map(|run| predictor.predict(run))
+        .collect::<Vec<_>>();
+    let predicted = samples
+        .iter()
+        .map(|sample| sample.predicted_ms)
+        .collect::<Vec<_>>();
+    let observed = samples
+        .iter()
+        .map(|sample| sample.observed_ms)
+        .collect::<Vec<_>>();
+    let errors = samples
+        .iter()
+        .map(|sample| sample.abs_error_ms)
+        .collect::<Vec<_>>();
+    let pct_errors = samples
+        .iter()
+        .filter_map(|sample| sample.pct_error)
+        .collect::<Vec<_>>();
+    let status = if predictor.global_median_ms.is_some() && !holdout.is_empty() {
+        "pass"
+    } else if predictor.global_median_ms.is_some() {
+        "insufficient_holdout"
+    } else {
+        "no_timed_runs"
+    }
+    .to_string();
+
+    WindTunnelHoldoutReport {
+        kind: "pg_local_wind_tunnel_holdout",
+        estimate_only: true,
+        predictor_kind: "train_only_stage_residual_plus_recurrent_split",
+        train_sample_count: train.len(),
+        holdout_sample_count: holdout.len(),
+        baseline_ms: predictor.global_median_ms,
+        mean_predicted_ms: mean_f64(&predicted),
+        mean_abs_error_ms: mean_f64(&errors),
+        mean_abs_pct_error: mean_f64(&pct_errors),
+        spearman_rank_correlation: spearman_rank_correlation(&predicted, &observed),
+        samples,
+        status,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WindTunnelHoldoutPredictor {
+    global_median_ms: Option<f64>,
+    global_stage_residual_ms: Option<f64>,
+    global_active_recurrent_ms: Option<f64>,
+    global_inactive_recurrent_ms: Option<f64>,
+    class_median_ms: BTreeMap<String, f64>,
+    class_stage_residual_ms: BTreeMap<String, f64>,
+    class_active_recurrent_ms: BTreeMap<String, f64>,
+    class_inactive_recurrent_ms: BTreeMap<String, f64>,
+}
+
+impl WindTunnelHoldoutPredictor {
+    fn fit(runs: &[&WindTunnelCorpusRun]) -> Self {
+        let mut observed = Vec::new();
+        let mut stage_residuals = Vec::new();
+        let mut active = Vec::new();
+        let mut inactive = Vec::new();
+        let mut observed_by_class = BTreeMap::<String, Vec<f64>>::new();
+        let mut stage_residuals_by_class = BTreeMap::<String, Vec<f64>>::new();
+        let mut active_by_class = BTreeMap::<String, Vec<f64>>::new();
+        let mut inactive_by_class = BTreeMap::<String, Vec<f64>>::new();
+
+        for run in runs {
+            let Some(ms) = run.trace_total_ms.filter(|value| value.is_finite()) else {
+                continue;
+            };
+            let class = wind_tunnel_holdout_class(run);
+            observed.push(ms);
+            observed_by_class.entry(class.clone()).or_default().push(ms);
+            if let Some(stage_sum) = wind_tunnel_trace_stage_sum(run) {
+                let residual = ms - stage_sum;
+                if residual.is_finite() {
+                    stage_residuals.push(residual);
+                    stage_residuals_by_class
+                        .entry(class.clone())
+                        .or_default()
+                        .push(residual);
+                }
+            }
+            if let Some(ms) = run
+                .active_recurrent_ms_per_step
+                .filter(|value| value.is_finite())
+            {
+                active.push(ms);
+                active_by_class.entry(class.clone()).or_default().push(ms);
+            }
+            if let Some(ms) = run
+                .inactive_recurrent_ms_per_step
+                .filter(|value| value.is_finite())
+            {
+                inactive.push(ms);
+                inactive_by_class.entry(class).or_default().push(ms);
+            }
+        }
+
+        Self {
+            global_median_ms: median_f64(observed),
+            global_stage_residual_ms: median_f64(stage_residuals),
+            global_active_recurrent_ms: median_f64(active),
+            global_inactive_recurrent_ms: median_f64(inactive),
+            class_median_ms: median_by_key(observed_by_class),
+            class_stage_residual_ms: median_by_key(stage_residuals_by_class),
+            class_active_recurrent_ms: median_by_key(active_by_class),
+            class_inactive_recurrent_ms: median_by_key(inactive_by_class),
+        }
+    }
+
+    fn predict(&self, run: &WindTunnelCorpusRun) -> Option<WindTunnelHoldoutSampleReport> {
+        let observed_ms = run.trace_total_ms.filter(|value| value.is_finite())?;
+        let class_label = wind_tunnel_holdout_class(run);
+        let mut sources = Vec::new();
+        let mut predicted = if let Some(stage_sum) = wind_tunnel_trace_stage_sum(run) {
+            if let Some(residual) = self.class_stage_residual_ms.get(&class_label) {
+                sources.push("class_stage_residual");
+                stage_sum + residual
+            } else if let Some(residual) = self.global_stage_residual_ms {
+                sources.push("global_stage_residual");
+                stage_sum + residual
+            } else {
+                sources.push("global_median_total_no_stage_residual");
+                self.global_median_ms?
+            }
+        } else if let Some(class_median) = self.class_median_ms.get(&class_label) {
+            sources.push("class_median_total");
+            *class_median
+        } else {
+            sources.push("global_median_total");
+            self.global_median_ms?
+        };
+
+        if let Some(active_ms) = run
+            .active_recurrent_ms_per_step
+            .filter(|value| value.is_finite())
+        {
+            if let Some(reference) = self
+                .class_active_recurrent_ms
+                .get(&class_label)
+                .copied()
+                .or(self.global_active_recurrent_ms)
+            {
+                predicted += active_ms - reference;
+                sources.push("active_recurrent_offset");
+            }
+        } else if let Some(inactive_ms) = run
+            .inactive_recurrent_ms_per_step
+            .filter(|value| value.is_finite())
+            && let Some(reference) = self
+                .class_inactive_recurrent_ms
+                .get(&class_label)
+                .copied()
+                .or(self.global_inactive_recurrent_ms)
+        {
+            predicted += inactive_ms - reference;
+            sources.push("inactive_recurrent_offset");
+        }
+
+        let predicted_ms = predicted.max(1.0);
+        let abs_error_ms = (predicted_ms - observed_ms).abs();
+        let pct_error = if observed_ms.abs() > f64::EPSILON {
+            Some(abs_error_ms / observed_ms.abs() * 100.0)
+        } else {
+            None
+        };
+        Some(WindTunnelHoldoutSampleReport {
+            run_key: run.run_key.clone(),
+            selected_trace_path: run.selected_trace_path.clone(),
+            class_label,
+            prediction_source: sources.join("+"),
+            observed_ms,
+            predicted_ms,
+            abs_error_ms,
+            pct_error,
+        })
+    }
+}
+
+fn wind_tunnel_holdout_class(run: &WindTunnelCorpusRun) -> String {
+    if corpus_run_is_allst(run) {
+        "allst_diagnostic".to_string()
+    } else if corpus_run_is_exact_2135(run) {
+        "exact_2135".to_string()
+    } else if run
+        .active_recurrent_ms_per_step
+        .zip(run.inactive_recurrent_ms_per_step)
+        .is_some_and(|(active, inactive)| active > inactive)
+    {
+        "active_recurrent".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn wind_tunnel_trace_stage_sum(run: &WindTunnelCorpusRun) -> Option<f64> {
+    let body = fs::read_to_string(&run.selected_trace_path).ok()?;
+    let trace = parse_trace_body(&body)?;
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for mapping in TRACE_STAGE_MAPPINGS {
+        if let Some(ms) = trace_number_for_aliases(&trace, mapping.aliases)
+            && ms.is_finite()
+            && ms.abs() > 1e-9
+        {
+            total += ms;
+            count += 1;
+        }
+    }
+    (count > 0).then_some(total)
+}
+
+fn median_by_key(values: BTreeMap<String, Vec<f64>>) -> BTreeMap<String, f64> {
+    values
+        .into_iter()
+        .filter_map(|(key, values)| median_f64(values).map(|median| (key, median)))
+        .collect()
+}
+
+fn spearman_rank_correlation(predicted: &[f64], observed: &[f64]) -> Option<f64> {
+    if predicted.len() != observed.len() || predicted.len() < 2 {
+        return None;
+    }
+    let predicted_ranks = rank_finite_values(predicted)?;
+    let observed_ranks = rank_finite_values(observed)?;
+    pearson_correlation(&predicted_ranks, &observed_ranks)
+}
+
+fn rank_finite_values(values: &[f64]) -> Option<Vec<f64>> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut indexed = values
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<(usize, f64)>>();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut ranks = vec![0.0; values.len()];
+    let mut idx = 0;
+    while idx < indexed.len() {
+        let start = idx;
+        let value = indexed[idx].1;
+        while idx + 1 < indexed.len() && (indexed[idx + 1].1 - value).abs() <= 1e-12 {
+            idx += 1;
+        }
+        let end = idx;
+        let rank = (start + 1 + end + 1) as f64 * 0.5;
+        for (original_index, _) in &indexed[start..=end] {
+            ranks[*original_index] = rank;
+        }
+        idx += 1;
+    }
+    Some(ranks)
+}
+
+fn pearson_correlation(x: &[f64], y: &[f64]) -> Option<f64> {
+    if x.len() != y.len() || x.len() < 2 {
+        return None;
+    }
+    let mean_x = mean_f64(x)?;
+    let mean_y = mean_f64(y)?;
+    let mut numerator = 0.0;
+    let mut x_sq = 0.0;
+    let mut y_sq = 0.0;
+    for (&x_value, &y_value) in x.iter().zip(y.iter()) {
+        let dx = x_value - mean_x;
+        let dy = y_value - mean_y;
+        numerator += dx * dy;
+        x_sq += dx * dx;
+        y_sq += dy * dy;
+    }
+    let denominator = (x_sq * y_sq).sqrt();
+    if denominator <= f64::EPSILON {
+        None
+    } else {
+        Some((numerator / denominator).clamp(-1.0, 1.0))
+    }
+}
+
+fn wind_tunnel_reviewer_markdown(
+    report: &WindTunnelReviewerReport,
+    index: &TraceIndexReport,
+    corpus: &WindTunnelCorpusReport,
+    calibration: &WindTunnelCalibrationReport,
+    scenario: &WindTunnelScenarioReport,
+    suite: &WindTunnelSuiteReport,
+) -> String {
+    let mut body = String::new();
+    body.push_str("# PG Wind Tunnel Reviewer Report\n\n");
+    body.push_str(
+        "This report is local planning evidence. It indexes historical traces, deduplicates runs, calibrates a simple stage model, and estimates the next recurrent-replay cut. It is not an H100 validation run.\n\n",
+    );
+    body.push_str("## Summary\n\n");
+    body.push_str(&format!(
+        "- Spec: `{}`\n- Trace dir: `{}`\n- Status: `{}`\n- Traces found: `{}`\n- Parseable traces: `{}`\n- Deduped runs: `{}`\n- Timed runs: `{}`\n- Exact #2135 timed runs: `{}`\n- Stage calibration runs: `{}`\n- Canonical CaseOps runs: `{}`\n",
+        report.spec_path,
+        report.trace_dir,
+        report.status,
+        report.traces_found,
+        report.parseable_traces,
+        report.deduped_runs,
+        report.timed_runs,
+        report.exact_2135_timed_runs,
+        report.stage_calibration_runs,
+        report.canonical_caseops_runs
+    ));
+    if let Some(ms) = report.best_exact_2135_ms {
+        body.push_str(&format!(
+            "- Best exact #2135 timed trace: `{ms:.3} ms/step`\n"
+        ));
+    }
+    if let Some(ms) = report.best_active_recurrent_ms {
+        body.push_str(&format!(
+            "- Best active recurrent trace: `{ms:.3} ms/active step`\n"
+        ));
+    }
+    body.push_str(&format!(
+        "- Calibration confidence: `{}`\n- Scenario prediction after requested cut: `{:.3} ms/step`\n- Scenario clears target: `{}`\n- Recommended next experiment: {}\n",
+        report.calibration_confidence_summary,
+        report.scenario_predicted_step_ms,
+        report.scenario_clears_target,
+        report.recommended_next_experiment
+    ));
+
+    body.push_str("\n## Holdout Check\n\n");
+    body.push_str(&format!(
+        "- Status: `{}`\n- Train samples: `{}`\n- Holdout samples: `{}`\n",
+        report.holdout_validation.status,
+        report.holdout_validation.train_sample_count,
+        report.holdout_validation.holdout_sample_count
+    ));
+    if let Some(value) = report.holdout_validation.baseline_ms {
+        body.push_str(&format!("- Median train baseline: `{value:.3} ms/step`\n"));
+    }
+    if let Some(value) = report.holdout_validation.mean_abs_error_ms {
+        body.push_str(&format!(
+            "- Mean absolute holdout error: `{value:.3} ms/step`\n"
+        ));
+    }
+    if let Some(value) = report.holdout_validation.mean_abs_pct_error {
+        body.push_str(&format!("- Mean absolute holdout error: `{value:.2}%`\n"));
+    }
+    if let Some(value) = report.holdout_validation.mean_predicted_ms {
+        body.push_str(&format!(
+            "- Mean predicted holdout step: `{value:.3} ms/step`\n"
+        ));
+    }
+    if let Some(value) = report.holdout_validation.spearman_rank_correlation {
+        body.push_str(&format!("- Spearman rank correlation: `{value:.3}`\n"));
+    }
+    if !report.holdout_validation.samples.is_empty() {
+        body.push_str("\n| Run | Class | Predicted ms | Observed ms | Abs error | Source |\n");
+        body.push_str("|---|---|---:|---:|---:|---|\n");
+        for sample in &report.holdout_validation.samples {
+            body.push_str(&format!(
+                "| `{}` | `{}` | {:.3} | {:.3} | {:.3} | `{}` |\n",
+                sample.run_key,
+                sample.class_label,
+                sample.predicted_ms,
+                sample.observed_ms,
+                sample.abs_error_ms,
+                sample.prediction_source
+            ));
+        }
+    }
+
+    body.push_str("\n## Top Calibrated Stages\n\n");
+    body.push_str("| Stage | Estimate ms | Samples | Confidence | Source fields |\n");
+    body.push_str("|---|---:|---:|---|---|\n");
+    for metric in &report.top_stage_metrics {
+        body.push_str(&format!(
+            "| `{}` | {:.3} | {} | `{}` | `{}` |\n",
+            metric.stage,
+            metric.estimate_ms,
+            metric.sample_count,
+            metric.confidence,
+            metric.source_fields.join(", ")
+        ));
+    }
+
+    body.push_str("\n## Scenario\n\n");
+    body.push_str(&format!(
+        "- Base step: `{:.3} ms/step` from `{}`\n- Requested active recurrent replay cut: `{:.3} ms`\n- Target: `{:.3} ms/step`\n- Predicted step: `{:.3} ms/step`\n- Remaining gap: `{:.3} ms`\n- Risk: `{}`\n",
+        scenario.base_step_ms,
+        scenario.base_step_source,
+        scenario.active_recurrent_replay_cut_ms,
+        scenario.target_step_ms,
+        scenario.predicted_step_ms,
+        scenario.remaining_gap_ms,
+        scenario.risk_level
+    ));
+
+    body.push_str("\n## Corpus And Suite\n\n");
+    body.push_str(&format!(
+        "- Index status: `{}`\n- Corpus status: `{}`\n- Calibration status: `{}`\n- Suite status: `{}`\n- Suite mean absolute baseline error: `{}`\n",
+        index.status,
+        corpus.status,
+        calibration.status,
+        suite.status,
+        suite
+            .mean_abs_baseline_step_error_ms
+            .map(|value| format!("{value:.3} ms/step"))
+            .unwrap_or_else(|| "n/a".to_string())
+    ));
+
+    if !report.warnings.is_empty() {
+        body.push_str("\n## Warnings\n\n");
+        for warning in &report.warnings {
+            body.push_str(&format!("- {warning}\n"));
+        }
+    }
+
+    body.push_str("\n## Generated Files\n\n");
+    body.push_str(&format!(
+        "- Trace index: `{}`\n- Corpus: `{}`\n- Calibration: `{}`\n- Scenario: `{}`\n- Suite summary: `{}`\n- JSON report: `{}`\n",
+        report.trace_index_path,
+        report.corpus_path,
+        report.calibration_path,
+        report.scenario_path,
+        report.suite_summary_path,
+        report.report_json_path
+    ));
     body
 }
 
@@ -3051,10 +5614,10 @@ fn artifact_audit_file_ok(path: &Path, total_limit: usize) -> PgResult<bool> {
     else {
         return Ok(false);
     };
-    let total = json_usize(&value, "artifact_total_bytes");
-    let model = json_usize(&value, "artifact_model_bytes");
-    let code = json_usize(&value, "artifact_code_bytes");
-    let limit = json_usize(&value, "artifact_total_limit").unwrap_or(total_limit);
+    let total = json_usize(value, "artifact_total_bytes");
+    let model = json_usize(value, "artifact_model_bytes");
+    let code = json_usize(value, "artifact_code_bytes");
+    let limit = json_usize(value, "artifact_total_limit").unwrap_or(total_limit);
     let budget_ok = value
         .get("artifact_budget_ok")
         .and_then(serde_json::Value::as_bool)
@@ -3313,10 +5876,10 @@ fn flat_timing_trace_from_body(body: &str) -> Option<serde_json::Value> {
             continue;
         }
         let raw = raw.trim();
-        if let Ok(number) = raw.parse::<f64>() {
-            if let Some(value) = serde_json::Number::from_f64(number) {
-                map.insert(key.to_string(), serde_json::Value::Number(value));
-            }
+        if let Ok(number) = raw.parse::<f64>()
+            && let Some(value) = serde_json::Number::from_f64(number)
+        {
+            map.insert(key.to_string(), serde_json::Value::Number(value));
         }
     }
     if map.is_empty() {
@@ -3646,7 +6209,11 @@ fn proposal_feature_report() -> ProposalFeatureReport {
         quant_layout_compiler: "local_parity_tested".to_string(),
         bigramhash_fusion: "local_parity_tested".to_string(),
         pg_lite: "local_validated".to_string(),
-        pg_lite_metal_backend: "source_boundary_checked_not_executable".to_string(),
+        pg_lite_metal_backend: if cfg!(feature = "metal_apple") {
+            "runtime_linked_requires_local_backend_check".to_string()
+        } else {
+            "source_boundary_checked_feature_gated".to_string()
+        },
         wind_tunnel: "local_validated".to_string(),
     }
 }
@@ -4037,7 +6604,7 @@ fn quant_roundtrip_stats(
         .map(|value| (value / scale).round().clamp(-qmax - 1.0, qmax) as i8)
         .collect::<Vec<_>>();
     let packed = kernel_set.pack_signed(&q, bits)?;
-    let scales = half::f16::from_f32(scale).to_bits().to_le_bytes().repeat(1);
+    let scales = half::f16::from_f32(scale).to_bits().to_le_bytes().to_vec();
     let mut dequant = vec![0.0f32; values.len()];
     kernel_set.dequant_per_row(&packed, &scales, 1, values.len(), bits, &mut dequant)?;
     let (mse, max_abs) = reconstruction_stats(values, &dequant);
@@ -4456,18 +7023,17 @@ const TRACE_COVERAGE_FIELDS: &[TraceCoverageField] = &[
 
 fn apply_trace_to_stages(value: &serde_json::Value, stages: &mut [StageEstimate]) {
     for mapping in TRACE_STAGE_MAPPINGS {
-        if let Some((trace_key, ms)) = trace_number_with_alias(value, mapping.aliases) {
-            if let Some(stage) = stages
+        if let Some((trace_key, ms)) = trace_number_with_alias(value, mapping.aliases)
+            && let Some(stage) = stages
                 .iter_mut()
                 .find(|stage| stage.name == mapping.stage_name)
-            {
-                stage.ms = ms;
-                stage.source = if trace_key == mapping.canonical {
-                    format!("trace_field:{trace_key}")
-                } else {
-                    format!("trace_field:{trace_key};canonical:{}", mapping.canonical)
-                };
-            }
+        {
+            stage.ms = ms;
+            stage.source = if trace_key == mapping.canonical {
+                format!("trace_field:{trace_key}")
+            } else {
+                format!("trace_field:{trace_key};canonical:{}", mapping.canonical)
+            };
         }
     }
 }
@@ -4942,6 +7508,7 @@ fn wind_tunnel_what_if_scenarios(
     scenarios
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wind_tunnel_scenario(
     spec: &RunSpec,
     name: &str,
@@ -5061,6 +7628,214 @@ fn wind_tunnel_validation_for_scenario(name: &str) -> String {
     }
 }
 
+fn trace_entry_run_key(entry: &TraceIndexEntry) -> String {
+    if let Some(run_name) = entry.run_name.as_deref() {
+        let mut key = format!("run:{}", sanitize_path_component(run_name));
+        if let Some(total) = entry.trace_total_ms {
+            key.push_str(&format!(":{total:.6}ms"));
+        }
+        return key;
+    }
+    let mut path = entry.trace_path.clone();
+    for suffix in [
+        ".finish_status.json",
+        ".wind_tunnel.json",
+        ".json",
+        ".log",
+        ".txt",
+    ] {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    format!("path:{}", sanitize_path_component(&path))
+}
+
+fn trace_entry_selection_score(entry: &TraceIndexEntry) -> i32 {
+    let mut score = if entry.parsed_trace { 10 } else { 0 };
+    score += match entry.calibration_role.as_str() {
+        "stage_calibration" => 100,
+        "partial_stage_calibration" => 80,
+        "total_calibration" => 60,
+        "shape_model_only" => 20,
+        _ => 0,
+    };
+    if entry.trace_total_ms.is_some() {
+        score += 25;
+    }
+    if entry.active_recurrent_ms_per_step.is_some() {
+        score += 12;
+    }
+    if entry.inactive_recurrent_ms_per_step.is_some() {
+        score += 8;
+    }
+    if entry.canonical_caseops_dataset == Some(true) {
+        score += 8;
+    }
+    if entry.host_batch_flatten_calls == Some(0) {
+        score += 3;
+    }
+    if entry.f32_to_bf16_bridge_launches == Some(0) && entry.bf16_to_f32_bridge_launches == Some(0)
+    {
+        score += 3;
+    }
+    score + entry.nonzero_stage_fields.len() as i32 * 3
+}
+
+fn trace_entry_selection_reason(entry: &TraceIndexEntry) -> String {
+    format!(
+        "{}; signal={}; total={}; active_recurrent={}; nonzero_stage_fields={}",
+        entry.calibration_role,
+        entry.signal_quality,
+        entry.trace_total_ms.is_some(),
+        entry.active_recurrent_ms_per_step.is_some(),
+        entry.nonzero_stage_fields.len()
+    )
+}
+
+fn corpus_run_text(run: &WindTunnelCorpusRun) -> String {
+    [
+        run.run_key.as_str(),
+        run.selected_trace_path.as_str(),
+        run.run_name.as_deref().unwrap_or(""),
+        run.mode.as_deref().unwrap_or(""),
+        run.record_profile.as_deref().unwrap_or(""),
+        run.recurrent_backward_profile.as_deref().unwrap_or(""),
+        run.cuda_graph_profile.as_deref().unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn corpus_run_is_exact_2135(run: &WindTunnelCorpusRun) -> bool {
+    let text = corpus_run_text(run);
+    !corpus_run_is_allst(run)
+        && (run
+            .tags
+            .iter()
+            .any(|tag| tag == "frontier_2135" || tag == "exact_2135")
+            || text.contains("2135")
+            || text.contains("frontier2135"))
+}
+
+fn corpus_run_is_allst(run: &WindTunnelCorpusRun) -> bool {
+    let text = corpus_run_text(run);
+    text.contains("allst") || text.contains("all_st") || text.contains("hybridst")
+}
+
+fn calibrated_metric(name: &str, samples: Vec<(String, f64)>) -> Option<CalibratedMetricReport> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut values = samples
+        .iter()
+        .map(|(_, value)| *value)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sample_count = values.len();
+    let best_ms = values[0];
+    let median_ms = percentile_sorted(&values, 0.50);
+    let p90_ms = percentile_sorted(&values, 0.90);
+    let source_run_keys = samples
+        .into_iter()
+        .filter(|(_, value)| value.is_finite())
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    Some(CalibratedMetricReport {
+        name: name.to_string(),
+        estimate_ms: median_ms,
+        best_ms,
+        median_ms,
+        p90_ms,
+        sample_count,
+        confidence: confidence_for_sample_count(sample_count).to_string(),
+        source_run_keys,
+    })
+}
+
+fn percentile_sorted(values: &[f64], pct: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((values.len() - 1) as f64 * pct.clamp(0.0, 1.0)).round() as usize;
+    values[idx.min(values.len() - 1)]
+}
+
+fn confidence_for_sample_count(sample_count: usize) -> &'static str {
+    match sample_count {
+        0 => "none",
+        1 => "low_single_trace",
+        2..=4 => "medium_multi_trace",
+        _ => "high_multi_trace",
+    }
+}
+
+fn calibrated_stage_metrics(runs: &[WindTunnelCorpusRun]) -> Vec<CalibratedStageMetricReport> {
+    let mut by_stage: BTreeMap<String, Vec<(String, f64, String)>> = BTreeMap::new();
+    for run in runs {
+        let body = fs::read_to_string(&run.selected_trace_path).unwrap_or_default();
+        let Some(trace) = parse_trace_body(&body) else {
+            continue;
+        };
+        for mapping in TRACE_STAGE_MAPPINGS {
+            if let Some((field, ms)) = trace_number_with_alias(&trace, mapping.aliases) {
+                if ms.abs() <= 1e-9 {
+                    continue;
+                }
+                by_stage
+                    .entry(mapping.stage_name.to_string())
+                    .or_default()
+                    .push((run.run_key.clone(), ms, field.to_string()));
+            }
+        }
+    }
+    by_stage
+        .into_iter()
+        .filter_map(|(stage, samples)| {
+            let metric = calibrated_metric(
+                &stage,
+                samples
+                    .iter()
+                    .map(|(run_key, value, _)| (run_key.clone(), *value))
+                    .collect(),
+            )?;
+            let mut source_fields = samples
+                .into_iter()
+                .map(|(_, _, field)| field)
+                .collect::<Vec<_>>();
+            source_fields.sort();
+            source_fields.dedup();
+            Some(CalibratedStageMetricReport {
+                stage,
+                estimate_ms: metric.median_ms,
+                sample_count: metric.sample_count,
+                confidence: metric.confidence,
+                source_fields,
+            })
+        })
+        .collect()
+}
+
+fn calibration_confidence_summary(
+    exact_total: Option<&CalibratedMetricReport>,
+    active: Option<&CalibratedMetricReport>,
+    stage_runs: usize,
+) -> String {
+    let total = exact_total
+        .map(|metric| metric.confidence.as_str())
+        .unwrap_or("none");
+    let active = active
+        .map(|metric| metric.confidence.as_str())
+        .unwrap_or("none");
+    let stage = confidence_for_sample_count(stage_runs);
+    format!("exact_total={total}; active_recurrent={active}; stage_attribution={stage}")
+}
+
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
@@ -5076,13 +7851,7 @@ fn select_lite_backend(spec: &LiteSpec) -> PgResult<LiteBackendSelection> {
             accelerated: false,
             fallback_reason: None,
         }),
-        LiteBackendKind::MetalApple => select_unimplemented_lite_backend(
-            LiteBackendKind::MetalApple,
-            "metal_apple",
-            spec.backend.allow_cpu_fallback,
-            cfg!(feature = "metal_apple"),
-            "PG-Lite Metal executor is not implemented yet; the feature flag only enables compile-time backend selection tests",
-        ),
+        LiteBackendKind::MetalApple => select_metal_lite_backend(spec.backend.allow_cpu_fallback),
         LiteBackendKind::MlxPrototype => select_unimplemented_lite_backend(
             LiteBackendKind::MlxPrototype,
             "mlx_prototype",
@@ -5091,6 +7860,47 @@ fn select_lite_backend(spec: &LiteSpec) -> PgResult<LiteBackendSelection> {
             "PG-Lite MLX interop is not implemented in the Rust CLI",
         ),
     }
+}
+
+fn select_metal_lite_backend(allow_cpu_fallback: bool) -> PgResult<LiteBackendSelection> {
+    if !cfg!(feature = "metal_apple") {
+        return select_unimplemented_lite_backend(
+            LiteBackendKind::MetalApple,
+            "metal_apple",
+            allow_cpu_fallback,
+            false,
+            "PG-Lite Metal executor is compiled behind the `metal_apple` Cargo feature",
+        );
+    }
+    match metal_lite_runtime_probe() {
+        Ok(_) => Ok(LiteBackendSelection {
+            requested_backend: LiteBackendKind::MetalApple,
+            execution_backend: LiteBackendKind::MetalApple,
+            status: "metal_apple_runtime".to_string(),
+            accelerated: true,
+            fallback_reason: None,
+        }),
+        Err(err) if allow_cpu_fallback => Ok(LiteBackendSelection {
+            requested_backend: LiteBackendKind::MetalApple,
+            execution_backend: LiteBackendKind::CpuReference,
+            status: "metal_apple_requested_cpu_reference_fallback".to_string(),
+            accelerated: false,
+            fallback_reason: Some(format!("runtime_probe_failed: {err}")),
+        }),
+        Err(err) => Err(PgError::InvalidOp(format!(
+            "PG-Lite backend metal_apple is not executable in this build: {err}. Set [backend].allow_cpu_fallback = true for an explicitly labeled local fallback run."
+        ))),
+    }
+}
+
+#[cfg(feature = "metal_apple")]
+fn metal_lite_runtime_probe() -> Result<String, String> {
+    metal_lite::runtime_probe()
+}
+
+#[cfg(not(feature = "metal_apple"))]
+fn metal_lite_runtime_probe() -> Result<String, String> {
+    Err("`metal_apple` Cargo feature is disabled".to_string())
 }
 
 fn select_unimplemented_lite_backend(
@@ -5684,6 +8494,7 @@ fn context_bucket(bytes: &[u8], idx: usize, context: usize, buckets: usize) -> u
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -6150,7 +8961,7 @@ kind = "cpu_reference"
     }
 
     #[test]
-    fn backend_check_reports_metal_source_but_not_runtime_claim() {
+    fn backend_check_reports_metal_source_and_runtime_state() {
         let dir = temp_path("backend_check");
         fs::create_dir_all(&dir).unwrap();
         let output = dir.join("metal.json");
@@ -6164,22 +8975,36 @@ kind = "cpu_reference"
         assert!(report.kernel_source_crc32.is_some());
         assert_eq!(
             report.expected_kernel_symbols,
-            vec![
-                "pg_lite_ngram_loss_kernel".to_string(),
-                "pg_lite_ngram_loss_u32_residual_kernel".to_string(),
-                "pg_lite_ngram_train_kernel".to_string(),
-                "pg_lite_reduce_loss_kernel".to_string(),
-            ]
+            pg_lite_metal_expected_symbols()
         );
         assert_eq!(report.kernel_symbols_found, report.expected_kernel_symbols);
+        assert_eq!(
+            report.kernel_contracts.len(),
+            report.expected_kernel_symbols.len()
+        );
+        assert!(report.kernel_contracts.iter().any(|contract| {
+            contract.symbol == "pg_lite_ngram_loss_reduce_u16_presummed_kernel"
+                && contract.optimization_note.contains("avoids materializing")
+        }));
+        let source = fs::read_to_string(pg_lite_metal_kernel_path()).unwrap();
+        assert!(source.contains("PG_LITE_FNV_OFFSET = 0xcbf29ce484222325UL"));
+        assert!(source.contains("PG_LITE_FNV_PRIME = 0x100000001b3UL"));
+        assert!(source.contains("pg_lite_score_first_eval_u32_kernel"));
         assert!(report.kernel_contract_ok);
-        assert!(!report.rust_runtime_linked);
-        assert!(!report.executable_backend_available);
+        assert_eq!(report.rust_runtime_linked, cfg!(feature = "metal_apple"));
+        assert_eq!(report.executable_backend_available, report.status == "pass");
         if !report.metal_compiler_available {
             assert!(!report.metal_compile_smoke_attempted);
             assert!(!report.metal_compile_smoke_ok);
         }
-        assert_eq!(report.status, "fail");
+        if cfg!(feature = "metal_apple") {
+            assert!(
+                report.status == "pass" || report.status == "fail",
+                "runtime probe status must be explicit"
+            );
+        } else {
+            assert_eq!(report.status, "fail");
+        }
         assert!(output.exists());
     }
 
@@ -6699,6 +9524,230 @@ timing_cuda_bank_update_ms_per_step=10.0
     }
 
     #[test]
+    fn wind_tunnel_corpus_dedupes_finish_status_and_selects_rich_trace() {
+        let dir = temp_path("wind_corpus_dedupe");
+        fs::create_dir_all(&dir).unwrap();
+        let spec_path = dir.join("spec.toml");
+        tiny_run_spec(&spec_path);
+        let trace_dir = dir.join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+        fs::write(
+            trace_dir.join("frontier_2135_case.json"),
+            r#"{
+                "run_name":"frontier_2135_case",
+                "mode":"RecordShapedProxy",
+                "timing_measured_ms_per_step":127.0,
+                "timing_recurrent_active_ms_per_step":155.0,
+                "timing_recurrent_inactive_ms_per_step":119.0,
+                "backward_block_mlp_ms":20.0,
+                "backward_block_qkv_ms":15.0,
+                "backward_block_attention_sdpa_ms":10.0,
+                "backward_block_attn_out_gate_xsa_ms":8.0,
+                "output_ms":5.0,
+                "bank_update_ms_per_step":6.0
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            trace_dir.join("frontier_2135_case.finish_status.json"),
+            r#"{"run_name":"frontier_2135_case","timing_measured_ms_per_step":127.0}"#,
+        )
+        .unwrap();
+
+        let report = run_wind_tunnel_corpus(WindTunnelCorpusOptions {
+            spec: spec_path,
+            trace_dir,
+            output: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.parseable_traces, 2);
+        assert_eq!(report.deduped_runs, 1);
+        assert_eq!(report.duplicate_source_files, 1);
+        assert_eq!(report.timed_runs, 1);
+        assert_eq!(report.stage_calibration_runs, 1);
+        assert_eq!(report.best_exact_2135_ms, Some(127.0));
+        let run = &report.runs[0];
+        assert_eq!(run.source_paths.len(), 2);
+        assert!(run.selected_trace_path.ends_with("frontier_2135_case.json"));
+        assert!(run.selection_reason.contains("stage_calibration"));
+        assert!(run.tags.iter().any(|tag| tag == "frontier_2135"));
+    }
+
+    #[test]
+    fn wind_tunnel_calibration_and_scenario_use_deduped_corpus() {
+        let dir = temp_path("wind_calibration");
+        fs::create_dir_all(&dir).unwrap();
+        let spec_path = dir.join("spec.toml");
+        let mut spec = tiny_run_spec(&spec_path);
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.start_layer = 0;
+        spec.model.recurrence.repeat_layers = 1;
+        spec.save(&spec_path).unwrap();
+        let trace_dir = dir.join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+        for (name, total, active, inactive) in [
+            ("frontier_2135_a", 127.0, 155.0, 119.0),
+            ("frontier_2135_b", 128.0, 156.0, 120.0),
+        ] {
+            fs::write(
+                trace_dir.join(format!("{name}.json")),
+                format!(
+                    r#"{{
+                        "run_name":"{name}",
+                        "mode":"RecordShapedProxy",
+                        "timing_measured_ms_per_step":{total},
+                        "timing_recurrent_active_ms_per_step":{active},
+                        "timing_recurrent_inactive_ms_per_step":{inactive},
+                        "backward_block_qkv_ms":20.0,
+                        "bank_update_ms_per_step":5.0
+                    }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let corpus_path = dir.join("corpus.json");
+        let calibration_path = dir.join("calibration.json");
+        let scenario_path = dir.join("scenario.json");
+
+        let corpus = run_wind_tunnel_corpus(WindTunnelCorpusOptions {
+            spec: spec_path.clone(),
+            trace_dir,
+            output: Some(corpus_path.clone()),
+        })
+        .unwrap();
+        assert_eq!(corpus.deduped_runs, 2);
+
+        let calibration = run_wind_tunnel_calibrate(WindTunnelCalibrationOptions {
+            spec: spec_path.clone(),
+            trace_dir: None,
+            corpus: Some(corpus_path.clone()),
+            output: Some(calibration_path.clone()),
+        })
+        .unwrap();
+        assert_eq!(calibration.status, "pass");
+        assert_eq!(
+            calibration
+                .exact_2135_total_step_ms
+                .as_ref()
+                .unwrap()
+                .sample_count,
+            2
+        );
+        assert!(
+            calibration
+                .active_recurrent_ms
+                .as_ref()
+                .unwrap()
+                .confidence
+                .contains("medium")
+        );
+
+        let scenario = run_wind_tunnel_scenario(WindTunnelScenarioOptions {
+            spec: spec_path,
+            calibration: Some(calibration_path),
+            trace: None,
+            active_recurrent_replay_cut_ms: 10.0,
+            bank_update_cut_ms: 0.0,
+            graph_overhead_cut_ms: 0.0,
+            target_step_ms: 120.0,
+            output: Some(scenario_path.clone()),
+        })
+        .unwrap();
+        assert!(scenario.clears_target);
+        assert_eq!(scenario.predicted_step_ms, 117.0);
+        assert!(Path::new(&scenario_path).exists());
+    }
+
+    #[test]
+    fn wind_tunnel_reviewer_report_writes_handoff_packet() {
+        let dir = temp_path("wind_reviewer_report");
+        fs::create_dir_all(&dir).unwrap();
+        let spec_path = dir.join("spec.toml");
+        let mut spec = tiny_run_spec(&spec_path);
+        spec.model.recurrence.enabled = true;
+        spec.model.recurrence.start_layer = 0;
+        spec.model.recurrence.repeat_layers = 1;
+        spec.save(&spec_path).unwrap();
+        let trace_dir = dir.join("traces");
+        fs::create_dir_all(&trace_dir).unwrap();
+        for (name, total, active, inactive, canonical) in [
+            ("frontier_2135_a", 127.0, 155.0, 119.0, true),
+            ("frontier_2135_b", 128.0, 156.0, 120.0, true),
+            ("frontier_2135_c", 129.0, 157.0, 121.0, false),
+            ("diagnostic_allst", 117.0, 117.0, 117.0, false),
+        ] {
+            fs::write(
+                trace_dir.join(format!("{name}.json")),
+                format!(
+                    r#"{{
+                        "run_name":"{name}",
+                        "mode":"RecordShapedProxy",
+                        "canonical_caseops_dataset":{canonical},
+                        "timing_measured_ms_per_step":{total},
+                        "timing_recurrent_active_ms_per_step":{active},
+                        "timing_recurrent_inactive_ms_per_step":{inactive},
+                        "backward_block_qkv_ms":20.0,
+                        "backward_block_mlp_ms":18.0,
+                        "bank_update_ms_per_step":5.0
+                    }}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let output_dir = dir.join("out");
+        let report = run_wind_tunnel_report(WindTunnelReviewerOptions {
+            spec: spec_path,
+            trace_dir,
+            output_dir: output_dir.clone(),
+            target_step_ms: 120.0,
+            active_recurrent_replay_cut_ms: 10.0,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.timed_runs, 4);
+        assert_eq!(report.exact_2135_timed_runs, 3);
+        assert_eq!(report.canonical_caseops_runs, 2);
+        assert!(report.holdout_validation.mean_abs_error_ms.is_some());
+        assert_eq!(
+            report.holdout_validation.predictor_kind,
+            "train_only_stage_residual_plus_recurrent_split"
+        );
+        assert_eq!(report.holdout_validation.samples.len(), 2);
+        assert_eq!(
+            report.holdout_validation.spearman_rank_correlation,
+            Some(1.0)
+        );
+        assert!(
+            report
+                .holdout_validation
+                .samples
+                .iter()
+                .all(|sample| sample.prediction_source.contains("active_recurrent_offset"))
+        );
+        assert!(report.scenario_clears_target);
+        assert!(!report.top_stage_metrics.is_empty());
+        for file in [
+            "trace_index.json",
+            "trace_corpus.json",
+            "calibration_model.json",
+            "scenario_exact_recurrent_replay.json",
+            "suite/summary.json",
+            "suite/summary.md",
+            "report.json",
+            "report.md",
+        ] {
+            assert!(output_dir.join(file).exists(), "missing {file}");
+        }
+        let markdown = fs::read_to_string(output_dir.join("report.md")).unwrap();
+        assert!(markdown.contains("PG Wind Tunnel Reviewer Report"));
+        assert!(markdown.contains("This report is local planning evidence"));
+        assert!(markdown.contains("Spearman rank correlation"));
+    }
+
+    #[test]
     fn proof_bundle_writes_all_local_reports() {
         let dir = temp_path("proof_bundle");
         fs::create_dir_all(&dir).unwrap();
@@ -6711,6 +9760,7 @@ timing_cuda_bank_update_ms_per_step=10.0
             spec: spec_path,
             artifact: None,
             trace: None,
+            trace_dir: None,
             lite_config,
             lite_config_dir: None,
             output_dir: output_dir.clone(),
@@ -6723,10 +9773,17 @@ timing_cuda_bank_update_ms_per_step=10.0
             "dist_sim.json",
             "artifact_lab.json",
             "wind_tunnel.json",
+            "trace_corpus.json",
+            "calibration_model.json",
+            "scenario_exact_recurrent_replay.json",
+            "wind_tunnel_reviewer/report.json",
+            "wind_tunnel_reviewer/report.md",
             "pg_lite/report.json",
             "pg_lite/model.pglite.bin",
             "pg_lite/model.pglite.json",
             "pg_lite/artifact_manifest.json",
+            "pg_lite_benchmark/summary.json",
+            "pg_lite_benchmark/summary.md",
             "pg_lite_suite/summary.json",
             "pg_lite_suite/summary.md",
             "backend_cpu_reference.json",
@@ -6770,6 +9827,24 @@ timing_cuda_bank_update_ms_per_step=10.0
             report.lite_suite_summary_path,
             output_dir
                 .join("pg_lite_suite/summary.json")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            report.trace_corpus_path,
+            output_dir.join("trace_corpus.json").display().to_string()
+        );
+        assert_eq!(
+            report.calibration_model_path,
+            output_dir
+                .join("calibration_model.json")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            report.scenario_report_path,
+            output_dir
+                .join("scenario_exact_recurrent_replay.json")
                 .display()
                 .to_string()
         );
@@ -6865,6 +9940,160 @@ kind = "cpu_reference"
         );
         assert_eq!(load_lite_spec(&config).unwrap().track, LiteTrack::ByteGolf);
         assert_eq!(report.status, "pass");
+    }
+
+    #[test]
+    fn lite_init_creates_self_contained_benchmark_and_verify_artifact() {
+        let dir = temp_path("lite_init");
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("corpus.txt");
+        fs::write(
+            &input,
+            b"parameter golf lite corpus\nthis is a local byte benchmark\n",
+        )
+        .unwrap();
+        let init_dir = dir.join("pg_lite_bench");
+
+        let init = run_lite_init(LiteInitOptions {
+            input: input.clone(),
+            output_dir: init_dir.clone(),
+            artifact_budget_bytes: 64_000,
+            train_time_seconds: 10.0,
+            eval_time_seconds: 5.0,
+            memory_budget_bytes: Some(1_000_000),
+            val_bytes: Some(12),
+            val_fraction: 0.2,
+            context: 32,
+            residual_buckets: 16,
+            residual_weight: 0.2,
+            backend: LiteBackendKind::CpuReference,
+        })
+        .unwrap();
+
+        assert_eq!(init.status, "pass");
+        assert_eq!(init.input_bytes, 58);
+        assert_eq!(init.val_bytes, 12);
+        assert_eq!(init.train_bytes, 46);
+        assert!(Path::new(&init.train_path).exists());
+        assert!(Path::new(&init.val_path).exists());
+        assert!(Path::new(&init.readme_path).exists());
+        assert!(Path::new(&init.report_path).exists());
+        assert!(
+            init.configs
+                .iter()
+                .any(|config| config.name == "byte_golf_ngram_baseline")
+        );
+        assert!(
+            init.configs
+                .iter()
+                .any(|config| config.name == "stream_golf_score_first")
+        );
+        assert!(
+            init.configs
+                .iter()
+                .any(|config| config.name == "artifact_golf_empty")
+        );
+
+        let residual_config = init
+            .configs
+            .iter()
+            .find(|config| config.name == "byte_golf_ngram_residual")
+            .unwrap()
+            .path
+            .clone();
+        let run = run_lite(LiteRunOptions {
+            config: PathBuf::from(&residual_config),
+            output: dir.join("run"),
+        })
+        .unwrap();
+        assert_eq!(run.status, "pass");
+
+        let verified = run_lite_verify_artifact(LiteVerifyArtifactOptions {
+            artifact: PathBuf::from(&run.artifact_path),
+            config: Some(PathBuf::from(residual_config)),
+            val: None,
+            output: Some(dir.join("verify_artifact.json")),
+        })
+        .unwrap();
+        assert_eq!(verified.status, "pass");
+        assert!(verified.decoded_ok);
+        assert!(verified.model_reconstruct_ok);
+        assert_eq!(verified.artifact_budget_ok, Some(true));
+        assert_eq!(verified.source_config_matches_expected, Some(true));
+        assert_eq!(verified.val_bytes, Some(12));
+        assert!(verified.validation_bpb.unwrap().is_finite());
+    }
+
+    #[test]
+    fn lite_verify_artifact_reports_config_mismatch() {
+        let dir = temp_path("lite_verify_mismatch");
+        fs::create_dir_all(&dir).unwrap();
+        let residual_config =
+            write_lite_config_for_track(&dir, "byte_golf", "ngram_residual", 1, 1, 4_000_000);
+        let run = run_lite(LiteRunOptions {
+            config: residual_config,
+            output: dir.join("run"),
+        })
+        .unwrap();
+        let baseline_config =
+            write_lite_config_for_track(&dir, "byte_golf", "byte_ngram", 1, 1, 4_000_000);
+
+        let verified = run_lite_verify_artifact(LiteVerifyArtifactOptions {
+            artifact: PathBuf::from(&run.artifact_path),
+            config: Some(baseline_config),
+            val: None,
+            output: None,
+        })
+        .unwrap();
+        assert_eq!(verified.status, "fail");
+        assert_eq!(verified.source_config_matches_expected, Some(false));
+        assert!(
+            verified
+                .notes
+                .iter()
+                .any(|note| note.contains("source_config_fingerprint"))
+        );
+    }
+
+    #[test]
+    fn lite_benchmark_runs_cpu_and_reports_metal_status() {
+        let dir = temp_path("lite_benchmark");
+        fs::create_dir_all(&dir).unwrap();
+        let config =
+            write_lite_config_for_track(&dir, "byte_golf", "ngram_residual", 1, 1, 4_000_000);
+
+        let report = run_lite_benchmark(LiteBenchmarkOptions {
+            config,
+            output_dir: dir.join("bench"),
+            repeats: 2,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.backends.len(), 2);
+        let cpu = report
+            .backends
+            .iter()
+            .find(|backend| backend.requested_backend == LiteBackendKind::CpuReference)
+            .unwrap();
+        assert_eq!(cpu.status, "pass");
+        assert_eq!(cpu.run_count, 2);
+        assert!(cpu.median_total_wall_seconds.is_some());
+        let metal = report
+            .backends
+            .iter()
+            .find(|backend| backend.requested_backend == LiteBackendKind::MetalApple)
+            .unwrap();
+        if cfg!(feature = "metal_apple") {
+            assert!(
+                metal.status == "pass" || metal.status == "unavailable",
+                "Metal runtime status must be explicit"
+            );
+        } else {
+            assert_eq!(metal.status, "unavailable");
+        }
+        assert!(Path::new(&report.summary_json_path).exists());
+        assert!(Path::new(&report.summary_markdown_path).exists());
     }
 
     #[test]
@@ -7154,7 +10383,7 @@ kind = "cpu_reference"
     }
 
     #[test]
-    fn lite_rejects_unimplemented_backend() {
+    fn lite_rejects_or_selects_metal_backend_without_fallback() {
         let spec = LiteSpec {
             backend: LiteBackendSpec {
                 kind: LiteBackendKind::MetalApple,
@@ -7162,8 +10391,14 @@ kind = "cpu_reference"
             },
             ..LiteSpec::default()
         };
-        let err = select_lite_backend(&spec).expect_err("metal should reject without fallback");
-        assert!(err.to_string().contains("metal_apple"));
+        match select_lite_backend(&spec) {
+            Ok(selection) => {
+                assert_eq!(selection.requested_backend, LiteBackendKind::MetalApple);
+                assert_eq!(selection.execution_backend, LiteBackendKind::MetalApple);
+                assert!(selection.accelerated);
+            }
+            Err(err) => assert!(err.to_string().contains("metal_apple")),
+        }
     }
 
     #[test]
@@ -7184,26 +10419,44 @@ kind = "cpu_reference"
         .unwrap();
 
         assert_eq!(report.backend, LiteBackendKind::MetalApple);
-        assert_eq!(report.execution_backend, LiteBackendKind::CpuReference);
-        assert!(!report.backend_accelerated);
-        assert_eq!(
-            report.backend_status,
-            "metal_apple_requested_cpu_reference_fallback"
-        );
-        assert!(report.backend_fallback_reason.is_some());
+        if report.execution_backend == LiteBackendKind::MetalApple {
+            assert!(report.backend_accelerated);
+            assert_eq!(report.backend_status, "metal_apple_runtime");
+            assert!(report.backend_fallback_reason.is_none());
+        } else {
+            assert_eq!(report.execution_backend, LiteBackendKind::CpuReference);
+            assert!(!report.backend_accelerated);
+            assert_eq!(
+                report.backend_status,
+                "metal_apple_requested_cpu_reference_fallback"
+            );
+            assert!(report.backend_fallback_reason.is_some());
+        }
         let manifest_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(dir.join("out").join("artifact_manifest.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(manifest_json["backend"], "metal_apple");
-        assert_eq!(manifest_json["execution_backend"], "cpu_reference");
-        assert_eq!(manifest_json["backend_accelerated"], false);
-        assert!(
-            manifest_json["backend_fallback_reason"]
-                .as_str()
-                .unwrap()
-                .contains("executor")
+        assert_eq!(
+            manifest_json["execution_backend"],
+            lite_backend_label(report.execution_backend)
         );
+        assert_eq!(
+            manifest_json["backend_accelerated"],
+            report.backend_accelerated
+        );
+        if report.execution_backend == LiteBackendKind::CpuReference {
+            assert!(
+                manifest_json["backend_fallback_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("runtime")
+                    || manifest_json["backend_fallback_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("feature")
+            );
+        }
     }
 
     #[test]
@@ -7236,21 +10489,32 @@ kind = "cpu_reference"
             report.runs[0].requested_backend,
             LiteBackendKind::MetalApple
         );
-        assert_eq!(
-            report.runs[0].execution_backend,
-            LiteBackendKind::CpuReference
-        );
-        assert!(!report.runs[0].backend_accelerated);
+        if report.runs[0].execution_backend == LiteBackendKind::MetalApple {
+            assert!(report.runs[0].backend_accelerated);
+        } else {
+            assert_eq!(
+                report.runs[0].execution_backend,
+                LiteBackendKind::CpuReference
+            );
+            assert!(!report.runs[0].backend_accelerated);
+        }
     }
 
     #[test]
     fn proposal_report_keeps_future_work_unclaimed() {
         let report = proposal_feature_report();
         assert_eq!(report.persistent_cta_block_backward, "not_implemented");
-        assert_eq!(
-            report.pg_lite_metal_backend,
-            "source_boundary_checked_not_executable"
-        );
+        if cfg!(feature = "metal_apple") {
+            assert_eq!(
+                report.pg_lite_metal_backend,
+                "runtime_linked_requires_local_backend_check"
+            );
+        } else {
+            assert_eq!(
+                report.pg_lite_metal_backend,
+                "source_boundary_checked_feature_gated"
+            );
+        }
         assert_eq!(
             report.xsa_inside_sdpa,
             "local_parity_tested_not_record_active"
@@ -7279,6 +10543,67 @@ kind = "cpu_reference"
         assert_eq!(score_first.score_first_tokens_scored, 8);
         assert_eq!(score_first.score_first_update_count, 8);
         assert!(score_first.loss <= plain.loss + 1e-9);
+    }
+
+    #[cfg(feature = "metal_apple")]
+    #[test]
+    fn metal_lite_train_and_eval_match_cpu_reference_when_available() {
+        let mut spec = LiteSpec::default();
+        spec.track = LiteTrack::ByteGolf;
+        spec.model.family = LiteModelFamily::NgramResidual;
+        spec.model.context = 8;
+        spec.model.residual_buckets = 16;
+        spec.model.residual_weight = 0.25;
+        let train = b"abracadabra abracadabra abracadabra";
+        let val = b"cadabra abracadabra";
+        let cpu = LiteNgramResidual::train(train, &spec);
+        let cpu_eval = cpu.loss_on_bytes(val, false);
+        let metal = match run_metal_lite_train_eval(train, val, &spec) {
+            Ok(metal) => metal,
+            Err(err) => {
+                eprintln!("skipping Metal parity test because runtime is unavailable: {err}");
+                return;
+            }
+        };
+        assert_eq!(metal.model.bigram_counts, cpu.bigram_counts);
+        assert_eq!(metal.model.residual_counts, cpu.residual_counts);
+        assert_eq!(metal.eval.tokens, cpu_eval.tokens);
+        assert!(
+            (metal.eval.loss - cpu_eval.loss).abs() < 1e-3,
+            "metal loss {} cpu loss {}",
+            metal.eval.loss,
+            cpu_eval.loss
+        );
+    }
+
+    #[cfg(feature = "metal_apple")]
+    #[test]
+    fn metal_lite_score_first_matches_cpu_reference_when_available() {
+        let mut spec = LiteSpec::default();
+        spec.model.context = 8;
+        spec.model.residual_buckets = 16;
+        spec.model.residual_weight = 0.2;
+        let model = LiteNgramResidual::train(b"aaaaabbbbbaaaaabbbbb", &spec);
+        let val = b"abababababab";
+        let cpu_eval = model.loss_on_bytes_score_first(val);
+        let metal_eval = match run_metal_lite_score_first_eval(&model, val) {
+            Ok(eval) => eval,
+            Err(err) => {
+                eprintln!(
+                    "skipping Metal score-first parity test because runtime is unavailable: {err}"
+                );
+                return;
+            }
+        };
+        assert_eq!(metal_eval.tokens, cpu_eval.tokens);
+        assert_eq!(metal_eval.score_first_tokens_scored, val.len());
+        assert_eq!(metal_eval.score_first_update_count, val.len());
+        assert!(
+            (metal_eval.loss - cpu_eval.loss).abs() < 1e-3,
+            "metal loss {} cpu loss {}",
+            metal_eval.loss,
+            cpu_eval.loss
+        );
     }
 
     #[test]

@@ -1,0 +1,22 @@
+track = "byte_golf"
+artifact_budget_bytes = 1000000
+train_time_seconds = 300.0
+eval_time_seconds = 60.0
+memory_budget_bytes = 4000000000
+score = "bpb"
+
+[data]
+train_path = "specs/pg_lite/sample_train.txt"
+val_path = "specs/pg_lite/sample_val.txt"
+format = "bytes"
+
+[model]
+family = "ngram_residual"
+vocab = "byte"
+context = 512
+residual_buckets = 2048
+residual_weight = 0.15
+
+[backend]
+kind = "metal_apple"
+allow_cpu_fallback = false

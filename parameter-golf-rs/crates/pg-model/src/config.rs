@@ -256,6 +256,10 @@ pub struct TrainConfig {
 
     // Late QAT
     pub late_qat_threshold: f32, // activate when LR scale < this
+    pub artifact_regularization_lambda: f32,
+    pub artifact_regularization_bits: u8,
+    pub artifact_regularization_block_size: usize,
+    pub artifact_regularization_start_lr_scale: f32,
 
     // TTT
     pub ttt_enabled: bool,
@@ -307,6 +311,10 @@ impl TrainConfig {
             swa_every: 50,
 
             late_qat_threshold: 0.15,
+            artifact_regularization_lambda: 0.0,
+            artifact_regularization_bits: 4,
+            artifact_regularization_block_size: 64,
+            artifact_regularization_start_lr_scale: 0.15,
 
             ttt_enabled: true,
             ttt_lr: 0.002,
@@ -368,6 +376,14 @@ impl TrainConfig {
     pub fn qat_active(&self, step: usize) -> bool {
         let warmdown_start = self.total_iterations.saturating_sub(self.warmdown_iters);
         step >= warmdown_start && self.lr_scale(step) < self.late_qat_threshold
+    }
+
+    pub fn artifact_regularization_active(&self, step: usize) -> bool {
+        if self.artifact_regularization_lambda <= 0.0 {
+            return false;
+        }
+        let warmdown_start = self.total_iterations.saturating_sub(self.warmdown_iters);
+        step >= warmdown_start && self.lr_scale(step) <= self.artifact_regularization_start_lr_scale
     }
 }
 
@@ -439,6 +455,23 @@ mod tests {
         assert!(!config.qat_active(8400));
         assert!(config.qat_active(8500));
         assert!(config.qat_active(8999));
+    }
+
+    #[test]
+    fn test_artifact_regularization_activation() {
+        let mut config = TrainConfig::sota();
+        config.total_iterations = 100;
+        config.warmdown_iters = 20;
+        config.warmup_steps = 0;
+        config.artifact_regularization_lambda = 0.0;
+        config.artifact_regularization_start_lr_scale = 0.5;
+        assert!(!config.artifact_regularization_active(90));
+
+        config.artifact_regularization_lambda = 0.1;
+        assert!(!config.artifact_regularization_active(70));
+        assert!(!config.artifact_regularization_active(85));
+        assert!(config.artifact_regularization_active(90));
+        assert!(config.artifact_regularization_active(99));
     }
 
     #[test]

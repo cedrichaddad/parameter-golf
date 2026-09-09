@@ -1,4 +1,12 @@
 #![recursion_limit = "256"]
+#![allow(
+    clippy::collapsible_if,
+    clippy::empty_line_after_doc_comments,
+    clippy::manual_div_ceil,
+    clippy::manual_range_contains,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
 
 pub mod compress;
 pub mod export;

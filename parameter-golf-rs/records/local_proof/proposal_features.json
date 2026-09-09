@@ -9,6 +9,6 @@
   "quant_layout_compiler": "local_parity_tested",
   "bigramhash_fusion": "local_parity_tested",
   "pg_lite": "local_validated",
-  "pg_lite_metal_backend": "source_boundary_checked_not_executable",
+  "pg_lite_metal_backend": "runtime_linked_requires_local_backend_check",
   "wind_tunnel": "local_validated"
 }

@@ -707,11 +707,11 @@ fn main() {
             }
             let run_timing_json = pg_train::run_timing_json(&result);
             println!("run_timing_json={run_timing_json}");
-            if let Some(path) = result_json_path {
-                if let Err(err) = std::fs::write(&path, format!("{run_timing_json}\n")) {
-                    eprintln!("failed to write --result-json {}: {err}", path.display());
-                    std::process::exit(1);
-                }
+            if let Some(path) = result_json_path
+                && let Err(err) = std::fs::write(&path, format!("{run_timing_json}\n"))
+            {
+                eprintln!("failed to write --result-json {}: {err}", path.display());
+                std::process::exit(1);
             }
         }
         "sweep" => {
@@ -897,13 +897,17 @@ fn main() {
                 match VariantRunner::new(run_spec.clone()).and_then(|runner| runner.run(mode)) {
                     Ok(result) => {
                         println!(
-                            "variant={:?} status=ok backend={:?} fingerprint={} steps={} loss={:.6} train_loss_source={} ms_per_step={:.3} timing_steps={} timing_measured_ms_per_step={:.3} rank={} world_size={} seq_len={} global_batch_tokens={} local_microbatches_per_step={} tokens_seen_global={} distributed_sync={} attention_backend={} distributed_optimizer_backend={} eval_adaptation_backend={} frontier_record_ready={} leaderboard_algorithm_ready={} record_shape={} record_attention_grade={} microbatch_serial_loop={} bank_update_backend={} train_data_source={} bpb_byte_source={} timing_backend={} timing_data_sampling_ms={:.3} timing_train_step_ms={:.3} timing_cuda_zero_grads_ms={:.3} timing_cuda_h2d_ms={:.3} timing_cuda_backward_ms={:.3} timing_cuda_backward_forward_ms={:.3} timing_cuda_backward_forward_embed_ms={:.3} timing_cuda_backward_forward_encoder_ms={:.3} timing_cuda_backward_forward_encoder_layer_max_ms={:.3} timing_cuda_backward_forward_decoder_ms={:.3} timing_cuda_backward_forward_decoder_layer_max_ms={:.3} timing_cuda_backward_forward_logits_ms={:.3} timing_cuda_backward_forward_block_pre_attn_ms={:.3} timing_cuda_backward_forward_block_attention_ms={:.3} timing_cuda_backward_forward_block_post_attn_ms={:.3} timing_cuda_backward_forward_block_mlp_ms={:.3} timing_cuda_backward_block_recompute_ms={:.3} timing_cuda_backward_block_mlp_ms={:.3} timing_cuda_backward_block_attn_out_ms={:.3} timing_cuda_backward_block_attention_ms={:.3} timing_cuda_backward_block_qkv_ms={:.3} timing_cuda_backward_output_ms={:.3} timing_cuda_backward_decoder_ms={:.3} timing_cuda_backward_encoder_ms={:.3} timing_cuda_backward_tail_ms={:.3} timing_cuda_non_bank_sync_ms={:.3} timing_cuda_bank_update_ms={:.3} timing_cuda_non_bank_update_ms={:.3} timing_post_train_sync_ms={:.3} timing_artifact_export_ms={:.3} timing_eval_ms={:.3} proxy_bpb={} proxy_metric_source={} final_bpb={} artifact_bytes={} submission_total_bytes={} artifact_budget_ok={}",
+                            "variant={:?} status=ok backend={:?} fingerprint={} steps={} loss={:.6} train_task_loss={:.6} train_loss_source={} artifact_regularization_steps={} artifact_regularization_loss_last={:.6} artifact_regularization_distance_norm_last={:.6} ms_per_step={:.3} timing_steps={} timing_measured_ms_per_step={:.3} rank={} world_size={} seq_len={} global_batch_tokens={} local_microbatches_per_step={} tokens_seen_global={} distributed_sync={} attention_backend={} distributed_optimizer_backend={} eval_adaptation_backend={} frontier_record_ready={} leaderboard_algorithm_ready={} record_shape={} record_attention_grade={} microbatch_serial_loop={} bank_update_backend={} train_data_source={} bpb_byte_source={} timing_backend={} timing_data_sampling_ms={:.3} timing_train_step_ms={:.3} timing_cuda_zero_grads_ms={:.3} timing_cuda_h2d_ms={:.3} timing_cuda_backward_ms={:.3} timing_cuda_backward_forward_ms={:.3} timing_cuda_backward_forward_embed_ms={:.3} timing_cuda_backward_forward_encoder_ms={:.3} timing_cuda_backward_forward_encoder_layer_max_ms={:.3} timing_cuda_backward_forward_decoder_ms={:.3} timing_cuda_backward_forward_decoder_layer_max_ms={:.3} timing_cuda_backward_forward_logits_ms={:.3} timing_cuda_backward_forward_block_pre_attn_ms={:.3} timing_cuda_backward_forward_block_attention_ms={:.3} timing_cuda_backward_forward_block_post_attn_ms={:.3} timing_cuda_backward_forward_block_mlp_ms={:.3} timing_cuda_backward_block_recompute_ms={:.3} timing_cuda_backward_block_mlp_ms={:.3} timing_cuda_backward_block_attn_out_ms={:.3} timing_cuda_backward_block_attention_ms={:.3} timing_cuda_backward_block_qkv_ms={:.3} timing_cuda_backward_output_ms={:.3} timing_cuda_backward_decoder_ms={:.3} timing_cuda_backward_encoder_ms={:.3} timing_cuda_backward_tail_ms={:.3} timing_cuda_non_bank_sync_ms={:.3} timing_cuda_bank_update_ms={:.3} timing_cuda_non_bank_update_ms={:.3} timing_post_train_sync_ms={:.3} timing_artifact_export_ms={:.3} timing_eval_ms={:.3} proxy_bpb={} proxy_metric_source={} final_bpb={} artifact_bytes={} submission_total_bytes={} artifact_budget_ok={}",
                             family,
                             result.train_backend,
                             result.variant_fingerprint,
                             result.steps_completed,
                             result.train_loss,
+                            result.train_task_loss,
                             result.train_loss_source,
+                            result.artifact_regularization_steps,
+                            result.artifact_regularization_loss_last,
+                            result.artifact_regularization_distance_norm_last,
                             result.ms_per_step,
                             result.timing_steps,
                             result.timing_measured_ms_per_step,

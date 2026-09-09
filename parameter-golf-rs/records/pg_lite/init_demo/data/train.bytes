@@ -1,0 +1,3 @@
+parameter golf lite is a local benchmark for tiny byte models.
+it checks artifact budgets, score first adaptation, and simple bpb signals.
+this sample corpus is intentional

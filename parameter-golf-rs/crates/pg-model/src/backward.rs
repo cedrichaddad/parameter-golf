@@ -7,6 +7,8 @@
 /// ~15 distinct backward ops per block in reverse order of the forward pass.
 use crate::config::ModelConfig;
 use crate::model::{ForwardBuffer, GptModel};
+use pg_core::error::{PgError, PgResult};
+use pg_kernels::traingolf::{TrainGolfQuantizationConfig, traingolf_quantization_regularizer};
 
 fn qk_norm_backward_cpu(
     x: &[f32],
@@ -59,6 +61,22 @@ pub struct GradBuffers {
     pub ve_proj: Vec<f32>,
     pub ve_scale: f32,
     pub ve_layer_scales: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArtifactRegularizationConfig {
+    pub bits: u8,
+    pub block_size: usize,
+    pub lambda: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactRegularizationReport {
+    pub regularization_loss: f64,
+    pub distance_sq: f64,
+    pub distance_norm: f64,
+    pub tensors: usize,
+    pub parameters: usize,
 }
 
 impl GradBuffers {
@@ -135,12 +153,203 @@ impl GradBuffers {
         self.ve_layer_scales.fill(0.0);
     }
 
+    pub fn add_artifact_regularization(
+        &mut self,
+        model: &GptModel,
+        config: ArtifactRegularizationConfig,
+    ) -> PgResult<ArtifactRegularizationReport> {
+        let kernel_config = TrainGolfQuantizationConfig {
+            bits: config.bits,
+            block_size: config.block_size,
+            lambda: config.lambda,
+        };
+        let mut report = ArtifactRegularizationReport::default();
+
+        add_artifact_regularization_to_slice(
+            "tok_emb",
+            &model.tok_emb,
+            &mut self.tok_emb,
+            kernel_config,
+            &mut report,
+        )?;
+        if model.config.bigram_vocab_size > 0 {
+            add_artifact_regularization_to_slice(
+                "bigram_embed",
+                &model.bigram_embed,
+                &mut self.bigram_embed,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                "bigram_proj",
+                &model.bigram_proj,
+                &mut self.bigram_proj,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_scalar(
+                "bigram_scale",
+                model.bigram_scale,
+                &mut self.bigram_scale,
+                kernel_config,
+                &mut report,
+            )?;
+        }
+        add_artifact_regularization_to_slice(
+            "smear_gate",
+            &model.smear_gate,
+            &mut self.smear_gate,
+            kernel_config,
+            &mut report,
+        )?;
+        add_artifact_regularization_to_slice(
+            "skip_weights",
+            &model.skip_weights,
+            &mut self.skip_weights,
+            kernel_config,
+            &mut report,
+        )?;
+        add_artifact_regularization_to_slice(
+            "qo_bank",
+            &model.qo_bank,
+            &mut self.qo_bank,
+            kernel_config,
+            &mut report,
+        )?;
+        add_artifact_regularization_to_slice(
+            "kv_bank",
+            &model.kv_bank,
+            &mut self.kv_bank,
+            kernel_config,
+            &mut report,
+        )?;
+        add_artifact_regularization_to_slice(
+            "mlp_up_bank",
+            &model.mlp_up_bank,
+            &mut self.mlp_up_bank,
+            kernel_config,
+            &mut report,
+        )?;
+        add_artifact_regularization_to_slice(
+            "mlp_down_bank",
+            &model.mlp_down_bank,
+            &mut self.mlp_down_bank,
+            kernel_config,
+            &mut report,
+        )?;
+
+        for (layer, block) in model.blocks.iter().enumerate() {
+            add_artifact_regularization_to_slice(
+                &format!("blocks.{layer}.attn_scale"),
+                &block.attn_scale,
+                grad_block_slice(&mut self.block_attn_scale, layer, "block_attn_scale")?,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                &format!("blocks.{layer}.mlp_scale"),
+                &block.mlp_scale,
+                grad_block_slice(&mut self.block_mlp_scale, layer, "block_mlp_scale")?,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                &format!("blocks.{layer}.resid_mix"),
+                &block.resid_mix,
+                grad_block_slice(&mut self.block_resid_mix, layer, "block_resid_mix")?,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                &format!("blocks.{layer}.q_gain"),
+                &block.q_gain,
+                grad_block_slice(&mut self.block_q_gain, layer, "block_q_gain")?,
+                kernel_config,
+                &mut report,
+            )?;
+            if model.config.attn_out_gate_enabled {
+                add_artifact_regularization_to_slice(
+                    &format!("blocks.{layer}.attn_gate_weight"),
+                    &block.attn_gate_weight,
+                    grad_block_slice(
+                        &mut self.block_attn_gate_weight,
+                        layer,
+                        "block_attn_gate_weight",
+                    )?,
+                    kernel_config,
+                    &mut report,
+                )?;
+                add_artifact_regularization_to_slice(
+                    &format!("blocks.{layer}.attn_gate_bias"),
+                    &block.attn_gate_bias,
+                    grad_block_slice(
+                        &mut self.block_attn_gate_bias,
+                        layer,
+                        "block_attn_gate_bias",
+                    )?,
+                    kernel_config,
+                    &mut report,
+                )?;
+            }
+            if model.config.sparse_attn_gate_enabled {
+                add_artifact_regularization_to_slice(
+                    &format!("blocks.{layer}.sparse_attn_gate_weight"),
+                    &block.sparse_attn_gate_weight,
+                    grad_block_slice(
+                        &mut self.block_sparse_attn_gate_weight,
+                        layer,
+                        "block_sparse_attn_gate_weight",
+                    )?,
+                    kernel_config,
+                    &mut report,
+                )?;
+            }
+        }
+
+        if model.config.ve_enabled {
+            add_artifact_regularization_to_slice(
+                "ve_embed",
+                &model.ve_embed,
+                &mut self.ve_embed,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                "ve_proj",
+                &model.ve_proj,
+                &mut self.ve_proj,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_scalar(
+                "ve_scale",
+                model.ve_scale,
+                &mut self.ve_scale,
+                kernel_config,
+                &mut report,
+            )?;
+            add_artifact_regularization_to_slice(
+                "ve_layer_scales",
+                &model.ve_layer_scales,
+                &mut self.ve_layer_scales,
+                kernel_config,
+                &mut report,
+            )?;
+        }
+
+        report.distance_norm = report.distance_sq.sqrt();
+        Ok(report)
+    }
+
     pub fn flat_grad_norm(&self) -> f32 {
         let mut sum_sq = 0.0f32;
         let add = |buf: &[f32], s: &mut f32| {
             for &v in buf {
                 *s += v * v;
             }
+        };
+        let add_scalar = |value: f32, s: &mut f32| {
+            *s += value * value;
         };
         add(&self.tok_emb, &mut sum_sq);
         add(&self.qo_bank, &mut sum_sq);
@@ -151,6 +360,7 @@ impl GradBuffers {
         add(&self.smear_gate, &mut sum_sq);
         add(&self.bigram_embed, &mut sum_sq);
         add(&self.bigram_proj, &mut sum_sq);
+        add_scalar(self.bigram_scale, &mut sum_sq);
         for v in &self.block_attn_scale {
             add(v, &mut sum_sq);
         }
@@ -172,6 +382,10 @@ impl GradBuffers {
         for v in &self.block_sparse_attn_gate_weight {
             add(v, &mut sum_sq);
         }
+        add(&self.ve_embed, &mut sum_sq);
+        add(&self.ve_proj, &mut sum_sq);
+        add_scalar(self.ve_scale, &mut sum_sq);
+        add(&self.ve_layer_scales, &mut sum_sq);
         sum_sq.sqrt()
     }
 
@@ -193,6 +407,7 @@ impl GradBuffers {
             clip(&mut self.smear_gate, s);
             clip(&mut self.bigram_embed, s);
             clip(&mut self.bigram_proj, s);
+            self.bigram_scale *= s;
             for v in &mut self.block_attn_scale {
                 clip(v, s);
             }
@@ -214,8 +429,68 @@ impl GradBuffers {
             for v in &mut self.block_sparse_attn_gate_weight {
                 clip(v, s);
             }
+            clip(&mut self.ve_embed, s);
+            clip(&mut self.ve_proj, s);
+            self.ve_scale *= s;
+            clip(&mut self.ve_layer_scales, s);
         }
     }
+}
+
+fn add_artifact_regularization_to_slice(
+    name: &str,
+    params: &[f32],
+    grads: &mut [f32],
+    config: TrainGolfQuantizationConfig,
+    report: &mut ArtifactRegularizationReport,
+) -> PgResult<()> {
+    if params.len() != grads.len() {
+        return Err(PgError::InvalidOp(format!(
+            "artifact regularization tensor {name} length mismatch: params={}, grads={}",
+            params.len(),
+            grads.len()
+        )));
+    }
+    if params.is_empty() {
+        return Ok(());
+    }
+    let tensor_report = traingolf_quantization_regularizer(params, config)?;
+    for (grad, reg_grad) in grads.iter_mut().zip(tensor_report.gradient) {
+        *grad += reg_grad;
+    }
+    report.regularization_loss += tensor_report.regularization_loss;
+    report.distance_sq += tensor_report.distance_sq;
+    report.tensors += 1;
+    report.parameters += params.len();
+    Ok(())
+}
+
+fn add_artifact_regularization_to_scalar(
+    name: &str,
+    param: f32,
+    grad: &mut f32,
+    config: TrainGolfQuantizationConfig,
+    report: &mut ArtifactRegularizationReport,
+) -> PgResult<()> {
+    let mut grad_slice = [*grad];
+    add_artifact_regularization_to_slice(name, &[param], &mut grad_slice, config, report)?;
+    *grad = grad_slice[0];
+    Ok(())
+}
+
+fn grad_block_slice<'a>(
+    tensors: &'a mut [Vec<f32>],
+    layer: usize,
+    name: &str,
+) -> PgResult<&'a mut [f32]> {
+    tensors
+        .get_mut(layer)
+        .map(Vec::as_mut_slice)
+        .ok_or_else(|| {
+            PgError::InvalidOp(format!(
+                "artifact regularization missing {name} gradient buffer for layer {layer}"
+            ))
+        })
 }
 
 /// Saved state for the forward pass — hidden states at each layer boundary.
@@ -1383,10 +1658,119 @@ mod tests {
         for v in &mut grads.tok_emb {
             *v = 1.0;
         }
+        grads.bigram_scale = 2.0;
+        grads.ve_scale = 3.0;
+        for v in &mut grads.ve_proj {
+            *v = 0.5;
+        }
         let norm = grads.flat_grad_norm();
-        assert!(norm > 0.0);
+        assert!(norm >= 3.0);
         grads.clip_grad_norm(0.01);
         assert!(grads.flat_grad_norm() <= 0.011);
+        assert!(grads.bigram_scale.abs() <= 0.011);
+        assert!(grads.ve_scale.abs() <= 0.011);
+    }
+
+    #[test]
+    fn artifact_regularization_adds_gradients_and_loss() {
+        let config = tiny_config();
+        let model = init_model(&config);
+        let mut grads = GradBuffers::new(&config);
+
+        let report = grads
+            .add_artifact_regularization(
+                &model,
+                ArtifactRegularizationConfig {
+                    bits: 3,
+                    block_size: 8,
+                    lambda: 0.5,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            report.regularization_loss > 0.0,
+            "regularization loss should be positive"
+        );
+        assert!(report.distance_sq > 0.0, "distance should be positive");
+        assert!(
+            report.distance_norm > 0.0,
+            "distance norm should be positive"
+        );
+        assert!(report.tensors > 0, "should account for tensors");
+        assert!(report.parameters > 0, "should account for parameters");
+        assert!(
+            grads.flat_grad_norm() > 0.0,
+            "regularizer should add gradients"
+        );
+        assert!(
+            grads.tok_emb.iter().any(|&v| v != 0.0) || grads.qo_bank.iter().any(|&v| v != 0.0),
+            "at least one artifact tensor should receive regularization gradient"
+        );
+        assert!(
+            grads
+                .tok_emb
+                .iter()
+                .chain(&grads.qo_bank)
+                .all(|v| v.is_finite()),
+            "regularization gradients should be finite"
+        );
+    }
+
+    #[test]
+    fn artifact_regularization_accumulates_on_existing_gradients() {
+        let config = tiny_config();
+        let model = init_model(&config);
+        let tokens = vec![1u32, 3, 5, 7];
+        let targets = vec![3u32, 5, 7, 2];
+        let mut buf = ForwardBuffer::new(&config, tokens.len());
+        let mut grads = GradBuffers::new(&config);
+
+        let loss = model.backward(&tokens, &targets, &mut buf, &mut grads);
+        assert!(loss.is_finite());
+        let before = grads.tok_emb.clone();
+
+        let report = grads
+            .add_artifact_regularization(
+                &model,
+                ArtifactRegularizationConfig {
+                    bits: 4,
+                    block_size: 8,
+                    lambda: 0.25,
+                },
+            )
+            .unwrap();
+
+        assert!(report.regularization_loss > 0.0);
+        assert!(
+            before
+                .iter()
+                .zip(&grads.tok_emb)
+                .any(|(&old, &new)| (old - new).abs() > 1e-8),
+            "artifact regularization should accumulate into existing gradients"
+        );
+    }
+
+    #[test]
+    fn artifact_regularization_rejects_invalid_bits() {
+        let config = tiny_config();
+        let model = init_model(&config);
+        let mut grads = GradBuffers::new(&config);
+        let err = grads
+            .add_artifact_regularization(
+                &model,
+                ArtifactRegularizationConfig {
+                    bits: 1,
+                    block_size: 8,
+                    lambda: 0.5,
+                },
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bits must be in 2..=8"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

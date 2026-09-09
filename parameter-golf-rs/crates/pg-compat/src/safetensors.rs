@@ -27,8 +27,7 @@ pub struct TensorInfo {
 /// Loaded safetensors file.
 pub struct SafeTensorsFile {
     pub tensors: HashMap<String, TensorInfo>,
-    pub data: Vec<u8>,  // raw tensor data (after header)
-    data_offset: usize, // byte offset where tensor data starts in the file
+    pub data: Vec<u8>, // raw tensor data (after header)
 }
 
 impl SafeTensorsFile {
@@ -65,11 +64,7 @@ impl SafeTensorsFile {
         let data_offset = 8 + header_size;
         let data = bytes[data_offset..].to_vec();
 
-        Ok(Self {
-            tensors,
-            data,
-            data_offset,
-        })
+        Ok(Self { tensors, data })
     }
 
     /// Get tensor data as f32 (converting from bf16/f16/f32 as needed).

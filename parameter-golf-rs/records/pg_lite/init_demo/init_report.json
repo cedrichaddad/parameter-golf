@@ -1,0 +1,64 @@
+{
+  "kind": "pg_lite_init",
+  "input_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/specs/pg_lite/sample_train.txt",
+  "output_dir": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo",
+  "input_bytes": 215,
+  "input_crc32": "crc32:f493caab",
+  "train_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/data/train.bytes",
+  "val_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/data/val.bytes",
+  "train_bytes": 172,
+  "train_crc32": "crc32:b1a0854d",
+  "val_bytes": 43,
+  "val_crc32": "crc32:99a344db",
+  "val_fraction_effective": 0.2,
+  "configs": [
+    {
+      "name": "byte_golf_ngram_residual",
+      "path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/configs/byte_golf_ngram_residual.toml",
+      "track": "byte_golf",
+      "model_family": "ngram_residual",
+      "backend": "cpu_reference",
+      "allow_cpu_fallback": false,
+      "artifact_budget_bytes": 1000000
+    },
+    {
+      "name": "byte_golf_ngram_baseline",
+      "path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/configs/byte_golf_ngram_baseline.toml",
+      "track": "byte_golf",
+      "model_family": "byte_ngram",
+      "backend": "cpu_reference",
+      "allow_cpu_fallback": false,
+      "artifact_budget_bytes": 1000000
+    },
+    {
+      "name": "stream_golf_score_first",
+      "path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/configs/stream_golf_score_first.toml",
+      "track": "stream_golf",
+      "model_family": "ngram_residual",
+      "backend": "cpu_reference",
+      "allow_cpu_fallback": false,
+      "artifact_budget_bytes": 1000000
+    },
+    {
+      "name": "artifact_golf_empty",
+      "path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/configs/artifact_golf_empty.toml",
+      "track": "artifact_golf",
+      "model_family": "artifact_only",
+      "backend": "cpu_reference",
+      "allow_cpu_fallback": false,
+      "artifact_budget_bytes": 1000000
+    },
+    {
+      "name": "byte_golf_metal_probe",
+      "path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/configs/byte_golf_metal_probe.toml",
+      "track": "byte_golf",
+      "model_family": "ngram_residual",
+      "backend": "metal_apple",
+      "allow_cpu_fallback": true,
+      "artifact_budget_bytes": 1000000
+    }
+  ],
+  "readme_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/README.md",
+  "report_path": "/Users/cedrichaddad/parameter-golf/parameter-golf-rs/records/pg_lite/init_demo/init_report.json",
+  "status": "pass"
+}
